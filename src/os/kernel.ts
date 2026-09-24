@@ -177,7 +177,7 @@ export class Kernel {
       this.ticks++
       this.log(msg, true)
     }
-    stamp('crados 0.1 (minnow) booting on browser/js')
+    stamp('crados 1.0 booting on browser/js')
     stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
     stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${KERNEL_FRAMES} reserved for the kernel`)
 
@@ -573,7 +573,7 @@ export class Kernel {
     this.mem.zero(0)
     this.mem.writeAt(
       0,
-      `crados 0.1 minnow\nram=${RAM_SIZE} pagesize=${PAGE_SIZE} frames=${FRAME_COUNT}\n` +
+      `crados 1.0 \nram=${RAM_SIZE} pagesize=${PAGE_SIZE} frames=${FRAME_COUNT}\n` +
         `quantum=${QUANTUM} hz=${this.hz} tick=${this.ticks} nproc=${this.procs.size}\n` +
         `pcb base=${PCB_BASE} size=${PCB_SIZE} slots=${MAX_PROCS}\n`,
     )

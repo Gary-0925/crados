@@ -20,7 +20,7 @@ export function Header({ kernel, snap, onReboot }: { kernel: Kernel; snap: Snaps
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-[#30363d] bg-[#010409] px-3">
       <TermIcon size={15} className="text-[#e6edf3]" />
       <span className="text-[13px] font-semibold text-[#e6edf3]">crados</span>
-      <span className="hidden text-[10px] text-[#6e7681] sm:inline">0.1 minnow</span>
+      <span className="hidden text-[10px] text-[#6e7681] sm:inline">1.0</span>
 
       <span
         title="CPU 模式位：中断与系统调用期间处于内核态"
