@@ -26,7 +26,7 @@ function PanicOverlay({ panic, snap, onReboot }: { panic: string; snap: Snapshot
       <div className="w-full max-w-2xl">
         <div className="flex items-center gap-2.5">
           <OctagonX size={22} className="shrink-0 text-[#f85149]" />
-          <span className="text-[15px] font-semibold text-[#f85149]">Kernel panic — not syncing</span>
+          <span className="text-[15px] font-semibold text-[#f85149]">Kernel panic - not syncing</span>
         </div>
         <div className="mt-3 rounded-md border border-[#f85149]/40 bg-[#f85149]/10 px-3 py-2 text-[12px] text-[#ff7b72]">
           {panic}

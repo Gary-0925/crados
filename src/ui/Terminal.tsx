@@ -73,7 +73,7 @@ export function Terminal({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
       className="flex h-full min-h-0 cursor-text flex-col bg-[#010409] outline-none"
     >
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#21262d] px-3 text-[10px] text-[#6e7681]">
-        <span>tty0 — console device, canonical mode</span>
+        <span>tty0 - console device, canonical mode</span>
         <span>Ctrl-C interrupt · Ctrl-D EOF · Ctrl-L clear</span>
       </div>
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-3 py-2">

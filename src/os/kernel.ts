@@ -2,7 +2,7 @@
 //
 // 存储的真相只有两处：BlockDev 的字节数组（磁盘）与 Memory 的字节数组（内存条）。
 // 文件系统的目录、inode、位图都是磁盘字节里的字段；执行程序必须先把磁盘上的
-// 映像逐块拷贝进物理页帧，CPU 再从内存取指——没有任何数据"住在" JS 对象里。
+// 映像逐块拷贝进物理页帧，CPU 再从内存取指--没有任何数据"住在" JS 对象里。
 
 import { BlockDev, downloadDev, dropDev, loadDev, saveDev, SPECS } from './blockdev'
 import { basename, CRFS, dirname, normalizePath, T_DEV, T_DIR, T_FILE, VFS } from './fs'

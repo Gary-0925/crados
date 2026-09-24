@@ -30,7 +30,7 @@ function Detail({ p }: { p: ProcRow }) {
         <Cell label="cwd" value={p.cwd} />
         <Cell
           label={p.state === 'zombie' ? 'exit status' : 'wait channel'}
-          value={p.state === 'zombie' ? String(p.exitCode ?? 0) : (p.waitDesc ?? '—')}
+          value={p.state === 'zombie' ? String(p.exitCode ?? 0) : (p.waitDesc ?? '-')}
         />
       </div>
       {p.children.length > 0 && (

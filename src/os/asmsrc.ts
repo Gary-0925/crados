@@ -139,7 +139,7 @@ use:
 // Text views are kernel pseudo-files exposed through syscall 26. The executable
 // is still real CRX machine code; the kernel only supplies the same bytes that
 // /proc and /sys files supply to Unix utilities.
-const viewProgram = (name: string, kind: number, takesArg = false) => `; ${name} — read a kernel pseudo-file
+const viewProgram = (name: string, kind: number, takesArg = false) => `; ${name} - read a kernel pseudo-file
 .text
 _start:
     mov r4, 0
@@ -186,7 +186,7 @@ ${takesArg ? `use:
 ` : ''}`
 
 export const ASM_PROGRAMS: Record<string, string> = {
-  init: `; init — pid 1, starts the shell and reaps every orphan
+  init: `; init - pid 1, starts the shell and reaps every orphan
 .text
 _start:
     mov r0, 9
@@ -210,7 +210,7 @@ shpath:
     .asciz "/bin/sh"
 `,
 
-  sh: `; sh — command parsing, redirection, background jobs and waitpid in userspace
+  sh: `; sh - command parsing, redirection, background jobs and waitpid in userspace
 .text
 _start:
     mov r4, r1          ; preserve entry argc/argv across getpid
@@ -551,7 +551,7 @@ bg:     .byte 0
 scriptmode: .byte 0
 scriptfd: .word 0
 selfpid: .word 0
-banner: .asciz "crados 1.0 (Cradle OS) — all /bin programs are CRX machine code\\nType help for commands.\\n"
+banner: .asciz "crados 1.0 (Cradle OS) - all /bin programs are CRX machine code\\nType help for commands.\\n"
 pre:    .asciz "user@crados:"
 post:   .asciz "$ "
 home:   .asciz "/home/user"
@@ -561,7 +561,7 @@ bye:    .asciz "logout\\n"
 sfail:  .asciz "sh: cannot open script\\n"
 `,
 
-  cat: `; cat — with an argument copy that file, without one copy standard input
+  cat: `; cat - with an argument copy that file, without one copy standard input
 .text
 _start:
     cmp r1, 0
@@ -638,7 +638,7 @@ err:
     .asciz "cat: cannot open file\\n"
 `,
 
-  ls: `; ls — list a directory through getdents(2)
+  ls: `; ls - list a directory through getdents(2)
 .text
 _start:
     mov r4, dot
@@ -721,7 +721,7 @@ err:
     .asciz "ls: cannot read directory\\n"
 `,
 
-  pwd: `; pwd — print the working directory
+  pwd: `; pwd - print the working directory
 .text
 _start:
     mov r0, 12
@@ -747,7 +747,7 @@ nl:
     .ascii "\\n"
 `,
 
-  echo: `; echo — write the arguments separated by spaces
+  echo: `; echo - write the arguments separated by spaces
 .text
 _start:
     mov r6, r1
@@ -798,7 +798,7 @@ nl:
     .ascii "\\n"
 `,
 
-  cp: `; cp — copy a file through a 128 byte buffer, one block at a time
+  cp: `; cp - copy a file through a 128 byte buffer, one block at a time
 .text
 _start:
     cmp r1, 2
@@ -919,7 +919,7 @@ use:
   mkdir: oneArg('mkdir', 14, 'mkdir directory...', 'mkdir: cannot create directory'),
   rm: oneArg('rm', 13, 'rm file...', 'rm: cannot remove file'),
   rmdir: oneArg('rmdir', 13, 'rmdir directory...', 'rmdir: cannot remove directory'),
-  touch: `; touch — create a file if it does not exist
+  touch: `; touch - create a file if it does not exist
 .text
 _start:
     cmp r1, 0
@@ -959,7 +959,7 @@ use:
     .asciz "usage: touch file\\n"
 `,
 
-  chmod: `; chmod — set or clear the execute bit
+  chmod: `; chmod - set or clear the execute bit
 .text
 _start:
     cmp r1, 2
@@ -1005,7 +1005,7 @@ use:
     .asciz "usage: chmod +x|-x file\\n"
 `,
 
-  mv: `; mv — rename, which only rewrites a directory entry
+  mv: `; mv - rename, which only rewrites a directory entry
 .text
 _start:
     cmp r1, 2
@@ -1046,7 +1046,7 @@ use:
     .asciz "usage: mv source target\\n"
 `,
 
-  mount: `; mount — attach a block device to a directory
+  mount: `; mount - attach a block device to a directory
 .text
 _start:
     cmp r1, 2
@@ -1089,7 +1089,7 @@ use:
 
   umount: oneArg('umount', 21, 'umount directory', 'umount: cannot unmount'),
 
-  sleep: `; sleep — suspend for the given number of seconds
+  sleep: `; sleep - suspend for the given number of seconds
 .text
 _start:
     cmp r1, 0
@@ -1120,7 +1120,7 @@ use:
     .asciz "usage: sleep seconds\\n"
 `,
 
-  kill: `; kill — send SIGTERM to a process
+  kill: `; kill - send SIGTERM to a process
 .text
 _start:
     cmp r1, 0
@@ -1159,7 +1159,7 @@ use:
     .asciz "usage: kill pid\\n"
 `,
 
-  count: `; count — print a counter, sleeping one tick between numbers
+  count: `; count - print a counter, sleeping one tick between numbers
 .text
 _start:
     mov r0, 10
@@ -1213,7 +1213,7 @@ nl:
     .ascii "\\n"
 `,
 
-  pid: `; pid — print the process id
+  pid: `; pid - print the process id
 .text
 _start:
     mov r0, 7
@@ -1235,7 +1235,7 @@ nl:
     .ascii "\\n"
 `,
 
-  whoami: `; whoami — print the USER environment variable
+  whoami: `; whoami - print the USER environment variable
 .text
 _start:
     mov r0, 18
@@ -1264,7 +1264,7 @@ nl:
     .ascii "\\n"
 `,
 
-  uname: `; uname — print the system name, -a prints the long form
+  uname: `; uname - print the system name, -a prints the long form
 .text
 _start:
     cmp r1, 0
@@ -1292,7 +1292,7 @@ long_s:
     .asciz "crados 1.0 minnow browser js single-core\\n"
 `,
 
-  clear: `; clear — emit the erase-display control sequence
+  clear: `; clear - emit the erase-display control sequence
 .text
 _start:
     mov r0, 1
@@ -1309,21 +1309,21 @@ esc:
     .ascii "[2J"
 `,
 
-  true: `; true — exit with status 0
+  true: `; true - exit with status 0
 .text
 _start:
     mov r1, 0
     hlt
 `,
 
-  false: `; false — exit with status 1
+  false: `; false - exit with status 1
 .text
 _start:
     mov r1, 1
     hlt
 `,
 
-  head: `; head — copy the first ten lines of a file
+  head: `; head - copy the first ten lines of a file
 .text
 _start:
     cmp r1, 0
@@ -1425,7 +1425,7 @@ use: .asciz "usage: head file\\n"
 limit: .word 10
 `,
 
-  wc: `; wc — count lines, words and bytes
+  wc: `; wc - count lines, words and bytes
 .text
 _start:
     cmp r1, 0
@@ -1556,7 +1556,7 @@ use: .asciz "usage: wc file\\n"
   man: viewProgram('man', 8, true),
   help: viewProgram('help', 9),
 
-  as: `; as — machine-code frontend to the kernel's boot assembler service
+  as: `; as - machine-code frontend to the kernel's boot assembler service
 .text
 _start:
     cmp r1, 3

@@ -234,7 +234,7 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
             label="清除浏览器持久化数据"
             onClick={() => {
               kernel.wipeRoot()
-              setMsg('persistent store cleared — 重启后恢复出厂状态')
+              setMsg('persistent store cleared - 重启后恢复出厂状态')
             }}
             danger
           >

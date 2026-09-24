@@ -33,7 +33,7 @@ export function Header({ kernel, snap, onReboot }: { kernel: Kernel; snap: Snaps
         {kernelMode ? 'kernel' : 'user'}
       </span>
 
-      <Stat label="proc" value={cur ? `${cur.pid}:${cur.name}` : '—'} />
+      <Stat label="proc" value={cur ? `${cur.pid}:${cur.name}` : '-'} />
       <Stat label="tick" value={String(snap.ticks)} />
       <Stat label={snap.turbo ? 'tick/s' : 'switches'} value={String(snap.turbo ? snap.tps : snap.switches)} />
 
