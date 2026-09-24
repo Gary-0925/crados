@@ -40,7 +40,7 @@ export function MemoryPanel({
     <div className="p-2.5">
       <div className="flex items-baseline justify-between text-[10px] text-[#8b949e]">
         <span>
-          物理内存 · {FRAME_COUNT} 帧 × {PAGE_SIZE} B · 前 {KERNEL_FRAMES} 帧内核保留
+          内存 · {FRAME_COUNT} 帧 × {PAGE_SIZE} B
         </span>
         <span className="tabular">
           {(snap.mem.used / 1024).toFixed(1)} / {(snap.mem.total / 1024).toFixed(0)} KiB

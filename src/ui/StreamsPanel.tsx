@@ -16,7 +16,7 @@ export function TracePanel({ snap }: { snap: Snapshot }) {
   return (
     <div className="flex h-full flex-col p-2.5">
       <div className="text-[10px] text-[#8b949e]">
-        系统调用追踪 · 陷入内核并经 ax 寄存器返回 · {snap.trace.length} 条
+        系统调用追踪
       </div>
       <div ref={ref} className="mt-1.5 min-h-0 flex-1 overflow-y-auto text-[10.5px] leading-[1.6] tabular">
         {snap.trace.map((t, i) => (
@@ -45,7 +45,7 @@ export function KmsgPanel({ snap }: { snap: Snapshot }) {
   const ref = useStick()
   return (
     <div className="flex h-full flex-col p-2.5">
-      <div className="text-[10px] text-[#8b949e]">内核环形缓冲区 · 等价于终端中的 dmesg</div>
+      <div className="text-[10px] text-[#8b949e]">日志 (dmesg)</div>
       <div ref={ref} className="mt-1.5 min-h-0 flex-1 overflow-y-auto text-[10.5px] leading-[1.6] tabular">
         {snap.kmsgText.map((l, i) => {
           const sep = l.indexOf(']')

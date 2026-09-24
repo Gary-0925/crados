@@ -1,10 +1,10 @@
-export const MOTD = `crados 0.1 (minnow) — a transparent teaching kernel
+export const MOTD = `crados 1.0 (Cradle OS) - a transparent OS
 
 Type 'help' for the command list, 'man' for the guided tour.
 The right-hand panels are a live projection of kernel data structures.
 `
 
-export const README = `crados(7) — system overview
+export const README = `crados(7) - system overview
 
 DESCRIPTION
   A single-core, tick-driven kernel. Every command you type crosses the
@@ -43,7 +43,7 @@ SEE ALSO
   man inspect    reading raw memory and disk bytes
 `
 
-export const HELLO_S = `; hello.s — assemble with: as hello.s -o hello
+export const HELLO_S = `; hello.s - assemble with: as hello.s -o hello
 .text
 _start:
     mov r0, 1          ; syscall 1 = write
@@ -59,7 +59,7 @@ msg:
     .asciz "hello from a real binary\\n"
 `
 
-export const COUNT_S = `; count.s — a loop, a syscall and a sleep
+export const COUNT_S = `; count.s - a loop, a syscall and a sleep
 ; build:  as count.s -o count      run:  ./count
 .text
 _start:
@@ -102,7 +102,7 @@ nl:
     .asciz "\\n"
 `
 
-export const MAN_ASM = `asm(7) — writing real executables
+export const MAN_ASM = `asm(7) - writing real executables
 
 A program in /bin is not special. It is a file whose first four bytes are
 the magic number \\x7fCRX, with the execute bit set. Assemble one yourself
@@ -186,7 +186,7 @@ EXAMPLE
   See /home/user/hello.s and /home/user/count.s for working sources.
 `
 
-export const MAN_INSPECT = `inspect(7) — looking at raw storage
+export const MAN_INSPECT = `inspect(7) - looking at raw storage
 
 Every abstraction in this system is backed by real bytes. Physical memory is
 a 16 KiB array; a page table entry is an index into it. A disk image is a
@@ -239,7 +239,7 @@ WHAT YOU WILL SEE
   allocated page never leaks the previous tenant's data.
 `
 
-export const MAN_STORAGE = `storage(7) — disks, the on-disk format, import and export
+export const MAN_STORAGE = `storage(7) - disks, the on-disk format, import and export
 
 ON-DISK FORMAT (CRFS)
   A disk is an array of bytes and nothing else. Every structure below is a
@@ -303,7 +303,7 @@ NOTES
   device with EBUSY. Writes past the end of a disk fail with ENOSPC.
 `
 
-export const MAN_SCRIPT = `script(7) — creating an executable
+export const MAN_SCRIPT = `script(7) - creating an executable
 
 A file becomes a program in two steps: give it a #! interpreter line, then
 set the execute bit. This is exactly what execve(2) does on a real system.

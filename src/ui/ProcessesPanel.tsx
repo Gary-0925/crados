@@ -82,7 +82,7 @@ export function ProcessesPanel({
   return (
     <div className="p-2.5">
       <div className="flex items-baseline justify-between text-[10px] text-[#8b949e]">
-        <span>进程表 · 轮转调度 · 点击查看 PCB</span>
+        <span>进程表</span>
         <span className="tabular">
           <span className="text-[#3fb950]">{counts.running} run</span> · {counts.ready} ready ·{' '}
           <span className="text-[#d29922]">{counts.blocked} block</span> ·{' '}
