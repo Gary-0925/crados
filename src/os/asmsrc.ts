@@ -551,7 +551,7 @@ bg:     .byte 0
 scriptmode: .byte 0
 scriptfd: .word 0
 selfpid: .word 0
-banner: .asciz "crados 1.0 (Cradle OS) - all /bin programs are CRX machine code\\nType help for commands.\\n"
+banner: .asciz "crados 1.0 (Cradle OS)\\nType help for commands.\\n"
 pre:    .asciz "user@crados:"
 post:   .asciz "$ "
 home:   .asciz "/home/user"

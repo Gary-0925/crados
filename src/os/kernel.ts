@@ -1133,7 +1133,7 @@ export class Kernel {
     }
     if (kind === 9)
       return [
-        'crados commands (every file in /bin is CRX machine code)',
+        'crados commands',
         '',
         'files:   ls cat head wc cp mv rm rmdir mkdir touch chmod echo',
         'process: ps kill sleep count pid',
