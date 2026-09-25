@@ -4,7 +4,7 @@
 // 任何代价——内核只在 observer 非空时才产生追踪数据。
 
 import type { Kernel } from '@/os/kernel'
-import { basename, T_DEV, T_DIR, T_FILE } from '@/os/fs'
+import { basename, modeText, T_DEV, T_DIR, T_FILE } from '@/os/fs'
 import { disassemble, isExecutable, loadExe } from '@/os/isa'
 import { FRAME_COUNT, KERNEL_TEXT_FRAME, USER_FRAME_START } from '@/os/memory'
 import type { PTE } from '@/os/process'
@@ -43,6 +43,8 @@ export interface ProcRow {
   ticksUsed: number
   cwd: string
   children: number[]
+  uid: number
+  euid: number
   exitCode: number | null
   waitDesc: string | null
   pts: PTE[]
@@ -61,6 +63,8 @@ export interface FSNode {
   size: number
   blocks: number
   exec: boolean
+  uid: number
+  mode: string
   disk: string
   path: string
   data?: string
@@ -105,7 +109,7 @@ function formatCall(sc: Syscall): string {
     case 'mkdir': return `mkdir("${sc.path}")`
     case 'unlink': return `unlink("${sc.path}")`
     case 'rename': return `rename("${sc.from}", "${sc.to}")`
-    case 'chmod': return `chmod("${sc.path}", ${sc.exec ? '+x' : '-x'})`
+    case 'chmod': return `chmod("${sc.path}", +${sc.set.toString(16)} -${sc.clear.toString(16)})`
     case 'chdir': return `chdir("${sc.path}")`
     case 'getcwd': return 'getcwd()'
     case 'spawn': return `execve("${sc.path}", [${sc.args.join(', ')}])`
@@ -209,7 +213,7 @@ export class ControlPanel {
     const k = this.kernel
     const node = k.vfs.resolve(path, '/')
     if ('err' in node)
-      return { ino: 0, name: basename(path), type: 'file', size: 0, blocks: 0, exec: false, disk: '?', path, kids: [] }
+      return { ino: 0, name: basename(path), type: 'file', size: 0, blocks: 0, exec: false, uid: 0, mode: '------', disk: '?', path, kids: [] }
     const fs = k.vfs.fsOf(node)
     const kids =
       node.type === T_DIR
@@ -229,6 +233,8 @@ export class ControlPanel {
       size: node.size,
       blocks: node.type === T_DEV ? 0 : fs.blocksOf(node.ino).length,
       exec: node.exec,
+      uid: node.uid,
+      mode: modeText(node.mode),
       disk: node.dev.spec.name,
       path,
       data: raw && !binary ? clip(UTF8_DECODER.decode(raw), 1600) : undefined,
@@ -279,6 +285,8 @@ export class ControlPanel {
         ticksUsed: p.ticksUsed,
         cwd: p.cwd,
         children: processes.filter((child) => child.ppid === p.pid && child.pid !== p.pid).map((child) => child.pid),
+        uid: p.uid,
+        euid: p.euid,
         exitCode: p.exitCode,
         waitDesc: p.waitDesc() as string | null,
         pts: p.pageTable,

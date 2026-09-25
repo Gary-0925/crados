@@ -16,11 +16,33 @@ import {
   saveDev,
   SPECS,
 } from './blockdev'
-import { basename, CRFS, dirname, DRV_TTY, normalizePath, T_DEV, T_DIR, T_FILE, VFS } from './fs'
+import {
+  applyLoginPolicy,
+  basename,
+  CRFS,
+  dirname,
+  DRV_TTY,
+  M_EXEC,
+  M_OEXEC,
+  M_OREAD,
+  M_OWRITE,
+  M_READ,
+  M_SETUID,
+  M_STICKY,
+  M_WRITE,
+  normalizePath,
+  T_DEV,
+  T_DIR,
+  T_FILE,
+  UID_ROOT,
+  UID_USER,
+  VFS,
+} from './fs'
 import type { FNode } from './fs'
 import {
   FRAME_COUNT,
   KERNEL_TEXT_FRAME,
+  KERNEL_TEXT_PAGES,
   Memory,
   PAGE_SIZE,
   RAM_SIZE,
@@ -43,7 +65,6 @@ const TURBO_BUDGET_MS = 6 // 不限速模式每帧允许占用的时间
 const SLICES_PER_PUMP = 8
 const KERNEL_STACK_VPN = 15
 const KERNEL_TEXT_PFN = KERNEL_TEXT_FRAME
-const KERNEL_TEXT_PAGES = FRAME_COUNT - KERNEL_TEXT_PFN
 const KERNEL_TEXT_BASE = KERNEL_TEXT_PFN * PAGE_SIZE
 const MMIO_TTY_OUT = 0xff00
 const MMIO_TTY_ERR = 0xff01
@@ -140,7 +161,7 @@ export class Kernel {
     }
     stamp('crados 2.0 booting on browser/js')
     stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
-    stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B`)
+    stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${RAM_SIZE / 1024} KiB`)
 
     if (!this.installGuestKernel()) {
       this.setPanic('cannot install CRX kernel trap page')
@@ -170,6 +191,7 @@ export class Kernel {
     this.vfs.umount('/')
     this.vfs.mount('/', sdafs)
     this.vfs.mount('/bin', romfs)
+    this.ensureCreds('sda')
     stamp(
       restored
         ? `sda: superblock valid, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`
@@ -255,6 +277,7 @@ export class Kernel {
       if (typeof ino !== 'number') continue
       fs.writeBytes(ino, r.bytes)
       fs.setExec(ino, true)
+      fs.setFlags(ino, fs.iflags(ino) | M_OEXEC)
       compiled++
     }
     return compiled
@@ -269,7 +292,8 @@ export class Kernel {
       return false
     }
     const image = built.bytes.slice(16)
-    if (image.length > PAGE_SIZE * KERNEL_TEXT_PAGES || built.symbols.ivt === undefined) return false
+    // 文本必须停在 MMIO 窗口前面，否则中断向量会被读成 0。
+    if (image.length > PAGE_SIZE * KERNEL_TEXT_PAGES || KERNEL_TEXT_BASE + image.length > 0xff00 || built.symbols.ivt === undefined) return false
 
     // Relocate absolute symbol references from image offset zero.
     for (const at of built.relocations) {
@@ -591,6 +615,15 @@ export class Kernel {
       }
       try {
         const bytes = dev.block(block)
+        // 命令 2 是用户态 block_write。命令 4/5 是内核自己的 CRFS 搬运，不在这里卡 euid。
+        if (command === 2 && this.euidOf(this.currentPid) !== UID_ROOT) {
+          setReg16(8, 0xffff)
+          return
+        }
+        if ((command === 2 || command === 5) && name === 'rom') {
+          setReg16(8, 0xffff)
+          return
+        }
         if (command === 1 || command === 4) {
           const forceUser = command === 1
           for (let i = 0; i < bytes.length; i++) writeMem(buffer + i, bytes[i], forceUser)
@@ -668,6 +701,7 @@ export class Kernel {
     args: string[],
     spec: ExecSpec,
     image: Uint8Array,
+    setuid?: number,
   ): Process | Err {
     const slot = this.freeSlot()
     if (slot < 0) return { err: 'EAGAIN' }
@@ -687,9 +721,23 @@ export class Kernel {
     const argvText = args.length ? args.join('\0') + '\0' : ''
     this.mem.writeAt(stackFrame * PAGE_SIZE, argvText)
 
-    const env = parent ? { ...parent.env } : { USER: 'root', HOME: '/', PATH: '/usr/bin:/bin', SHELL: '/bin/sh' }
+    const env = parent ? { ...parent.env } : { USER: 'root', HOME: '/', PATH: '/bin:/usr/bin', SHELL: '/bin/sh' }
     const p = new Process(this.mem, slot, unloadedGen(), env, this.vfsHooks)
     p.init(pid, parent ? parent.pid : 0, name, cmd, parent ? parent.cwd : '/')
+    if (parent) {
+      p.uid = parent.uid
+      p.euid = parent.euid
+      p.gid = parent.gid
+      p.egid = parent.egid
+    }
+    if (setuid !== undefined) p.euid = setuid
+    // init 拉起的交互 shell 是登录会话，落到 uid 1000。setuid 的 sh 也不例外。
+    if (name === 'sh' && !args.length && p.euid === UID_ROOT) {
+      p.uid = UID_USER
+      p.euid = UID_USER
+      p.gid = UID_USER
+      p.egid = UID_USER
+    }
     p.pageTable = [
       ...pfns.slice(0, codePages + 1).map((pfn, vpn) => ({ vpn, pfn })),
       { vpn: KERNEL_STACK_VPN, pfn: kernelStackFrame, supervisor: true },
@@ -746,12 +794,14 @@ export class Kernel {
     this.mem.setU16(0x0024, this.hz)
     this.mem.setU16(0x0030, this.kernelIvt)
     this.mem.setU16(0x0032, this.procs.size)
-    this.mem.setU16(0x0034, RAM_SIZE)
+    // 64 KiB 放不进 u16，这里记最后一个可寻址字节。mem 命令用的是真实字节数。
+    this.mem.setU16(0x0034, RAM_SIZE > 0xffff ? 0xffff : RAM_SIZE)
     this.mem.setU16(0x0036, PAGE_SIZE)
     this.mem.setU16(0x0038, PCB_BASE)
     this.mem.setU16(0x003a, PCB_SIZE)
     this.mem.setU16(0x003c, QUANTUM)
     this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
+    this.mem.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
   }
 
   private doExit(p: Process, code: number) {
@@ -793,7 +843,10 @@ export class Kernel {
   }
 
   private killSig(p: Process, sig: number) {
-    if (p.pid <= 1) return
+    if (p.pid <= 1) {
+      this.setPanic('Attempted to kill init')
+      return
+    }
     const name = sig === 2 ? 'SIGINT' : sig === 9 ? 'SIGKILL' : sig === 15 ? 'SIGTERM' : `signal ${sig}`
     this.log(`signal: pid ${p.pid} (${p.name}) terminated by ${name}`)
     this.doExit(p, 128 + sig)
@@ -804,6 +857,67 @@ export class Kernel {
     this.log(`Kernel panic - not syncing: ${msg}`, true)
     this.flush(true)
     this.emit()
+  }
+
+  // ---------- 凭证 ----------
+
+  private euidOf(pid: number): number {
+    return this.procs.get(pid)?.euid ?? UID_ROOT
+  }
+
+  private isRoot(p: Process): boolean {
+    return p.euid === UID_ROOT
+  }
+
+  // 旧盘没有 uid 表时补一次。已标记的盘不动，避免把用户文件改回 root。
+  private ensureCreds(name: string) {
+    const fs = this.fss.get(name)
+    if (!fs || !fs.valid() || fs.credsReady()) return
+    fs.seedModes()
+    applyLoginPolicy(fs)
+    fs.markCreds()
+    this.dirty = true
+    this.log(`${name}: credential table written, login uid ${UID_USER}`)
+  }
+
+  private modeAllows(p: Process, fs: CRFS, ino: number, write: boolean): boolean {
+    if (write && fs.dev.spec.name === 'rom') return false
+    if (this.isRoot(p)) return true
+    const mode = fs.iflags(ino)
+    const own = p.euid === fs.iowner(ino)
+    return write ? (mode & (own ? M_WRITE : M_OWRITE)) !== 0 : (mode & (own ? M_READ : M_OREAD)) !== 0
+  }
+
+  private canExec(p: Process, fs: CRFS, ino: number): boolean {
+    if (this.isRoot(p)) return true
+    const mode = fs.iflags(ino)
+    return (mode & (p.euid === fs.iowner(ino) ? M_EXEC : M_OEXEC)) !== 0
+  }
+
+  // 沿路径检查每一级目录的搜索权。最后一级只解析，不额外要求权限。
+  private walk(p: Process, path: string): FNode | Err {
+    const abs = normalizePath(path, p.cwd)
+    const parts = abs.split('/').filter(Boolean)
+    let cur = '/'
+    for (const seg of parts) {
+      const dir = this.vfs.resolve(cur, '/')
+      if ('err' in dir) return dir
+      if (dir.type !== T_DIR) return { err: 'ENOTDIR' }
+      if (!this.canExec(p, this.vfs.fsOf(dir), dir.ino)) return { err: 'EACCES' }
+      cur = cur === '/' ? `/${seg}` : `${cur}/${seg}`
+    }
+    return this.vfs.resolve(abs, '/')
+  }
+
+  private parentNode(p: Process, path: string): FNode | Err {
+    const abs = normalizePath(path, p.cwd)
+    const dir = this.walk(p, dirname(abs))
+    if ('err' in dir) return dir
+    if (dir.type !== T_DIR) return { err: 'ENOTDIR' }
+    if (dir.dev.spec.name === 'rom') return { err: 'EROFS' }
+    const fs = this.vfs.fsOf(dir)
+    if (!this.canExec(p, fs, dir.ino) || !this.modeAllows(p, fs, dir.ino, true)) return { err: 'EACCES' }
+    return dir
   }
 
   // ---------- 设备与持久化 ----------
@@ -837,6 +951,7 @@ export class Kernel {
     if (target.type !== T_DIR) return { err: 'ENOTDIR' }
     const fs = this.fsOf(name)
     if (!fs.valid()) return { err: 'EINVAL' }
+    this.ensureCreds(name)
     const abs = normalizePath(dir, cwd)
     if (abs === '/' || [...this.mounts.values()].includes(abs)) return { err: 'EBUSY' }
     this.vfs.mount(abs, fs)
@@ -933,6 +1048,7 @@ export class Kernel {
       this.fss.delete(name)
       return { err: 'EINVAL' }
     }
+    this.ensureCreds(name)
     if (this.persist) {
       saveDev(dev)
       rememberDisk(name)
@@ -995,9 +1111,10 @@ export class Kernel {
         result = this.sysDup(p, sc.from, sc.to)
         break
       case 'readdir': {
-        const node = this.vfs.resolve(sc.path, p.cwd)
+        const node = this.walk(p, sc.path)
         if ('err' in node) result = { err: node.err }
         else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
+        else if (!this.modeAllows(p, this.vfs.fsOf(node), node.ino, false)) result = { err: 'EACCES' }
         else {
           const fs = this.vfs.fsOf(node)
           result = fs.entries(node.ino).map((e) => ({
@@ -1012,7 +1129,7 @@ export class Kernel {
         break
       }
       case 'stat': {
-        const node = this.vfs.resolve(sc.path, p.cwd)
+        const node = this.walk(p, sc.path)
         result =
           'err' in node
             ? { err: node.err }
@@ -1036,19 +1153,23 @@ export class Kernel {
         result = this.sysRename(p, sc.from, sc.to)
         break
       case 'chmod': {
-        const node = this.vfs.resolve(sc.path, p.cwd)
+        const node = this.walk(p, sc.path)
         if ('err' in node) result = { err: node.err }
+        else if (node.dev.spec.name === 'rom') result = { err: 'EROFS' }
+        else if (!this.isRoot(p) && p.euid !== node.uid) result = { err: 'EPERM' }
         else {
-          this.vfs.fsOf(node).setExec(node.ino, sc.exec)
+          const fs = this.vfs.fsOf(node)
+          fs.setFlags(node.ino, (fs.iflags(node.ino) | sc.set) & ~sc.clear & 0xff)
           this.dirty = true
           result = 0
         }
         break
       }
       case 'chdir': {
-        const node = this.vfs.resolve(sc.path, p.cwd)
+        const node = this.walk(p, sc.path)
         if ('err' in node) result = { err: node.err }
         else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
+        else if (!this.canExec(p, this.vfs.fsOf(node), node.ino)) result = { err: 'EACCES' }
         else {
           p.cwd = normalizePath(sc.path, p.cwd)
           result = 0
@@ -1102,6 +1223,8 @@ export class Kernel {
       case 'kill': {
         const t = this.procs.get(sc.pid)
         if (!t) result = { err: 'ESRCH' }
+        else if (!this.isRoot(p) && (sc.pid <= 1 || (t.euid !== p.euid && t.uid !== p.euid)))
+          result = { err: 'EPERM' }
         else {
           this.killSig(t, sc.sig)
           result = 0
@@ -1109,10 +1232,10 @@ export class Kernel {
         break
       }
       case 'mount':
-        result = this.sysMount(sc.dev, sc.dir, p.cwd)
+        result = this.isRoot(p) ? this.sysMount(sc.dev, sc.dir, p.cwd) : { err: 'EPERM' }
         break
       case 'umount':
-        result = this.sysUmount(sc.target, p.cwd)
+        result = this.isRoot(p) ? this.sysUmount(sc.target, p.cwd) : { err: 'EPERM' }
         break
       case 'sync':
         result = this.flush(false)
@@ -1123,10 +1246,15 @@ export class Kernel {
       case 'getenv':
         result = p.env[sc.key] ?? ''
         break
-      case 'tcsetpgrp':
-        this.fgPid = sc.pid
-        result = 0
+      case 'tcsetpgrp': {
+        const t = this.procs.get(sc.pid)
+        if (t && !this.isRoot(p) && t.euid !== p.euid) result = { err: 'EPERM' }
+        else {
+          this.fgPid = sc.pid
+          result = 0
+        }
         break
+      }
       case 'view':
         result = this.sysView(sc.kind, sc.arg, p)
         break
@@ -1155,9 +1283,9 @@ export class Kernel {
   // /proc 与 /sys 风格的文本视图。格式化发生在内核虚拟文件层，命令本身只做 read/write。
   private sysView(kind: number, arg: string, p: Process): string | Err {
     if (kind === 1) {
-      let out = '  PID  PPID STAT MEM TIME COMMAND\n'
+      let out = '  PID  PPID   UID STAT MEM TIME COMMAND\n'
       for (const r of this.procInfoList())
-        out += `${String(r.pid).padStart(5)} ${String(r.ppid).padStart(5)} ${r.state
+        out += `${String(r.pid).padStart(5)} ${String(r.ppid).padStart(5)} ${String(r.uid).padStart(5)} ${r.state
           .slice(0, 4)
           .toUpperCase()
           .padEnd(5)} ${String(r.pages).padStart(3)}p ${String(r.ticks).padStart(4)} ${r.cmd}${
@@ -1193,9 +1321,10 @@ export class Kernel {
     }
     if (kind === 5) return clip(this.kmsgLines().join('\n') + '\n', 1190)
     if (kind === 6 || kind === 7) {
-      const node = this.vfs.resolve(arg, p.cwd)
+      const node = this.walk(p, arg)
       if ('err' in node) return { err: node.err }
       if (node.type !== T_FILE) return { err: 'EISDIR' }
+      if (!this.modeAllows(p, this.vfs.fsOf(node), node.ino, false)) return { err: 'EACCES' }
       const raw = this.vfs.fsOf(node).readBytes(node.ino)
       if (kind === 7) {
         const exe = loadExe(String.fromCharCode(...raw))
@@ -1236,22 +1365,26 @@ export class Kernel {
 
   // 汇编服务使用与引导 ROM 完全相同的编码器；产物仍由 CPU 执行，不存在函数入口。
   private sysAssemble(source: string, output: string, p: Process): 0 | Err {
-    const src = this.vfs.resolve(source, p.cwd)
-    if ('err' in src) return { err: src.err }
+    const src = this.walk(p, source)
+    if ('err' in src) return src
     if (src.type !== T_FILE) return { err: 'EISDIR' }
+    if (!this.modeAllows(p, this.vfs.fsOf(src), src.ino, false)) return { err: 'EACCES' }
     const text = this.vfs.fsOf(src).read(src.ino)
     const built = assemble(text)
     if (built.errors.length) {
       this.log(`as: ${source}:${built.errors[0]}`)
       return { err: 'EINVAL' }
     }
-    let dst = this.vfs.resolve(output, p.cwd)
+    let dst = this.walk(p, output)
     if ('err' in dst) {
+      if (dst.err !== 'ENOENT') return dst
       const c = this.sysCreate(p, output, T_FILE)
       if (c !== 0) return c
-      dst = this.vfs.resolve(output, p.cwd)
+      dst = this.walk(p, output)
     }
-    if ('err' in dst) return { err: dst.err }
+    if ('err' in dst) return dst
+    if (dst.dev.spec.name === 'rom') return { err: 'EROFS' }
+    if (!this.modeAllows(p, this.vfs.fsOf(dst), dst.ino, true)) return { err: 'EACCES' }
     const fs = this.vfs.fsOf(dst)
     const wr = fs.writeBytes(dst.ino, built.bytes)
     if (isErr(wr)) return wr
@@ -1262,12 +1395,12 @@ export class Kernel {
 
   private sysCreate(p: Process, path: string, type: number): 0 | Err {
     const abs = normalizePath(path, p.cwd)
-    const parent = this.vfs.resolve(dirname(abs), '/')
-    if ('err' in parent) return { err: parent.err }
-    if (parent.type !== T_DIR) return { err: 'ENOTDIR' }
+    const parent = this.parentNode(p, abs)
+    if ('err' in parent) return parent
     const fs = this.vfs.fsOf(parent)
     const r = fs.create(parent.ino, basename(abs), type)
     if (typeof r !== 'number') return r
+    fs.setOwner(r, p.euid)
     this.dirty = true
     return 0
   }
@@ -1275,36 +1408,53 @@ export class Kernel {
   private sysUnlink(p: Process, path: string): 0 | Err {
     const abs = normalizePath(path, p.cwd)
     if (abs === '/' || this.vfs.isMountPoint(abs)) return { err: 'EBUSY' }
-    const node = this.vfs.resolve(abs, '/')
-    if ('err' in node) return { err: node.err }
+    const node = this.walk(p, abs)
+    if ('err' in node) return node
+    if (node.dev.spec.name === 'rom') return { err: 'EROFS' }
     if (node.type === T_DEV) return { err: 'EPERM' }
+    const parent = this.parentNode(p, abs)
+    if ('err' in parent) return parent
     const fs = this.vfs.fsOf(node)
     if (node.type === T_DIR && fs.entries(node.ino).length) return { err: 'ENOTEMPTY' }
-    const parentIno = fs.iparent(node.ino)
-    fs.unlink(parentIno, node.name)
+    if ((fs.iflags(parent.ino) & M_STICKY) !== 0 && !this.isRoot(p) && p.euid !== node.uid)
+      return { err: 'EPERM' }
+    fs.unlink(fs.iparent(node.ino), node.name)
     fs.destroy(node.ino)
     this.dirty = true
     return 0
   }
 
   private sysRename(p: Process, from: string, to: string): 0 | Err {
-    const src = this.vfs.resolve(from, p.cwd)
-    if ('err' in src) return { err: src.err }
+    const src = this.walk(p, from)
+    if ('err' in src) return src
+    if (src.type === T_DEV) return { err: 'EPERM' }
+    if (src.dev.spec.name === 'rom') return { err: 'EROFS' }
+    const srcParent = this.parentNode(p, normalizePath(from, p.cwd))
+    if ('err' in srcParent) return srcParent
+    const fs = this.vfs.fsOf(src)
+    if ((fs.iflags(srcParent.ino) & M_STICKY) !== 0 && !this.isRoot(p) && p.euid !== src.uid)
+      return { err: 'EPERM' }
+
     const absTo = normalizePath(to, p.cwd)
     const existing = this.vfs.resolve(absTo, '/')
     let dir: FNode | Err
     let name: string
     if (!('err' in existing) && existing.type === T_DIR) {
+      if (existing.dev.spec.name === 'rom') return { err: 'EROFS' }
+      if (!this.canExec(p, this.vfs.fsOf(existing), existing.ino) || !this.modeAllows(p, this.vfs.fsOf(existing), existing.ino, true))
+        return { err: 'EACCES' }
       dir = existing
       name = src.name
     } else {
-      dir = this.vfs.resolve(dirname(absTo), '/')
+      dir = this.parentNode(p, absTo)
       name = basename(absTo)
-      if (!('err' in existing)) this.sysUnlink(p, absTo)
+      if (!('err' in existing)) {
+        const removed = this.sysUnlink(p, absTo)
+        if (removed !== 0) return removed
+      }
     }
-    if ('err' in dir) return { err: dir.err }
+    if ('err' in dir) return dir
     if (dir.dev !== src.dev) return { err: 'EXDEV' } // 跨设备只能用 cp 逐块复制
-    const fs = this.vfs.fsOf(src)
     fs.unlink(fs.iparent(src.ino), src.name)
     const r = fs.link(dir.ino, name, src.ino)
     if (r !== 0) return r
@@ -1317,6 +1467,12 @@ export class Kernel {
     const f = p.fds.get(fd)
     if (!f) return { err: 'EBADF' }
     if (f.kind === 'stdin' || (f.kind === 'file' && f.flags === 'r')) return { err: 'EBADF' }
+    if (f.kind === 'file') {
+      const fs = this.fss.get(f.dev)
+      if (!fs) return { err: 'EBADF' }
+      if (f.dev === 'rom') return { err: 'EROFS' }
+      if (!this.modeAllows(p, fs, f.ino, true)) return { err: 'EACCES' }
+    }
     const raw = typeof data === 'string' ? UTF8_ENCODER.encode(data) : data
     if (f.kind === 'stdout') {
       const cls = f.id === 2 ? 'err' : 'out'
@@ -1353,6 +1509,7 @@ export class Kernel {
       return line === null || line === undefined ? null : { bytes: UTF8_ENCODER.encode(line) }
     }
     const fs = this.fss.get(f.dev)!
+    if (!this.modeAllows(p, fs, f.ino, false)) return { err: 'EACCES' }
     const size = fs.isize(f.ino)
     if (f.pos >= size) return { bytes: new Uint8Array(0) }
     // 机器码程序按缓冲区大小分次读取；不给长度则读到文件末尾
@@ -1369,16 +1526,20 @@ export class Kernel {
   }
 
   private sysOpen(p: Process, path: string, flags: 'r' | 'w' | 'a'): number | Err {
-    let node = this.vfs.resolve(path, p.cwd)
+    let node = this.walk(p, path)
     if ('err' in node) {
-      if (flags === 'r' || node.err !== 'ENOENT') return { err: node.err }
+      if (flags === 'r' || node.err !== 'ENOENT') return node
       const c = this.sysCreate(p, path, T_FILE)
       if (c !== 0) return c
-      node = this.vfs.resolve(path, p.cwd)
-      if ('err' in node) return { err: node.err }
+      node = this.walk(p, path)
+      if ('err' in node) return node
     }
     const n = node as FNode
     if (n.type === T_DIR) return { err: 'EISDIR' }
+    if (flags === 'r') {
+      if (!this.modeAllows(p, this.vfs.fsOf(n), n.ino, false)) return { err: 'EACCES' }
+    } else if (n.dev.spec.name === 'rom') return { err: 'EROFS' }
+    else if (!this.modeAllows(p, this.vfs.fsOf(n), n.ino, true)) return { err: 'EACCES' }
     const fd = this.lowestFd(p)
     if (n.type === T_DEV) {
       p.fds.set(fd, n.driver === DRV_TTY ? { kind: 'tty' } : { kind: 'null' })
@@ -1411,7 +1572,7 @@ export class Kernel {
   private sysSpawn(p: Process, path: string, args: string[]): number | Err {
     let resolved = path
     if (!path.includes('/')) {
-      for (const dir of (p.env.PATH || '/usr/bin:/bin').split(':')) {
+      for (const dir of (p.env.PATH || '/bin:/usr/bin').split(':')) {
         const candidate = `${dir}/${path}`
         if (!('err' in this.vfs.resolve(candidate, p.cwd))) {
           resolved = candidate
@@ -1419,11 +1580,11 @@ export class Kernel {
         }
       }
     }
-    const node = this.vfs.resolve(resolved, p.cwd)
-    if ('err' in node) return { err: node.err }
+    const node = this.walk(p, resolved)
+    if ('err' in node) return node
     if (node.type === T_DIR) return { err: 'EISDIR' }
     if (node.type === T_DEV) return { err: 'EACCES' }
-    if (!node.exec) return { err: 'EACCES' }
+    if (!this.canExec(p, this.vfs.fsOf(node), node.ino)) return { err: 'EACCES' }
 
     const fs = this.vfs.fsOf(node)
     const image = fs.readBytes(node.ino) // 真实的块读取
@@ -1436,14 +1597,14 @@ export class Kernel {
       const exe = loadExe(String.fromCharCode(...image))
       if (!exe) return { err: 'ENOEXEC' }
       this.log(`execve: CRX image, text ${exe.textLen} B, data ${exe.dataLen} B, entry ${hexAddr(exe.entry)}`)
-      return this.launch(p, node.name, `${node.name} ${args.join(' ')}`.trim(), args, { entry: exe.entry }, exe.image)
+      return this.launch(p, node.name, `${node.name} ${args.join(' ')}`.trim(), args, { entry: exe.entry }, exe.image, node)
     }
 
     const head = String.fromCharCode(...image.subarray(0, 64)).split('\n', 1)[0]
     if (!head.startsWith('#!')) return { err: 'ENOEXEC' }
     const interpPath = head.slice(2).trim().split(/\s+/)[0]
-    const interp = this.vfs.resolve(interpPath, '/')
-    if ('err' in interp || !interp.exec) return { err: 'ENOEXEC' }
+    const interp = this.walk(p, interpPath)
+    if ('err' in interp || !this.canExec(p, this.vfs.fsOf(interp), interp.ino)) return { err: 'ENOEXEC' }
     const interpRaw = this.vfs.fsOf(interp).readBytes(interp.ino)
     const interpExe = loadExe(String.fromCharCode(...interpRaw))
     if (!interpExe) return { err: 'ENOEXEC' }
@@ -1455,11 +1616,21 @@ export class Kernel {
       [abs, ...args],
       { entry: interpExe.entry },
       interpExe.image,
+      node,
     )
   }
 
-  private launch(p: Process, name: string, cmd: string, args: string[], spec: ExecSpec, image: Uint8Array): number | Err {
-    const r = this.exec(p, name, cmd, args, spec, image)
+  private launch(
+    p: Process,
+    name: string,
+    cmd: string,
+    args: string[],
+    spec: ExecSpec,
+    image: Uint8Array,
+    file: FNode,
+  ): number | Err {
+    const setuid = (this.vfs.fsOf(file).iflags(file.ino) & M_SETUID) !== 0 ? file.uid : undefined
+    const r = this.exec(p, name, cmd, args, spec, image, setuid)
     if ('err' in r) {
       this.log(`fork: pid ${p.pid} (${p.name}): ${r.err === 'ENOMEM' ? 'out of physical memory' : r.err}`)
       return { err: r.err }
@@ -1472,6 +1643,7 @@ export class Kernel {
     return [...this.procs.values()].map((p) => ({
       pid: p.pid,
       ppid: p.ppid,
+      uid: p.euid,
       name: p.name,
       state: p.state,
       cmd: p.cmd,

@@ -16,7 +16,7 @@ function Detail({ p }: { p: ProcRow }) {
     <div className="mt-2 space-y-2 border-t border-[#30363d] pt-2.5">
       <div className="flex items-center justify-between text-[11px]">
         <span className="text-[#c9d1d9]">
-          pid {p.pid} · {p.cmd}
+          pid {p.pid} · uid {p.euid === p.uid ? p.uid : `${p.euid}/${p.uid}`} · {p.cmd}
         </span>
       </div>
       <div className="grid grid-cols-4 gap-1.5">

@@ -42,7 +42,8 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Panic. Run 'kill 1'. Killing init halts a real kernel too.
+5. Permissions. The login shell is uid 1000. 'kill 1' returns
+   EPERM. Only euid 0 may signal init, and that still panics.
 6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
 
 ## Manuals
@@ -94,7 +95,8 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 内核恐慌。运行 'kill 1'。真实内核杀掉 init 同样会停机。
+5. 权限。登录 shell 是 uid 1000。运行 'kill 1' 得到 EPERM。
+   只有 euid 0 可以信号 init，那样才会恐慌。
 6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
 
 ## 手册
@@ -162,7 +164,7 @@ r1-r3 the arguments; r0 receives the result. 0xffff means failure.
      8 gethz()              9 spawn(path,argv,argc)
     10 wait(pid)           11 getdents(path,buf,max)
     12 getcwd(buf)         13 unlink(path)     14 mkdir(path)
-    15 chmod(path,x)       16 rename(from,to)  17 sync()
+    15 chmod(path,set,clr)       16 rename(from,to)  17 sync()
     18 getenv(key,buf)     20 mount(dev,dir)   21 umount(target)
     22 kill(pid,sig)       23 chdir(path)      24 dup(fd)
     25 dup2(old,new)       26 readview(kind,arg,buf)
@@ -230,7 +232,7 @@ jgt 测试。地址空间从 0 开始：先 .text，再 .data，栈在最高一�
      8 gethz()              9 spawn(path,argv,argc)
     10 wait(pid)           11 getdents(path,buf,max)
     12 getcwd(buf)         13 unlink(path)     14 mkdir(path)
-    15 chmod(path,x)       16 rename(from,to)  17 sync()
+    15 chmod(path,set,clr)       16 rename(from,to)  17 sync()
     18 getenv(key,buf)     20 mount(dev,dir)   21 umount(target)
     22 kill(pid,sig)       23 chdir(path)      24 dup(fd)
     25 dup2(old,new)       26 readview(kind,arg,buf)
@@ -265,11 +267,23 @@ field inside those bytes; no copy of the tree is held anywhere else.
 An inode is laid out as
 
     offset 0   type    1 file, 2 directory, 3 device
-    offset 1   flags   bit 0 is the execute bit
+    offset 1   flags   bit0 owner exec, bit1 owner read, bit2 owner write,
+                       bit3 other read, bit4 other write, bit5 setuid,
+                       bit6 sticky, bit7 other exec. Shown as rwxrwxst.
+                       chmod [u|o|a][+|-][rwxst] file. x follows u/o/a.
+                       Owner or root, not firmware
     offset 2   size    16-bit length in bytes
     offset 4   parent  inode number of the containing directory
     offset 6   driver  device node minor number
     offset 8   ptr[20] twenty direct block pointers
+
+Owner uids live in the superblock, at byte 32 plus inode*2, one
+big-endian u16 each. The login shell is uid 1000. uid 0 bypasses the
+checks. /bin is firmware: syscall writes return EROFS. block_write
+requires euid 0. A file created by a process is owned by that euid.
+/home/user and /usr/bin are sticky, so a user cannot unlink root's files.
+PATH searches /bin before /usr/bin, so a program in /usr/bin cannot
+shadow ls.
 
 ## Where a file starts and ends
 
@@ -345,11 +359,21 @@ export const DOC_STORAGE_ZH = `# storage
 inode 的布局：
 
     偏移 0    type    1 文件，2 目录，3 设备
-    偏移 1    flags   bit 0 是执行位
+    偏移 1    flags   bit0 属主执行，bit1 属主读，bit2 属主写，
+                      bit3 其他人读，bit4 其他人写，bit5 setuid，
+                      bit6 sticky，bit7 其他人执行。显示为 rwxrwxst。
+                      chmod [u|o|a][+|-][rwxst] file，x 也看 u/o/a。
+                      属主或 root 可以改，固件不行
     偏移 2    size    16 位字节长度
     偏移 4    parent  所在目录的 inode 号
     偏移 6    driver  设备号
     偏移 8    ptr[20] 二十个直接块指针
+
+属主 uid 在超级块里，字节 32 起每个 inode 一个大端 u16。登录 shell 是
+uid 1000。uid 0 跳过检查。/bin 是固件，系统调用写它返回 EROFS。
+block_write 需要 euid 0。进程创建的文件属主就是它的 euid。/home/user
+和 /usr/bin 带 sticky，用户删不掉 root 的文件。PATH 先搜 /bin 再搜
+/usr/bin，所以 /usr/bin 里的程序不能盖住 ls。
 
 ## 文件的起止是怎么标记的
 
@@ -402,8 +426,8 @@ umount、内核恐慌和关闭页面时也会强制写回。存储面板会显�
 export const DOC_INSPECT = `# inspect
 
 Every abstraction here is backed by real bytes. Physical memory is a
-16 KiB array; a page table entry is an index into it. A disk image is a
-block array whose first block is the superblock.
+64 KiB array, 256 frames of 256 bytes; a page table entry is an index
+into it. A disk image is a block array whose first block is the superblock.
 
 ## From the shell
 
@@ -425,6 +449,8 @@ slots of 192 bytes, one per task.
     41-88 fd table     89-105 name        106-127 command
     128-143 r0-r7      144-145 flags      146   halted
     147-154 cpu ticks  155-162 wake deadline     163 sleep mode
+    176-177 uid       178-179 euid            180-181 gid
+    182-183 egid      184-185 frame bit 6     186-187 frame bit 7
 
 CPU tick counters are stored in 64-bit PCB fields. The host performs exact
 arithmetic throughout JavaScript's 53-bit safe range. Sleep mode 1 stores a
@@ -442,7 +468,9 @@ real kernel does with its dentry pointer.
 Registers are not JavaScript values either. The CPU state is a set of
 accessors onto bytes 128-146 of the PCB, so every instruction reads and
 writes that physical register bank. The MMU likewise reads a frame number
-out of bytes 24-39 on every fetch.
+on every fetch: the low 6 bits live in bytes 24-39, and bits 6 and 7 are
+the corresponding bit of the masks at 184 and 186. The frame bitmap is
+the last 32 bytes of frame 0.
 
 ## From the panels
 
@@ -465,8 +493,8 @@ tenant's data.
 
 export const DOC_INSPECT_ZH = `# inspect
 
-这里的每一层抽象背后都是真实字节。物理内存是一块 16 KiB 的数组，页表项
-就是它的下标；磁盘镜像是一个块数组，第一块是超级块。
+这里的每一层抽象背后都是真实字节。物理内存是一块 64 KiB 的数组，256 帧
+乘 256 字节，页表项就是它的下标；磁盘镜像是一个块数组，第一块是超级块。
 
 ## 在 shell 里
 
@@ -487,6 +515,8 @@ export const DOC_INSPECT_ZH = `# inspect
     41-88 fd 表        89-105 名字        106-127 命令行
     128-143 r0-r7      144-145 标志位     146   停机标志
     147-154 cpu tick   155-162 唤醒截止值    163  睡眠模式
+    176-177 uid       178-179 euid           180-181 gid
+    182-183 egid      184-185 帧号 bit6      186-187 帧号 bit7
 
 tick 计数在 PCB 中占 64 位。睡眠模式 1 保存 Guest tick 截止值，因此 MAX 会
 缩短 sleep(ticks)；模式 2 保存单调时钟毫秒截止值，由 sleep_seconds() 使用，
@@ -498,8 +528,9 @@ tick 计数在 PCB 中占 64 位。睡眠模式 1 保存 Guest tick 截止值，
 盘上的 parent 链回溯出来的，真实内核用 dentry 指针做的也是同一件事。
 
 寄存器同样不是 JS 变量。CPU 状态只是 PCB 第 128 到 146 字节的一组访问器，
-每条指令都在读写那片物理寄存器区。MMU 也一样，每次取指都从第 24 到 39
-字节里现取帧号。
+每条指令都在读写那片物理寄存器区。MMU 也一样，每次取指现取帧号：低 6 位
+在第 24 到 39 字节，bit6 和 bit7 是 184、186 两个掩码里对应的那一位。帧
+位图是第 0 帧最后 32 字节。
 
 ## 在面板里
 
@@ -537,7 +568,7 @@ what execve does on a real system.
 
 cat with no argument reads standard input. The shell has redirected fd 1
 into the new file, so your keystrokes land on the disk. Ctrl-D closes the
-stream. chmod sets the execute bit on the inode.
+stream. chmod +x sets the execute bit; u/o/a and rwxst change the rest.
 
 When you run ./hello.sh the kernel reads the first line, finds #!/bin/sh,
 and spawns /bin/sh with the script path as argv[0]. The shell, itself CRX
@@ -579,7 +610,7 @@ export const DOC_SCRIPT_ZH = `# script
 ## 原理
 
 不带参数的 cat 读标准输入。shell 已经把 fd 1 重定向进了新文件，所以你的
-击键会落到磁盘上。Ctrl-D 关闭输入流。chmod 在 inode 上置执行位。
+击键会落到磁盘上。Ctrl-D 关闭输入流。chmod +x 置执行位，rwxst 改其余位。
 
 运行 ./hello.sh 时，内核读取首行，发现 #!/bin/sh，于是启动 /bin/sh 并把
 脚本路径作为 argv[0] 传入。而 shell 本身也是 CRX 机器码，它会逐字节读取

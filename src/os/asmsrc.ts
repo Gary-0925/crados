@@ -7,7 +7,7 @@
 //    5 close(fd)           6 sleep(ticks)        7 getpid()     8 gethz()
 //    9 spawn(path)        10 wait(pid)          11 getdents(path,buf,max)
 //   12 getcwd(buf)        13 unlink(path)       14 mkdir(path)
-//   15 chmod(path,x)      16 rename(a,b)        17 sync()       18 getenv(key,buf)
+//   15 chmod(path,set,clr) 16 rename(a,b)        17 sync()       18 getenv(key,buf)
 //   20 mount(dev,dir)     21 umount(target)     22 kill(pid,sig)
 
 // 取 argv 中第 n 个参数的地址：入口 r5 = argv 基址, r6 = n，出口 r5 指向该参数
@@ -961,28 +961,138 @@ use:
     .asciz "usage: touch file\\n"
 `,
 
-  chmod: `; chmod — set or clear the execute bit
+  chmod: `; chmod — set or clear mode bits: [u|o|a][+|-][rwxst]
 .text
 _start:
     cmp r1, 2
     jlt usage
-    ldb r7, [r2+0]      ; '+' or '-'
-    mov r4, 0
-    cmp r7, 43
-    jne haveflag
-    mov r4, 1
-haveflag:
-    mov r5, r2          ; second argument is the path
+    mov r5, r2
+    mov r6, 0
+    call argn
+    mov r4, r5          ; mode string
+    mov r5, r2
     mov r6, 1
     call argn
+    mov r6, r5          ; path
+    mov r3, 0           ; who: 0 owner, 1 other, 2 both
+    ldb r7, [r4+0]
+    cmp r7, 117         ; u
+    je who_skip
+    cmp r7, 111         ; o
+    jne who_a
+    mov r3, 1
+    jmp who_skip
+who_a:
+    cmp r7, 97          ; a
+    jne parse_op
+    mov r3, 2
+who_skip:
+    add r4, 1
+parse_op:
+    ldb r7, [r4+0]
+    mov r2, 0           ; 0 clear, 1 set
+    cmp r7, 43          ; +
+    je op_set
+    cmp r7, 45          ; -
+    jne usage
+    jmp letters
+op_set:
+    mov r2, 1
+letters:
+    add r4, 1
+    mov r0, 0           ; mask
+    mov r1, 0           ; letter count
+letter:
+    ldb r7, [r4+0]
+    cmp r7, 0
+    je letters_done
+    add r1, 1
+    call letter_bits
+    cmp r7, 0
+    je usage
+    or r0, r7
+    add r4, 1
+    jmp letter
+letters_done:
+    cmp r1, 0
+    je usage
+    cmp r2, 0
+    je do_clear
+    mov r2, r0
+    mov r3, 0
+    jmp do_sys
+do_clear:
+    mov r3, r0
+    mov r2, 0
+do_sys:
+    mov r1, r6
     mov r0, 15
-    mov r1, r5
-    mov r2, r4
     sys
     cmp r0, 65535
     je failed
     mov r1, 0
     hlt
+
+; r7 = letter, r3 = who. Returns the bit mask in r7, or 0.
+letter_bits:
+    cmp r7, 120         ; x  shared execute bit
+    je bit_x
+    cmp r7, 115         ; s
+    je bit_s
+    cmp r7, 116         ; t
+    je bit_t
+    cmp r7, 114         ; r
+    je bit_r
+    cmp r7, 119         ; w
+    je bit_w
+    mov r7, 0
+    ret
+bit_x:
+    cmp r3, 1
+    je bit_ox
+    cmp r3, 2
+    je bit_ax
+    mov r7, 1
+    ret
+bit_ox:
+    mov r7, 128
+    ret
+bit_ax:
+    mov r7, 129
+    ret
+bit_s:
+    mov r7, 32
+    ret
+bit_t:
+    mov r7, 64
+    ret
+bit_r:
+    cmp r3, 1
+    je bit_or
+    cmp r3, 2
+    je bit_ar
+    mov r7, 2
+    ret
+bit_or:
+    mov r7, 8
+    ret
+bit_ar:
+    mov r7, 10
+    ret
+bit_w:
+    cmp r3, 1
+    je bit_ow
+    cmp r3, 2
+    je bit_aw
+    mov r7, 4
+    ret
+bit_ow:
+    mov r7, 16
+    ret
+bit_aw:
+    mov r7, 20
+    ret
+
 failed:
     mov r0, 1
     mov r1, 2
@@ -1004,7 +1114,7 @@ ${ARGN}
 err:
     .asciz "chmod: cannot change mode\\n"
 use:
-    .asciz "usage: chmod +x|-x file\\n"
+    .asciz "usage: chmod [u|o|a][+|-][rwxst] file\\n"
 `,
 
   mv: `; mv — rename, which only rewrites a directory entry
@@ -1151,7 +1261,7 @@ usage:
 ${ATOI}
 .data
 err:
-    .asciz "kill: no such process\\n"
+    .asciz "kill: failed\\n"
 use:
     .asciz "usage: kill pid\\n"
 `,

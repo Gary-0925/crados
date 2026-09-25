@@ -124,7 +124,7 @@ function trap(cpu: CpuState, bus: Bus): Syscall | null {
     case 14:
       return sys.mkdir(cstr(bus, a1))
     case 15:
-      return sys.chmod(cstr(bus, a1), a2 !== 0)
+      return sys.chmod(cstr(bus, a1), a2, a3)
     case 16:
       return sys.rename(cstr(bus, a1), cstr(bus, a2))
     case 17:

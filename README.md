@@ -47,7 +47,8 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Panic. Run 'kill 1'. Killing init halts a real kernel too.
+5. Permissions. The login shell is uid 1000. 'kill 1' returns
+   EPERM. Only euid 0 may signal init, and that still panics.
 6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
 
 ## Manuals
@@ -102,7 +103,8 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 内核恐慌。运行 'kill 1'。真实内核杀掉 init 同样会停机。
+5. 权限。登录 shell 是 uid 1000。运行 'kill 1' 得到 EPERM。
+   只有 euid 0 可以信号 init，那样才会恐慌。
 6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
 
 ## 手册

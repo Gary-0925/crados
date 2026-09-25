@@ -54,7 +54,10 @@ export function MemoryPanel({
         </span>
       </div>
 
-      <div className="mt-2 grid grid-cols-8 gap-1">
+      <div
+        className="mt-2 grid gap-px"
+        style={{ gridTemplateColumns: `repeat(${FRAME_COUNT > 64 ? 16 : 8}, minmax(0, 1fr))` }}
+      >
         {snap.frames.map((f) => (
           <button
             key={f.no}
@@ -70,7 +73,7 @@ export function MemoryPanel({
               color: f.owner === null ? '#30363d' : f.owner === 'kernel' ? '#8b949e' : '#010409',
             }}
           >
-            {f.no}
+            {FRAME_COUNT > 64 ? '' : f.no}
           </button>
         ))}
       </div>

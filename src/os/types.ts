@@ -19,7 +19,7 @@ export type Syscall =
   | { call: 'mkdir'; path: string }
   | { call: 'unlink'; path: string }
   | { call: 'rename'; from: string; to: string }
-  | { call: 'chmod'; path: string; exec: boolean }
+  | { call: 'chmod'; path: string; set: number; clear: number }
   | { call: 'chdir'; path: string }
   | { call: 'getcwd' }
   | { call: 'spawn'; path: string; args: string[] }
@@ -64,6 +64,7 @@ export const ERRMSG: Record<string, string> = {
   ENOEXEC: 'Exec format error',
   EPERM: 'Operation not permitted',
   EACCES: 'Permission denied',
+  EROFS: 'Read-only file system',
   ENODEV: 'No such device',
   EBUSY: 'Device or resource busy',
   EINVAL: 'Invalid argument',
@@ -86,7 +87,7 @@ export const sys = {
   mkdir: (path: string): Syscall => ({ call: 'mkdir', path }),
   unlink: (path: string): Syscall => ({ call: 'unlink', path }),
   rename: (from: string, to: string): Syscall => ({ call: 'rename', from, to }),
-  chmod: (path: string, exec: boolean): Syscall => ({ call: 'chmod', path, exec }),
+  chmod: (path: string, set: number, clear = 0): Syscall => ({ call: 'chmod', path, set, clear }),
   chdir: (path: string): Syscall => ({ call: 'chdir', path }),
   getcwd: (): Syscall => ({ call: 'getcwd' }),
   spawn: (path: string, args: string[] = []): Syscall => ({ call: 'spawn', path, args }),
@@ -109,6 +110,7 @@ export const sys = {
 export interface ProcInfo {
   pid: number
   ppid: number
+  uid: number
   name: string
   state: PState
   cmd: string

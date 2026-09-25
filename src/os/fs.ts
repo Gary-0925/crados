@@ -40,7 +40,7 @@ const SB_DATA = 12
 const SB_LABEL = 16
 const LABEL_MAX = 16
 
-// inode 字段偏移
+// inode 字段偏移。机器码内核按这些偏移直接解析，不能挪。
 const I_TYPE = 0
 const I_FLAGS = 1
 const I_SIZE = 2
@@ -48,12 +48,38 @@ const I_PARENT = 4
 const I_DRIVER = 6
 const I_PTR = 8
 
+// flags 字节。chmod 按掩码置位或清位。执行位分属主和其他人，显示顺序 rwxrwxst。
+export const M_EXEC = 0x01
+export const M_READ = 0x02
+export const M_WRITE = 0x04
+export const M_OREAD = 0x08
+export const M_OWRITE = 0x10
+export const M_SETUID = 0x20
+export const M_STICKY = 0x40
+export const M_OEXEC = 0x80
+
+export const MODE_FILE = M_READ | M_WRITE | M_OREAD // 0644
+export const MODE_DIR = M_EXEC | M_READ | M_WRITE | M_OREAD | M_OEXEC // 0755
+export const MODE_DEV = M_READ | M_WRITE | M_OREAD | M_OWRITE // 0666
+export const MODE_TMP = MODE_DIR | M_OWRITE | M_STICKY // 1777
+
+export const UID_ROOT = 0
+export const UID_USER = 1000
+
+// 超级块空闲区：偏移 14 是特性字，偏移 32 起每个 inode 一个大端 uid。
+// 64 × 2 = 128 字节，落在最小的 256 B 超级块里，不占用数据块。
+const SB_FEAT = 14
+const FEAT_CREDS = 0x0001
+const SB_UID = 32
+
 export interface FNode {
   dev: BlockDev
   ino: number
   type: number
   size: number
   exec: boolean
+  uid: number
+  mode: number
   driver: number
   name: string
   path: string
@@ -111,6 +137,7 @@ export class CRFS {
     for (let b = 0; b < this.dataStart; b++) this.setBlockBit(b, true) // 元数据区预占
     const root = this.allocInode(T_DIR, 0)
     if (root !== 1) throw new Error('mkfs: root inode must be 1')
+    this.markCreds()
   }
 
   // 只接受当前盘上布局。任何旧版容量或元数据布局都由调用方重新 mkfs。
@@ -127,6 +154,13 @@ export class CRFS {
 
   label(): string {
     return dec(this.dev.bytes.subarray(SB_LABEL, SB_LABEL + LABEL_MAX)).replace(/\0+$/, '')
+  }
+
+  credsReady(): boolean {
+    return (this.dev.u16(SB_FEAT) & FEAT_CREDS) !== 0
+  }
+  markCreds() {
+    this.dev.setU16(SB_FEAT, this.dev.u16(SB_FEAT) | FEAT_CREDS)
   }
 
   // ---------- 位图 ----------
@@ -180,6 +214,9 @@ export class CRFS {
       this.dev.bytes.fill(0, at, at + INODE_SIZE)
       this.dev.setU8(at + I_TYPE, type)
       this.dev.setU16(at + I_PARENT, parent)
+      const mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
+      this.dev.setU8(at + I_FLAGS, mode)
+      this.setOwner(i, UID_ROOT)
       return i
     }
     return -1
@@ -194,13 +231,36 @@ export class CRFS {
   private setSize(ino: number, n: number) {
     this.dev.setU16(this.inodeAt(ino) + I_SIZE, n)
   }
+  iflags(ino: number): number {
+    return this.dev.u8(this.inodeAt(ino) + I_FLAGS)
+  }
+  setFlags(ino: number, mode: number) {
+    this.dev.setU8(this.inodeAt(ino) + I_FLAGS, mode & 0xff)
+  }
   iexec(ino: number): boolean {
-    return (this.dev.u8(this.inodeAt(ino) + I_FLAGS) & 1) !== 0
+    return (this.iflags(ino) & M_EXEC) !== 0
   }
   setExec(ino: number, on: boolean) {
-    const at = this.inodeAt(ino) + I_FLAGS
-    const cur = this.dev.u8(at)
-    this.dev.setU8(at, on ? cur | 1 : cur & ~1)
+    const cur = this.iflags(ino)
+    this.setFlags(ino, on ? cur | M_EXEC : cur & ~M_EXEC)
+  }
+  iowner(ino: number): number {
+    return this.dev.u16(SB_UID + ino * 2)
+  }
+  setOwner(ino: number, uid: number) {
+    this.dev.setU16(SB_UID + ino * 2, uid)
+  }
+
+  // 旧盘没有 uid 表。按类型补上模式，已有的执行位保留，属主先记为 root。
+  seedModes() {
+    for (let ino = 1; ino < this.inodeCount; ino++) {
+      if (!this.inodeUsed(ino)) continue
+      const type = this.itype(ino)
+      let mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
+      if (this.iexec(ino)) mode |= M_EXEC | M_OEXEC
+      this.setFlags(ino, mode)
+      this.setOwner(ino, UID_ROOT)
+    }
   }
   iparent(ino: number): number {
     return this.dev.u16(this.inodeAt(ino) + I_PARENT)
@@ -455,6 +515,51 @@ export class CRFS {
   }
 }
 
+// 单设备上的绝对路径。不看挂载表，迁移和造根盘镜像时用。
+export function lookupAbs(fs: CRFS, path: string): number {
+  let ino = 1
+  for (const seg of path.split('/').filter(Boolean)) {
+    const next = fs.lookup(ino, seg)
+    if (!next) return 0
+    ino = next
+  }
+  return ino
+}
+
+// 登录策略：家目录和 /usr/bin 归用户，且带 sticky，用户删不掉 root 的文件。
+// /tmp 对所有人可写。调用前 inode 模式应已按类型填好。
+export function applyLoginPolicy(fs: CRFS) {
+  const home = lookupAbs(fs, '/home/user')
+  if (home) {
+    fs.setOwner(home, UID_USER)
+    fs.setFlags(home, MODE_DIR | M_STICKY)
+  }
+  const ubin = lookupAbs(fs, '/usr/bin')
+  if (ubin) {
+    fs.setOwner(ubin, UID_USER)
+    fs.setFlags(ubin, MODE_DIR | M_STICKY)
+  }
+  const tmp = lookupAbs(fs, '/tmp')
+  if (tmp) {
+    fs.setOwner(tmp, UID_ROOT)
+    fs.setFlags(tmp, MODE_TMP)
+  }
+}
+
+export function modeText(mode: number): string {
+  const bit = (mask: number, ch: string) => ((mode & mask) !== 0 ? ch : '-')
+  return (
+    bit(M_READ, 'r') +
+    bit(M_WRITE, 'w') +
+    bit(M_EXEC, 'x') +
+    bit(M_OREAD, 'r') +
+    bit(M_OWRITE, 'w') +
+    bit(M_OEXEC, 'x') +
+    bit(M_SETUID, 's') +
+    bit(M_STICKY, 't')
+  )
+}
+
 // ---------- VFS：挂载表 + 跨设备路径解析 ----------
 
 export interface Mount {
@@ -512,6 +617,8 @@ export class VFS {
       type: fs.itype(ino),
       size: fs.isize(ino),
       exec: fs.iexec(ino),
+      uid: fs.iowner(ino),
+      mode: fs.iflags(ino),
       driver: fs.idriver(ino),
       name,
       path,
