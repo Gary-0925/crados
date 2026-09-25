@@ -1,2 +1,2 @@
-// 构建入口。CI 在构建纯净版时把这一行整体替换为 './app/Plain'。
-export { default } from './app/Transparent'
+// 构建入口。CI 在构建透明版时替换为 './app/Transparent'。
+export { default } from './app/Plain'

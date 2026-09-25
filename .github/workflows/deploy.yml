@@ -15,7 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 纯净版：只有 /os 与 /ui，整个 /cp 目录不参与打包
   build-plain:
     runs-on: ubuntu-latest
     steps:
@@ -46,7 +45,6 @@ jobs:
           path: dist/index.html
           retention-days: 1
 
-  # 透明版：在纯净系统之上挂载 /cp 观测层
   build-transparent:
     runs-on: ubuntu-latest
     steps:

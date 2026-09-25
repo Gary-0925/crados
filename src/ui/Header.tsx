@@ -1,4 +1,4 @@
-import { Pause, Play, RotateCcw, StepForward } from 'lucide-react'
+import { Github, Pause, Play, RotateCcw, StepForward } from 'lucide-react'
 import type { Kernel } from '@/os/kernel'
 import { cn } from '@/utils/cn'
 
@@ -10,6 +10,16 @@ export function Header({ kernel, ips, onReboot }: { kernel: Kernel; ips?: number
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-[#30363d] bg-[#010409] px-3">
       <span className="text-[13px] font-semibold text-[#e6edf3]">crados</span>
+      <a
+        href="https://github.com/Gary-0925/crados/blob/main/README.md"
+        target="_blank"
+        rel="noreferrer"
+        aria-label="View Gary-0925/crados on GitHub"
+        className="inline-flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[10px] font-medium text-[#c9d1d9] transition-colors hover:border-[#8b949e] hover:text-[#f0f6fc]"
+      >
+        <Github size={11} />
+        <span>Github</span>
+      </a>
 
       <span className="hidden items-baseline gap-1 md:inline-flex">
         <span className="text-[10px] text-[#6e7681]">proc</span>

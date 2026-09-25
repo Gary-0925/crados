@@ -3,7 +3,7 @@
 // 运行在 supervisor 特权模式下。
 // 内存布局 (Physical Memory Layout):
 //   0x0000..0x003F : Kernel Control Block (KCB)
-//     0x0000..0x001F : 引导标语 "crados 1.1\n"
+//     0x0000..0x001F : 引导标语 "crados 2.0\n"
 //     0x0020 : k_current_pid (u16)
 //     0x0022 : k_current_slot (u16)
 //     0x0024 : k_hz (u16)
