@@ -91,7 +91,9 @@ function Node({
           <span className="w-[11px] shrink-0" />
         )}
         <span className={cn('truncate', isDir ? 'text-[#e6edf3]' : 'text-[#8b949e]')}>{node.name}</span>
-        {node.exec && node.type === 'file' && <span className="text-[9px] text-[#3fb950]">x</span>}
+        <span className={cn('shrink-0 text-[9px] tabular tracking-tight', node.mode.includes('x') ? 'text-[#3fb950]' : 'text-[#6e7681]')}>
+          {node.mode}
+        </span>
         <span className={cn('ml-auto pl-2 text-[9px] tabular', DISK_TONE[node.disk] ?? 'text-[#bc8cff]')}>
           {node.type === 'dev' ? 'dev' : node.disk}
         </span>
@@ -279,7 +281,7 @@ export function StoragePanel({
                 <div className="flex items-baseline justify-between">
                   <span className="truncate text-[11px] text-[#e6edf3]">{sel.path}</span>
                   <span className="shrink-0 pl-2 text-[9px] text-[#6e7681]">
-                    {sel.disk} inode {sel.ino} · {sel.size} B · {sel.blocks} blk
+                    {sel.disk} inode {sel.ino} · uid {sel.uid} · {sel.mode} · {sel.size} B · {sel.blocks} blk
                   </span>
                 </div>
                 {sel.blockList && sel.blockList.length > 0 && (

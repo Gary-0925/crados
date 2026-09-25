@@ -1,7 +1,7 @@
 // Builds the initial sda byte image from a declarative file table.
 
 import { BlockDev, SPECS } from './blockdev'
-import { basename, CRFS, dirname, DRV_NULL, DRV_TTY, T_DEV, T_DIR, T_FILE } from './fs'
+import { applyLoginPolicy, basename, CRFS, dirname, DRV_NULL, DRV_TTY, T_DEV, T_DIR, T_FILE } from './fs'
 import {
   COUNT_S,
   BLOCK_S,
@@ -100,5 +100,6 @@ export function buildRootImage(): RootImage {
     fs.setDriver(ino, driver)
   }
 
+  applyLoginPolicy(fs)
   return { bytes: dev.bytes, errors }
 }

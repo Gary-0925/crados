@@ -3,7 +3,8 @@
 // 运行在 supervisor 特权模式下。
 // 内存布局 (Physical Memory Layout):
 //   0x0000..0x003F : Kernel Control Block (KCB)
-//     0x0000..0x001F : 引导标语 "crados 2.0\n"
+//     0x0000..0x001D : 引导标语 "crados 2.0\n"
+//     0x001E : k_text_pfn (u16)，用户帧扫描上界
 //     0x0020 : k_current_pid (u16)
 //     0x0022 : k_current_slot (u16)
 //     0x0024 : k_hz (u16)
@@ -19,11 +20,12 @@
 //     0x0038 : k_pcb_base (u16 = 0x0100)
 //     0x003A : k_pcb_size (u16 = 192)
 //     0x003C : k_quantum (u16 = 5)
-//     0x003E : k_first_user_pfn (u16 = 31)
-//     0x0040..0x0047 : k_frame_bitmap (64 frames = 8 bytes)
+//     0x003E : k_first_user_pfn (u16 = 14)
+//   0x00E0..0x00FF : k_frame_bitmap (256 frames = 32 bytes)
 //   0x0100..0x0CFF : Process Control Block Table (16 PCBs x 192 bytes)
 //   0x0D00..0x0DFF : Kernel Device Scratch Page
-//   0x2800..0x3FFF : CRX Kernel Text (PFN 40..63, physical direct map)
+//   0xE600..0xFDFF : CRX Kernel Text (PFN 230..253, physical direct map)
+//   0xFF00..0xFFFF : MMIO，不是内存
 
 export const GUEST_KERNEL_SOURCE = `.text
 _start:
@@ -86,6 +88,8 @@ syscall_entry:
 ; tty/stdout/stderr 通过虚拟硬件 MMIO 端口输出；重定向到文件时交由 CRFS 桥。
 ;   0xFF00 = tty stdout data, 0xFF01 = tty stderr data
 sys_write:
+    cmp r1, 7
+    jgt write_bridge
     mov r4, r2          ; r4 = buffer
     mov r5, r3          ; r5 = requested length (0 means NUL terminated)
 
@@ -240,6 +244,12 @@ open_resolved:
     call crfs_u8
     cmp r0, 1           ; T_FILE
     jne open_failed
+    push r6
+    mov r1, r6
+    call may_read_ino
+    pop r6
+    cmp r0, 0
+    jne open_failed
 
     ; find free fd 3..7
     mov r4, 3
@@ -290,6 +300,18 @@ write_file:
     ldb r6, [r3+44]     ; flags: 0=read, 1=write, 2=append
     cmp r6, 0
     je write_file_failed
+    push r1
+    push r3
+    push r4
+    push r5
+    ldb r1, [r3+43]     ; inode
+    call may_write_ino
+    pop r5
+    pop r4
+    pop r3
+    pop r1
+    cmp r0, 0
+    jne write_file_failed
 
     ; length 0 means NUL-terminated
     cmp r5, 0
@@ -568,6 +590,12 @@ read_tty_loop:
     add r0, 1
     jmp read_tty_loop
 read_tty_done:
+    ; 短行必须补 NUL，否则行缓冲里上一条更长的命令会粘在后面。
+    cmp r0, r5
+    je read_tty_full
+    mov r6, 0
+    ustb [r4+0], r6
+read_tty_full:
     iret
 
 read_tty_empty:
@@ -998,11 +1026,12 @@ sys_time:
     ldw r0, [r4+0x0028] ; r0 = k_ticks_lo
     iret
 
-; chmod(path, exec): resolve an sda path and update inode flags byte.
+; chmod(path, set, clear): (flags | set) & ~clear & 255。
 sys_chmod:
     mov r4, 0
     stw [r4+0x007C], r1 ; path
-    stw [r4+0x007E], r2 ; execute flag
+    stw [r4+0x007E], r2 ; bits to set
+    stw [r4+0x0082], r3 ; bits to clear
     call is_bin_path
     cmp r0, 1
     je chmod_bridge
@@ -1011,6 +1040,14 @@ sys_chmod:
     call crfs_resolve
     cmp r0, 65535
     je chmod_failed
+    push r0
+    mov r1, r0
+    call may_chmod_ino
+    mov r6, r0
+    pop r0
+    cmp r6, 0
+    jne chmod_failed
+    mov r4, 0           ; crfs_resolve 会改掉 r4
     mul r0, 48
     add r0, 769         ; inode flags absolute offset
     stw [r4+0x0080], r0
@@ -1018,13 +1055,13 @@ sys_chmod:
     call crfs_u8
     cmp r0, 65535
     je chmod_failed
-    and r0, 254
     mov r4, 0
     ldw r2, [r4+0x007E]
-    cmp r2, 0
-    je chmod_store
-    or r0, 1
-chmod_store:
+    or r0, r2
+    ldw r2, [r4+0x0082]
+    xor r2, 65535
+    and r0, r2
+    and r0, 255
     mov r2, r0
     ldw r1, [r4+0x0080]
     call crfs_write_u8
@@ -1036,6 +1073,7 @@ chmod_bridge:
     mov r4, 0
     ldw r1, [r4+0x007C]
     ldw r2, [r4+0x007E]
+    ldw r3, [r4+0x0082]
     mov r0, 15
     svc
     iret
@@ -1061,6 +1099,12 @@ sys_chdir:
     add r1, 768
     call crfs_u8
     cmp r0, 2           ; T_DIR
+    jne chdir_failed
+    push r6
+    mov r1, r6
+    call may_search_ino
+    pop r6
+    cmp r0, 0
     jne chdir_failed
     call current_pcb
     mov r4, 1           ; sda device code
@@ -1251,6 +1295,126 @@ copy_fd_loop:
 copy_fd_done:
     ret
 
+; 权限位与 src/os/fs.ts 一致：1 exec，2 owner-read，4 owner-write，8 other-read，16 other-write。
+; uid 表在 sda 超级块偏移 32，每个 inode 一个大端 u16。euid 在 PCB+178。
+; r1 = inode。返回 0 允许，0xffff 拒绝。会破坏 r1-r7。
+may_read_ino:
+    push r1
+    call current_euid
+    cmp r0, 0
+    je may_pop_yes
+    mov r6, r0
+    pop r1
+    push r1
+    push r6
+    mul r1, 2
+    add r1, 32
+    call crfs_u16
+    pop r6
+    pop r1
+    cmp r0, 65535
+    je may_no
+    cmp r0, r6
+    jne may_read_other
+    mov r5, 2
+    jmp may_flag
+may_read_other:
+    mov r5, 8
+    jmp may_flag
+
+may_write_ino:
+    push r1
+    call current_euid
+    cmp r0, 0
+    je may_pop_yes
+    mov r6, r0
+    pop r1
+    push r1
+    push r6
+    mul r1, 2
+    add r1, 32
+    call crfs_u16
+    pop r6
+    pop r1
+    cmp r0, 65535
+    je may_no
+    cmp r0, r6
+    jne may_write_other
+    mov r5, 4
+    jmp may_flag
+may_write_other:
+    mov r5, 16
+    jmp may_flag
+
+may_search_ino:
+    push r1
+    call current_euid
+    cmp r0, 0
+    je may_pop_yes
+    mov r6, r0
+    pop r1
+    push r1
+    push r6
+    mul r1, 2
+    add r1, 32
+    call crfs_u16
+    pop r6
+    pop r1
+    cmp r0, 65535
+    je may_no
+    cmp r0, r6
+    jne may_search_other
+    mov r5, 1
+    jmp may_flag
+may_search_other:
+    mov r5, 128
+    jmp may_flag
+
+may_chmod_ino:
+    push r1
+    call current_euid
+    cmp r0, 0
+    je may_pop_yes
+    mov r6, r0
+    pop r1
+    push r1
+    push r6
+    mul r1, 2
+    add r1, 32
+    call crfs_u16
+    pop r6
+    pop r1
+    cmp r0, r6
+    je may_yes
+    jmp may_no
+
+may_flag:
+    push r5
+    mul r1, 48
+    add r1, 769
+    call crfs_u8
+    pop r5
+    cmp r0, 65535
+    je may_no
+    and r0, r5
+    cmp r0, 0
+    je may_no
+may_yes:
+    mov r0, 0
+    ret
+may_pop_yes:
+    pop r1
+    mov r0, 0
+    ret
+may_no:
+    mov r0, 65535
+    ret
+
+current_euid:
+    call current_pcb
+    ldw r0, [r5+178]
+    ret
+
 ; current_pcb: returns current PCB physical address in r5
 current_pcb:
     mov r5, 0
@@ -1262,6 +1426,64 @@ current_pcb:
 fd_failed:
     mov r0, 65535
     iret
+
+; r5 = PTE, r3 = vpn, r4 = pfn, r6 = PCB。低 6 位进页表字节，bit6/bit7 进掩码。
+pte_store:
+    mov r7, r4
+    and r7, 63
+    or r7, 128
+    stb [r5+0], r7
+    mov r7, 1
+    shl r7, r3
+    ldw r0, [r6+184]
+    mov r2, r4
+    shr r2, 6
+    and r2, 1
+    cmp r2, 0
+    je pte_clr6
+    or r0, r7
+    jmp pte_bit7
+pte_clr6:
+    mov r2, r7
+    xor r2, 65535
+    and r0, r2
+pte_bit7:
+    stw [r6+184], r0
+    ldw r0, [r6+186]
+    mov r2, r4
+    shr r2, 7
+    and r2, 1
+    cmp r2, 0
+    je pte_clr7
+    or r0, r7
+    jmp pte_stored
+pte_clr7:
+    mov r2, r7
+    xor r2, 65535
+    and r0, r2
+pte_stored:
+    stw [r6+186], r0
+    ret
+
+; r6 = PTE, r5 = PCB, r3 = vpn。完整帧号返回在 r4。
+pte_load:
+    ldb r4, [r6+0]
+    and r4, 63
+    mov r7, 1
+    shl r7, r3
+    ldw r0, [r5+184]
+    and r0, r7
+    cmp r0, 0
+    je pte_load7
+    add r4, 64
+pte_load7:
+    ldw r0, [r5+186]
+    and r0, r7
+    cmp r0, 0
+    je pte_loaded
+    add r4, 128
+pte_loaded:
+    ret
 
 ; page_alloc(vpn): 扫描物理帧位图，为当前进程映射一个清零的新页面
 sys_page_alloc:
@@ -1281,11 +1503,13 @@ sys_page_alloc:
     cmp r7, 0
     jne page_failed
 
-    ; 从 KCB 指定的首个用户帧开始扫描物理帧位图
+    ; 从 KCB 指定的首个用户帧开始扫描物理帧位图，到内核文本帧为止
     mov r4, 0
     ldw r4, [r4+0x003E] ; pfn = k_first_user_pfn
 page_scan:
-    cmp r4, 64
+    mov r0, 0
+    ldw r0, [r0+0x001E] ; k_text_pfn
+    cmp r4, r0
     je page_failed
     mov r5, r4
     div r5, 8           ; bitmap byte index
@@ -1293,7 +1517,7 @@ page_scan:
     mod r6, 8           ; bitmap bit index
     mov r7, 1
     shl r7, r6          ; mask
-    add r5, 0x0040      ; bitmap address
+    add r5, 0x00E0      ; bitmap address
     ldb r2, [r5+0]
     mov r0, r2
     and r0, r7
@@ -1307,7 +1531,7 @@ page_found:
     or r2, r7
     stb [r5+0], r2
 
-    ; 写入当前 PCB 的页表项: VALID(0x80) | PFN
+    ; 写入当前 PCB 的页表项: VALID(0x80) | PFN[5:0]，高两位在 PCB+184/186
     mov r5, 0
     ldw r6, [r5+0x0022]
     mul r6, 192
@@ -1315,9 +1539,7 @@ page_found:
     mov r5, r6
     add r5, 24
     add r5, r3          ; PTE address
-    mov r7, r4
-    or r7, 128
-    stb [r5+0], r7
+    call pte_store
     ldb r7, [r6+21]     ; npages++
     add r7, 1
     stb [r6+21], r7
@@ -1359,14 +1581,28 @@ sys_page_free:
     ldb r4, [r6+0]
     cmp r4, 0
     je page_free_failed
-    and r4, 63          ; PFN
+    call pte_load
     mov r7, 0
     ldw r7, [r7+0x003E]
     cmp r4, r7
     jlt page_free_failed
+    mov r7, 0
+    ldw r7, [r7+0x001E] ; 不能把内核文本帧还回用户池
+    cmp r4, r7
+    jgt page_free_failed
+    je page_free_failed
 
     mov r7, 0
     stb [r6+0], r7      ; clear PTE
+    mov r7, 1
+    shl r7, r3
+    xor r7, 65535
+    ldw r0, [r5+184]
+    and r0, r7
+    stw [r5+184], r0
+    ldw r0, [r5+186]
+    and r0, r7
+    stw [r5+186], r0
     ldb r7, [r5+21]
     cmp r7, 0
     je page_free_bitmap
@@ -1381,7 +1617,7 @@ page_free_bitmap:
     mov r7, 1
     shl r7, r6
     xor r7, 65535       ; inverse mask
-    add r5, 0x0040
+    add r5, 0x00E0
     ldb r0, [r5+0]
     and r0, r7
     stb [r5+0], r0
@@ -1409,6 +1645,13 @@ sys_block_read:
     iret
 
 sys_block_write:
+    push r1
+    call current_euid
+    pop r1
+    cmp r0, 0
+    jne block_failed
+    cmp r1, 254         ; 0xfe = rom，固件不可由系统调用改写
+    je block_failed
     mov r4, 0xFE00
     stw [r4+2], r1
     stw [r4+4], r2
@@ -1429,8 +1672,20 @@ block_failed:
 sys_kill:
     cmp r1, 0
     je kill_failed
-    cmp r1, 1           ; pid 1 (init) 保护
-    je kill_init
+    push r1
+    call current_euid
+    pop r1
+    cmp r0, 0
+    je kill_as_root
+    cmp r1, 1           ; 非 root 不能信号 init
+    je kill_failed
+    jmp kill_scan
+kill_as_root:
+    cmp r1, 1
+    jne kill_scan
+    mov r0, 22          ; current_euid 覆盖了系统调用号
+    jmp kill_init
+kill_scan:
     mov r4, 0           ; r4 = slot (0..31)
 kill_loop:
     cmp r4, 16
@@ -1449,6 +1704,17 @@ kill_next:
     jmp kill_loop
 
 kill_target:
+    push r1
+    push r5
+    call current_euid
+    pop r5
+    pop r1
+    cmp r0, 0
+    je kill_apply
+    ldw r6, [r5+178]    ; target euid
+    cmp r6, r0
+    jne kill_failed
+kill_apply:
     mov r6, 5           ; PState.ZOMBIE
     stb [r5+1], r6      ; PCB.state = ZOMBIE
     mov r6, 128

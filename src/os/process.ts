@@ -12,7 +12,10 @@
 //   147-154 cpu ticks (64 位)           155-162 wake deadline ms (64 位)
 //   163 sleeping    164 mode   165 irq-enable   166-167 pending irq
 //   168-169 cause   170-171 ivt base            172-173 kernel sp
-//   174-175 user sp                       176-191 reserved
+//   174-175 user sp
+//   176-177 uid      178-179 euid     180-181 gid      182-183 egid
+//   184-185 pfn bit6  186-187 pfn bit7  188-191 reserved
+//   页表字节只有 6 位帧号。bit6/bit7 各是一个 u16 掩码，第 n 位对应虚拟页 n。
 
 import type { Memory } from './memory'
 import { PAGE_SIZE } from './memory'
@@ -54,6 +57,12 @@ const O_CAUSE = 168
 const O_IVT = 170
 const O_KSP = 172
 const O_USP = 174
+const O_UID = 176
+const O_EUID = 178
+const O_GID = 180
+const O_EGID = 182
+const O_PFN6 = 184
+const O_PFN7 = 186
 const NAME_CAP = 16
 const CMD_CAP = 20
 const FD_SIZE = 6
@@ -401,6 +410,31 @@ export class Process {
     this.setU16(O_WAITFOR, v === null ? 0xffff : v === -1 ? 0xfffe : v)
   }
 
+  get uid(): number {
+    return this.u16(O_UID)
+  }
+  set uid(v: number) {
+    this.setU16(O_UID, v)
+  }
+  get euid(): number {
+    return this.u16(O_EUID)
+  }
+  set euid(v: number) {
+    this.setU16(O_EUID, v)
+  }
+  get gid(): number {
+    return this.u16(O_GID)
+  }
+  set gid(v: number) {
+    this.setU16(O_GID, v)
+  }
+  get egid(): number {
+    return this.u16(O_EGID)
+  }
+  set egid(v: number) {
+    this.setU16(O_EGID, v)
+  }
+
   get readStdin(): boolean {
     return this.u8(O_STDIN) !== 0
   }
@@ -419,6 +453,11 @@ export class Process {
     this.setU8(O_CWDINO, ino)
   }
 
+  private pfnOf(vpn: number, raw: number): number {
+    const bit = 1 << vpn
+    return (raw & PTE_PFN) | (this.u16(O_PFN6) & bit ? 64 : 0) | (this.u16(O_PFN7) & bit ? 128 : 0)
+  }
+
   get pageTable(): PTE[] {
     const out: PTE[] = []
     for (let i = 0; i < MAX_PAGES; i++) {
@@ -426,7 +465,7 @@ export class Process {
       if (!(raw & PTE_VALID)) continue
       out.push({
         vpn: i,
-        pfn: raw & PTE_PFN,
+        pfn: this.pfnOf(i, raw),
         supervisor: !!(raw & PTE_SUPERVISOR),
       })
     }
@@ -435,12 +474,17 @@ export class Process {
   set pageTable(list: PTE[]) {
     this.setU8(O_NPAGES, Math.min(list.length, MAX_PAGES))
     for (let i = 0; i < MAX_PAGES; i++) this.setU8(O_PAGES + i, 0)
+    this.setU16(O_PFN6, 0)
+    this.setU16(O_PFN7, 0)
     for (const pte of list.slice(0, MAX_PAGES)) {
       if (pte.vpn < 0 || pte.vpn >= MAX_PAGES) continue
       this.setU8(
         O_PAGES + pte.vpn,
         PTE_VALID | (pte.supervisor ? PTE_SUPERVISOR : 0) | (pte.pfn & PTE_PFN),
       )
+      const bit = 1 << pte.vpn
+      if (pte.pfn & 64) this.setU16(O_PFN6, this.u16(O_PFN6) | bit)
+      if (pte.pfn & 128) this.setU16(O_PFN7, this.u16(O_PFN7) | bit)
     }
   }
 
@@ -453,7 +497,7 @@ export class Process {
     if (vpn < 0 || vpn >= MAX_PAGES) return null
     const raw = this.u8(O_PAGES + vpn)
     if (!(raw & PTE_VALID)) return null
-    return { pfn: raw & PTE_PFN, supervisor: !!(raw & PTE_SUPERVISOR) }
+    return { pfn: this.pfnOf(vpn, raw), supervisor: !!(raw & PTE_SUPERVISOR) }
   }
 
   // 构造无状态访问器。Object 本身只承担总线接口，所有值都落在 Memory.bytes。
