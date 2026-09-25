@@ -1,49 +1,606 @@
-export const MOTD = `crados 1.0 (Cradle OS) - a transparent OS
+// /home/user 下的初始文档。
+// 单个文件上限是 20 个直接块 × 256 B = 5120 字节；中文按 UTF-8 每字 3 字节计算。
+// 文档用缩进式代码块而非围栏式，避免与 JS 模板字符串的反引号冲突。
 
-Type 'help' for the command list, 'man' for the guided tour.
-The right-hand panels are a live projection of kernel data structures.
+export const DOC_README = `# crados
+
+The filesystem is bytes on a block device, the process table is bytes in RAM,
+and every program in /bin is CRX machine code fetched through a page table.
+
+## How a command runs
+
+    timer interrupt
+      -> scheduler picks a ready process (round robin, quantum 5)
+      -> CPU fetches an instruction through the page table
+      -> a sys instruction traps into the kernel
+
+execve reads the inode, follows its block pointers, copies the image into
+page frames, and only then starts the CPU. Watch it in dmesg.
+
+## Filesystem
+
+    /bin        programs, mounted from /dev/rom
+    /home/user  these documents
+    /mnt        mount point for /dev/sdb
+    /tmp        scratch
+    /usr/bin    where your own programs go
+
+## First steps
+
+    ls -l /bin
+    cat count.s
+    as count.s -o count
+    ./count
+    ps
+
+## Experiments
+
+1. Scheduling. Run 'count 30 a &' then 'count 30 b'. The output
+   interleaves because the scheduler preempts each process.
+2. Blocking. Run 'sleep 8 &' then 'ps'. The sleeper is BLOCK, not
+   consuming CPU.
+3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
+   <defunct> until its parent reaps it.
+4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
+5. Panic. Run 'kill 1'. Killing init halts a real kernel too.
+6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
+
+## Manuals
+
+    man asm        instruction set, assembler, syscalls
+    man storage    disks and the on-disk format
+    man inspect    memory, the process table, registers
+    man script     shell scripts and the #! mechanism
+
+Chinese versions: man README.zh, man asm.zh, and so on.
 `
 
-export const README = `crados(7) - system overview
+export const DOC_README_ZH = `# crados
 
-DESCRIPTION
-  A single-core, tick-driven kernel. Every command you type crosses the
-  user/kernel boundary through a system call, and the panels on the right
-  show that boundary as it is crossed.
+文件系统是块设备上的字节，进程表是内存条里的字节，/bin 中的每个程序都是
+经页表取指执行的 CRX 机器码。
 
-  timer interrupt (20 Hz) -> scheduler (round robin, quantum 5)
-                          -> current process runs until its next syscall
+## 一条命令是怎么跑起来的
 
-  process  PCB with page table, registers, open file table, state machine
-  memory   64 frames x 256 B of real bytes; allocated on spawn, freed on exit
+    时钟中断
+      -> 调度器挑一个就绪进程（轮转，时间片 5）
+      -> CPU 经页表取指
+      -> sys 指令陷入内核
 
-EXECUTION PATH
-  Nothing runs from disk. execve(2) reads the inode, follows its block
-  pointers, copies the image block by block into the page frames it just
-  allocated, and only then starts the CPU, which fetches every instruction
-  from memory through the page table. dmesg shows the copy for each exec:
-    execve: /usr/bin/hello read 1 block(s) from sda, 44 bytes into memory
-  storage  /dev/sda root disk (persisted in the browser)
-           /dev/sdb removable disk (mount, export, import)
-  program  a file under /bin; exec loads it from the disk
+execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才启动 CPU。
+这个过程在 dmesg 里能看到。
 
-EXPERIMENTS
-  1  scheduling     count 30 a &   then   count 30 b
-  2  blocking I/O   sleep 8 &      then   ps
-  3  zombies        sleep 60 &     then   kill <pid>   then   ps
-  4  out of memory  run 'sleep 100 &' repeatedly until fork fails
-  5  panic          kill 1
-  6  devices        cat /dev/tty   (reads lines until Ctrl-D)
-  7  redirection    echo hello > /tmp/a.txt ; cat /tmp/a.txt
+## 文件系统
 
-SEE ALSO
-  man asm        writing real executables in assembly
-  man storage    disks, mounting, import and export
-  man script     shell scripts and the #! mechanism
-  man inspect    reading raw memory and disk bytes
+    /bin        程序，由 /dev/rom 挂载
+    /home/user  本目录下的文档
+    /mnt        /dev/sdb 的挂载点
+    /tmp        临时目录
+    /usr/bin    存放你自己编译的程序
+
+## 上手
+
+    ls -l /bin
+    cat count.s
+    as count.s -o count
+    ./count
+    ps
+
+## 实验
+
+1. 调度。先后运行 'count 30 a &' 和 'count 30 b'，两者的输出会交错，
+   因为调度器在抢占它们。
+2. 阻塞。运行 'sleep 8 &' 再 'ps'，睡眠进程处于 BLOCK，不占用 CPU。
+3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
+   状态留存，直到父进程回收。
+4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
+5. 内核恐慌。运行 'kill 1'。真实内核杀掉 init 同样会停机。
+6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
+
+## 手册
+
+    man asm        指令集、汇编器、系统调用
+    man storage    磁盘与盘上格式
+    man inspect    内存、进程表、寄存器
+    man script     shell 脚本与 #! 机制
+
+英文版：man README、man asm，以此类推。
 `
 
-export const HELLO_S = `; hello.s - assemble with: as hello.s -o hello
+export const DOC_ASM = `# asm
+
+A program in /bin is not special. It is a file whose first four bytes are
+the magic number \\x7fCRX, with the execute bit set. Assemble one and it is
+loaded, paged and scheduled exactly like the system utilities.
+
+## Build and run
+
+    as hello.s -o hello    assemble; the execute bit is set for you
+    ./hello                run it from the current directory
+    cp hello /usr/bin/     install it
+    hello                  now found on PATH, like ls or ps
+    objdump hello          disassemble the text section
+
+## Machine
+
+Eight 16-bit registers r0-r7. Fixed four-byte instructions. Flags are set
+by cmp and tested by je, jne, jlt, jgt. The address space starts at 0:
+.text first, then .data, with the stack on the top page. Every fetch and
+load goes through the page table; a bad address raises a page fault and
+the kernel kills the process, just as SIGSEGV would.
+
+## Instructions
+
+    mov add sub mul div mod cmp   rD, rS or rD, imm
+    jmp je jne jlt jgt call ret   control flow
+    ldb rD, [rB+off]              load byte
+    stb [rB+off], rS              store byte
+    ldw rD, [rB+off]              load 16-bit word
+    stw [rB+off], rS              store 16-bit word
+    push rS | push imm | pop rD   stack
+    sys                           trap into the kernel
+    hlt                           stop; r1 is the exit status
+
+## Directives
+
+    .text  .data  .asciz "s"  .ascii "s"  .byte n  .word n  .space n
+
+_start is the entry point if defined, otherwise address 0.
+
+## Calling convention
+
+On entry r1 holds argc and r2 points at the argv block, where arguments
+are separated by NUL bytes. For a syscall, r0 holds the call number and
+r1-r3 the arguments; r0 receives the result. 0xffff means failure.
+
+## System calls
+
+     1 write(fd,buf,len)    len 0 means up to the NUL terminator
+     2 read(fd,buf,max)     returns length, 0xffff at end of file
+     3 exit(status)         4 open(path,mode)   mode 0 r, 1 w, 2 a
+     5 close(fd)            6 sleep(ticks)      7 getpid()
+     8 gethz()              9 spawn(path,argv,argc)
+    10 wait(pid)           11 getdents(path,buf,max)
+    12 getcwd(buf)         13 unlink(path)     14 mkdir(path)
+    15 chmod(path,x)       16 rename(from,to)  17 sync()
+    18 getenv(key,buf)     20 mount(dev,dir)   21 umount(target)
+    22 kill(pid,sig)       23 chdir(path)      24 dup(fd)
+    25 dup2(old,new)       26 readview(kind,arg,buf)
+    27 assemble(src,out)   28 tcsetpgrp(pid)
+    29 page_alloc(vpn)     30 clock_gettime()   31 page_free(vpn)
+    32 block_read(dev,blk,buf)   33 block_write(dev,blk,buf)
+    34 sleep_seconds(seconds)
+
+getdents fills a buffer with 16-byte records: 15 bytes of NUL-padded name
+plus one type byte. That is why these calls take a buffer and a length.
+
+## Sources
+
+See hello.s and count.s in this directory.
+`
+
+export const DOC_ASM_ZH = `# asm
+
+/bin 里的程序并不特殊：它只是一个头四字节为魔数 \\x7fCRX、并且置了执行位的
+文件。你汇编出来的程序，会以和系统工具完全相同的方式被加载、分页和调度。
+
+## 构建与运行
+
+    as hello.s -o hello    汇编，执行位会自动置上
+    ./hello                在当前目录运行
+    cp hello /usr/bin/     安装
+    hello                  现在和 ls、ps 一样能在 PATH 里找到
+    objdump hello          反汇编 text 段
+
+## 机器模型
+
+八个 16 位寄存器 r0-r7，定长四字节指令。cmp 置标志位，由 je、jne、jlt、
+jgt 测试。地址空间从 0 开始：先 .text，再 .data，栈在最高一页。每次取指和
+访存都要过页表；非法地址触发缺页，内核会杀掉进程，等同于 SIGSEGV。
+
+## 指令
+
+    mov add sub mul div mod cmp   rD, rS 或 rD, imm
+    jmp je jne jlt jgt call ret   控制流
+    ldb rD, [rB+off]              读字节
+    stb [rB+off], rS              写字节
+    ldw rD, [rB+off]              读 16 位字
+    stw [rB+off], rS              写 16 位字
+    push rS | push imm | pop rD   栈操作
+    sys                           陷入内核
+    hlt                           停机，r1 为退出码
+
+## 伪指令
+
+    .text  .data  .asciz "s"  .ascii "s"  .byte n  .word n  .space n
+
+定义了 _start 就以它为入口，否则从地址 0 开始。
+
+## 调用约定
+
+入口处 r1 是 argc，r2 指向 argv 区，各参数以 NUL 分隔。系统调用时 r0 放
+调用号，r1-r3 放参数，返回值在 r0，0xffff 表示失败。
+
+## 系统调用
+
+     1 write(fd,buf,len)    len 为 0 表示写到 NUL 为止
+     2 read(fd,buf,max)     返回长度，0xffff 表示文件结束
+     3 exit(status)         4 open(path,mode)   mode 0 读 1 写 2 追加
+     5 close(fd)            6 sleep(ticks)      7 getpid()
+     8 gethz()              9 spawn(path,argv,argc)
+    10 wait(pid)           11 getdents(path,buf,max)
+    12 getcwd(buf)         13 unlink(path)     14 mkdir(path)
+    15 chmod(path,x)       16 rename(from,to)  17 sync()
+    18 getenv(key,buf)     20 mount(dev,dir)   21 umount(target)
+    22 kill(pid,sig)       23 chdir(path)      24 dup(fd)
+    25 dup2(old,new)       26 readview(kind,arg,buf)
+    27 assemble(src,out)   28 tcsetpgrp(pid)
+    29 page_alloc(vpn)     30 clock_gettime()   31 page_free(vpn)
+    32 block_read(dev,blk,buf)   33 block_write(dev,blk,buf)
+    34 sleep_seconds(seconds)
+
+机器码无法消费结构化的值，所以 read、getdents、getcwd、getenv 一律采用
+「缓冲区 + 长度」的形式。getdents 填的是 16 字节定长记录：15 字节 NUL
+补齐的名字加一字节类型。真实 Unix 这样设计，也是同一个原因。
+
+## 示例
+
+本目录下的 hello.s 与 count.s。
+`
+
+export const DOC_STORAGE = `# storage
+
+A disk is an array of bytes and nothing else. Every structure below is a
+field inside those bytes; no copy of the tree is held anywhere else.
+
+## On-disk format
+
+    block 0        superblock: magic "CRFS", block size, block count,
+                   inode count, inode table start, data start, label
+    block 1        block bitmap, one bit per block
+    block 2        inode bitmap, one bit per inode
+    block 3..k     inode table, 48 bytes per inode
+    block k+1..    data blocks
+
+An inode is laid out as
+
+    offset 0   type    1 file, 2 directory, 3 device
+    offset 1   flags   bit 0 is the execute bit
+    offset 2   size    16-bit length in bytes
+    offset 4   parent  inode number of the containing directory
+    offset 6   driver  device node minor number
+    offset 8   ptr[20] twenty direct block pointers
+
+## Where a file starts and ends
+
+The block pointers say which blocks hold the file; they need not be
+adjacent. The size field says how far into the last block the file runs.
+Nothing is stored inline and no terminator is used: extent is the pointer
+list, end is size. A file is therefore capped at 20 blocks: 5120 bytes on
+sda, 20480 on rom, whose blocks are 1024 B.
+
+There are no indirect blocks. Growing past the limit returns EFBIG, which
+is what a real filesystem does when it runs out of addressing depth.
+
+A directory is an ordinary file whose data is a run of 16-byte records,
+each holding a 2-byte inode number and a 14-byte name. Deleting a name
+rewrites that run.
+
+## Devices
+
+    /dev/rom   firmware, 256 blocks x 1024 B, mounted at /bin
+    /dev/sda   root disk, 2048 blocks x 256 B (512 KiB), mounted at /
+    /dev/sdb   first imported or created disk, same geometry as sda
+    /dev/sdc   the next one, and so on
+
+Only sda and rom exist at boot. Importing an image or creating a blank
+disk allocates the next free name; each one is a separate device.
+
+## Mounting
+
+    lsblk                    list block devices
+    df                       usage per filesystem
+    mount /dev/sdb /mnt      attach the device to a directory
+    cp README.md /mnt/       copy a file onto it
+    umount /mnt              detach it
+
+Any device except rom can be mounted anywhere, and several can be mounted
+at once on different directories.
+
+Unmount before removing a disk; the kernel refuses to detach a busy
+device with EBUSY. Writes past the end of a disk fail with ENOSPC.
+A rename across devices fails with EXDEV, because rename only rewrites a
+directory entry. Use cp for that.
+
+## Writeback
+
+There is no sync command. The kernel tracks a dirty flag and flushes
+modified devices to browser storage about once a second, on unmount, on
+panic and on shutdown. The Storage panel shows whether the current state
+has reached the store. sync(2) still exists as call 17.
+
+## Host transfer
+
+The Storage panel saves the selected device as <name>.img, a byte-for-byte
+copy with the superblock first, so sda exports as sda.img and rom as
+rom.img. Importing an image never overwrites a device: it is attached as
+the next free name. Images whose superblock does not match the on-disk
+format are refused.
+`
+
+export const DOC_STORAGE_ZH = `# storage
+
+磁盘就是一个字节数组，此外别无他物。下面所有结构都是这些字节里的字段，
+别处不存在任何一份目录树的副本。
+
+## 盘上格式
+
+    块 0         超级块：magic "CRFS"、块大小、块数、inode 数、
+                 inode 表起始、数据区起始、卷标
+    块 1         块位图，每块一个 bit
+    块 2         inode 位图，每个 inode 一个 bit
+    块 3..k      inode 表，每个 inode 48 字节
+    块 k+1..     数据块
+
+inode 的布局：
+
+    偏移 0    type    1 文件，2 目录，3 设备
+    偏移 1    flags   bit 0 是执行位
+    偏移 2    size    16 位字节长度
+    偏移 4    parent  所在目录的 inode 号
+    偏移 6    driver  设备号
+    偏移 8    ptr[20] 二十个直接块指针
+
+## 文件的起止是怎么标记的
+
+块指针给出文件占用了哪些块，它们不要求相邻；size 字段给出最后一块用到第
+几字节。既不内联存储，也不使用结束符：范围由指针表决定，末端由 size 决定。
+因此单个文件上限为 20 块：sda 上是 5120 字节，rom 的块是 1024 B，上限为
+20480 字节。
+
+没有间接块。超出上限会返回 EFBIG，真实文件系统在寻址深度用尽时也是如此。
+
+目录也是普通文件，其数据是一串 16 字节记录，每条含 2 字节 inode 号和
+14 字节名字。删除一个名字就是重写这段数据。
+
+## 设备
+
+    /dev/rom   固件，256 块 x 1024 B，挂载于 /bin
+    /dev/sda   根盘，2048 块 x 256 B（512 KiB），挂载于 /
+    /dev/sdb   第一个导入或新建的磁盘，容量与 sda 相同
+    /dev/sdc   下一个，以此类推
+
+开机时只有 sda 和 rom。导入镜像或新建空盘会占用下一个空闲名字，
+每一个都是独立设备。
+
+## 挂载
+
+    lsblk                    列出块设备
+    df                       各文件系统用量
+    mount /dev/sdb /mnt      把设备接入目录树
+    cp README.md /mnt/       复制文件到该设备
+    umount /mnt              摘除
+
+除 rom 外的设备都可以挂到任意目录，也可以同时挂载多个。
+
+拔盘前先 umount；设备忙时内核会返回 EBUSY。写满返回 ENOSPC。跨设备的
+rename 返回 EXDEV，因为 rename 只改写目录项，跨设备请用 cp。
+
+## 回写
+
+没有 sync 命令。内核维护脏标志，大约每秒把被修改的设备写回浏览器存储，
+umount、内核恐慌和关闭页面时也会强制写回。存储面板会显示当前状态是否
+已经落盘。sync(2) 作为 17 号调用仍然保留。
+
+## 与宿主交换
+
+存储面板可以把当前选中的设备保存为 <设备名>.img，那是整盘逐字节的副本，
+超级块在最前，所以 sda 导出为 sda.img，rom 导出为 rom.img。导入镜像不会
+覆盖任何设备，而是挂到下一个空闲名字上。盘上格式不匹配的镜像会被拒绝。
+`
+
+export const DOC_INSPECT = `# inspect
+
+Every abstraction here is backed by real bytes. Physical memory is a
+16 KiB array; a page table entry is an index into it. A disk image is a
+block array whose first block is the superblock.
+
+## From the shell
+
+    hexdump file            dump the bytes of a regular file
+    objdump prog            disassemble a CRX executable
+    mem                     frame usage per process
+    ps                      the process table
+
+## The process table is in RAM
+
+Frame 0 is the boot record. Frames 1 to 12 hold the process table: 16
+slots of 192 bytes, one per task.
+
+    0     in use       1     state        2-3   pid
+    4-5   ppid         6-7   pc           8-9   sp
+    12-13 exit status  14-17 reserved     18-19 wait for
+    20    on stdin     21    page count   22    cwd device
+    23    cwd inode    24-39 page table   40    fd count
+    41-88 fd table     89-105 name        106-127 command
+    128-143 r0-r7      144-145 flags      146   halted
+    147-154 cpu ticks  155-162 wake deadline     163 sleep mode
+
+CPU tick counters are stored in 64-bit PCB fields. The host performs exact
+arithmetic throughout JavaScript's 53-bit safe range. Sleep mode 1 stores a
+Guest tick deadline, so MAX shortens sleep(ticks). Mode 2 stores a monotonic
+millisecond deadline for sleep_seconds(), so the sleep command keeps real
+seconds unchanged at every CPU speed.
+
+The kernel keeps no second copy. ps reads these bytes, and so does the
+process panel.
+
+Note how cwd is stored: two bytes, a device and an inode number. The path
+text is rebuilt on demand by walking parent links on disk, which is what a
+real kernel does with its dentry pointer.
+
+Registers are not JavaScript values either. The CPU state is a set of
+accessors onto bytes 128-146 of the PCB, so every instruction reads and
+writes that physical register bank. The MMU likewise reads a frame number
+out of bytes 24-39 on every fetch.
+
+## From the panels
+
+The Memory panel shows the frame bitmap, the MMU translator and the bytes
+of one frame together. Type a virtual address, press the button beside the
+result, and the frame it maps to is dumped with the target byte
+highlighted. Each process owns a hue; outlined cells are free.
+
+The Storage panel does the same for disks. Pick a device, click a block,
+or select a file in the inode tree: its data blocks are ringed in the map
+and its block pointers become buttons that jump to the bytes.
+
+## What you will see
+
+A code page holds the CRX image that was loaded into it. The stack page
+starts with the argv vector written by the loader. Freed frames are
+scrubbed on the next allocation, so a fresh page never leaks the previous
+tenant's data.
+`
+
+export const DOC_INSPECT_ZH = `# inspect
+
+这里的每一层抽象背后都是真实字节。物理内存是一块 16 KiB 的数组，页表项
+就是它的下标；磁盘镜像是一个块数组，第一块是超级块。
+
+## 在 shell 里
+
+    hexdump file            dump 一个普通文件的字节
+    objdump prog            反汇编 CRX 可执行文件
+    mem                     各进程的帧占用
+    ps                      进程表
+
+## 进程表就在内存条里
+
+帧 0 是引导记录，帧 1 到 12 是进程表：16 个槽位，每个 192 字节。
+
+    0     占用标志      1     状态         2-3   pid
+    4-5   ppid         6-7   pc           8-9   sp
+    12-13 退出码       14-17 保留         18-19 等待对象
+    20    等待 stdin   21    页数         22    cwd 设备
+    23    cwd inode    24-39 页表         40    fd 数
+    41-88 fd 表        89-105 名字        106-127 命令行
+    128-143 r0-r7      144-145 标志位     146   停机标志
+    147-154 cpu tick   155-162 唤醒截止值    163  睡眠模式
+
+tick 计数在 PCB 中占 64 位。睡眠模式 1 保存 Guest tick 截止值，因此 MAX 会
+缩短 sleep(ticks)；模式 2 保存单调时钟毫秒截止值，由 sleep_seconds() 使用，
+所以 sleep 命令在任何 CPU 速度下都按真实秒数等待。
+
+内核不保留第二份副本。ps 读的就是这些字节，进程面板读的也是。
+
+注意 cwd 的存法：两个字节，一个设备号加一个 inode 号。路径文本是按需沿着
+盘上的 parent 链回溯出来的，真实内核用 dentry 指针做的也是同一件事。
+
+寄存器同样不是 JS 变量。CPU 状态只是 PCB 第 128 到 146 字节的一组访问器，
+每条指令都在读写那片物理寄存器区。MMU 也一样，每次取指都从第 24 到 39
+字节里现取帧号。
+
+## 在面板里
+
+内存面板把帧位图、MMU 翻译器和某一帧的字节放在一起。输入虚拟地址，点结果
+旁边的按钮，就会 dump 它映射到的那一帧，并高亮目标字节。每个进程有自己的
+色调，灰色是内核，描边的格子是空闲帧。
+
+存储面板对磁盘做同样的事。选设备、点块，或者在 inode 树里选中一个文件：
+它的数据块会在块地图上被圈出，它的块指针会变成可以跳转到字节的按钮。
+
+## 你会看到什么
+
+代码页里装着被加载进来的 CRX 映像。栈页开头是加载器写入的 argv 向量。
+被释放的帧会在下次分配时清零，所以新页面绝不会泄漏上一个租户的数据。
+`
+
+export const DOC_SCRIPT = `# script
+
+A file becomes a program in two ways: assemble it into CRX machine code,
+or give it a #! interpreter line and set the execute bit. This is exactly
+what execve does on a real system.
+
+## Writing one
+
+    cat > hello.sh
+    #!/bin/sh
+    echo hello from a script
+    ls -l /bin
+    <Ctrl-D>
+
+    chmod +x hello.sh
+    ./hello.sh
+
+## How it works
+
+cat with no argument reads standard input. The shell has redirected fd 1
+into the new file, so your keystrokes land on the disk. Ctrl-D closes the
+stream. chmod sets the execute bit on the inode.
+
+When you run ./hello.sh the kernel reads the first line, finds #!/bin/sh,
+and spawns /bin/sh with the script path as argv[0]. The shell, itself CRX
+machine code, then reads the file one byte at a time and executes each
+line through the same parser the prompt uses.
+
+Without the execute bit exec fails with EACCES; without a #! line and
+without the CRX magic it fails with ENOEXEC.
+
+## What the shell understands
+
+    cmd arg ...      run a program found on PATH
+    cmd > file       redirect standard output
+    cmd &            run in the background
+    cd dir           change directory
+    exit             leave the shell; init starts a new one
+    # comment        ignored
+
+Scripts may live on the removable disk as well. For real machine code
+instead of an interpreted script, see man asm.
+`
+
+export const DOC_SCRIPT_ZH = `# script
+
+让一个文件变成程序有两条路：把它汇编成 CRX 机器码，或者给它加一行 #!
+解释器声明并置上执行位。真实系统里的 execve 做的就是这件事。
+
+## 动手写一个
+
+    cat > hello.sh
+    #!/bin/sh
+    echo hello from a script
+    ls -l /bin
+    <Ctrl-D>
+
+    chmod +x hello.sh
+    ./hello.sh
+
+## 原理
+
+不带参数的 cat 读标准输入。shell 已经把 fd 1 重定向进了新文件，所以你的
+击键会落到磁盘上。Ctrl-D 关闭输入流。chmod 在 inode 上置执行位。
+
+运行 ./hello.sh 时，内核读取首行，发现 #!/bin/sh，于是启动 /bin/sh 并把
+脚本路径作为 argv[0] 传入。而 shell 本身也是 CRX 机器码，它会逐字节读取
+该文件，用与交互提示符完全相同的解析器执行每一行。
+
+没有执行位，exec 返回 EACCES；既没有 #! 行、也没有 CRX 魔数，返回 ENOEXEC。
+
+## shell 认识的语法
+
+    cmd arg ...      运行 PATH 上找到的程序
+    cmd > file       重定向标准输出
+    cmd &            后台运行
+    cd dir           切换目录
+    exit             退出 shell，init 会拉起一个新的
+    # 注释           忽略
+
+脚本也可以放在可移动盘上。如果想要真正的机器码而不是解释执行的脚本，
+参见 man asm。
+`
+
+export const HELLO_S = `; hello.s — assemble with: as hello.s -o hello
 .text
 _start:
     mov r0, 1          ; syscall 1 = write
@@ -59,7 +616,7 @@ msg:
     .asciz "hello from a real binary\\n"
 `
 
-export const COUNT_S = `; count.s - a loop, a syscall and a sleep
+export const COUNT_S = `; count.s — a loop, a syscall and a sleep
 ; build:  as count.s -o count      run:  ./count
 .text
 _start:
@@ -102,228 +659,94 @@ nl:
     .asciz "\\n"
 `
 
-export const MAN_ASM = `asm(7) - writing real executables
+export const PAGE_S = `; page.s — ask the CRX kernel allocator for virtual page 8
+; build: as page.s -o page      run: ./page
+.text
+_start:
+    mov r0, 29          ; page_alloc(vpn)
+    mov r1, 8
+    sys
+    cmp r0, 65535
+    je failed
 
-A program in /bin is not special. It is a file whose first four bytes are
-the magic number \\x7fCRX, with the execute bit set. Assemble one yourself
-and it is loaded, paged and scheduled exactly like the system utilities.
+    mov r4, r0          ; returned virtual address
+    mov r5, 65          ; 'A'
+    stb [r4+0], r5
+    mov r5, 10
+    stb [r4+1], r5
 
-ALL PROGRAMS ARE NATIVE
-  Every regular file in /bin is a CRX image. This includes pid 1 init, the
-  interactive and script-mode shell, the assembler, ps, the disk tools and
-  the inspection tools. There is no function-entry table and execve has no
-  host-language fallback path. objdump /bin/init shows the program that
-  started the system; objdump /bin/sh shows the parser handling redirection,
-  background jobs, built-ins, PATH search and waitpid in userspace.
+    mov r0, 1
+    mov r1, 1
+    mov r2, r4
+    mov r3, 2
+    sys
 
-  Making them native required a byte-oriented ABI, because machine code
-  cannot consume a structured value. read(2) takes a buffer length and
-  returns only that much; getdents(2) fills a buffer with 16-byte records,
-  15 bytes of NUL-padded name plus a type byte; getcwd(2) and getenv(2)
-  fill a buffer and return the length. That is why these calls look the
-  way they do on a real system.
+    mov r0, 31          ; page_free(vpn)
+    mov r1, 8
+    sys
+    mov r1, 0
+    hlt
 
-  Text tables such as ps and df are exposed by the kernel as read-only
-  pseudo-file views, analogous to /proc and /sys. Their CRX frontends read
-  those bytes and write them to stdout. The assembler frontend invokes the
-  same encoding service used to build the boot ROM, then writes the returned
-  CRX bytes to a normal inode. The executable process is machine code in both
-  cases; no ProgramFn or JavaScript command implementation remains.
+failed:
+    mov r0, 1
+    mov r1, 2
+    mov r2, err
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
 
-SYSTEM CALL NUMBERS
-   1 write(fd,buf,len)    2 read(fd,buf,max)    3 exit(status)
-   4 open(path,mode)      5 close(fd)           6 sleep(ticks)
-   7 getpid()             8 gethz()             9 spawn(path)
-  10 wait(pid)           11 getdents(path,buf,max)
-  12 getcwd(buf)         13 unlink(path)       14 mkdir(path)
-  15 chmod(path,x)       16 rename(from,to)    17 sync()
-  18 getenv(key,buf)     20 mount(dev,dir)     21 umount(target)
-  22 kill(pid,sig)       23 chdir(path)        24 dup(fd)
-  25 dup2(old,new)       26 readview(kind,buf) 27 assemble(src,out)
-  28 tcsetpgrp(pid)
-
-BUILD AND RUN
-  $ as hello.s -o hello     assemble; the execute bit is set for you
-  $ ./hello                 run it from the current directory
-  $ cp hello /bin/          install it
-  $ hello                   now found on PATH, like ls or ps
-  $ ls -l /bin              identical -rwxr-xr-x mode to the built-ins
-  $ objdump hello           disassemble the text section
-
-MACHINE
-  8 general registers r0-r7, each 16 bits. Fixed 4-byte instructions.
-  Flags are set by cmp and tested by je, jne, jlt, jgt.
-  The address space starts at 0: .text at 0, .data after it, stack on top.
-  Every fetch and load goes through the page table; a bad address raises a
-  page fault and the kernel kills the process, just like SIGSEGV.
-
-INSTRUCTIONS
-  mov add sub mul div mod cmp   rD, rS or rD, imm
-  jmp je jne jlt jgt call ret   control flow
-  ldb rD, [rB+off]              load byte
-  stb [rB+off], rS              store byte
-  push rS | push imm | pop rD   stack
-  sys                           trap into the kernel
-  hlt                           stop; r1 is the exit status
-
-DIRECTIVES
-  .text  .data  .asciz "str"  .ascii "str"  .byte n  .word n  .space n
-  _start is the entry point if defined, otherwise address 0.
-
-SYSTEM CALL ABI
-  r0 holds the call number, r1-r3 the arguments, r0 receives the result.
-    1 write(fd, buf, len)   len 0 means up to the NUL terminator
-    2 read(fd, buf, max)    returns length, 0xffff at end of file
-    3 exit(status)
-    4 open(path, mode)      mode 0 read, 1 write, 2 append
-    5 close(fd)
-    6 sleep(ticks)
-    7 getpid()
-    9 spawn(path)
-   10 wait(pid)
-
-EXAMPLE
-  See /home/user/hello.s and /home/user/count.s for working sources.
+.data
+err:
+    .asciz "page_alloc failed\\n"
 `
 
-export const MAN_INSPECT = `inspect(7) - looking at raw storage
+export const BLOCK_S = `; block.s — read the sda superblock through the CRX MMIO driver
+; build: as block.s -o block      run: ./block      output: CRFS
+.text
+_start:
+    mov r0, 29          ; page_alloc(vpn 8)
+    mov r1, 8
+    sys
+    cmp r0, 65535
+    je failed
+    mov r4, r0          ; DMA buffer virtual address
 
-Every abstraction in this system is backed by real bytes. Physical memory is
-a 16 KiB array; a page table entry is an index into it. A disk image is a
-block array whose first block is the superblock.
+    mov r0, 32          ; block_read(device, block, buffer)
+    mov r1, 1           ; device 1 = sda
+    mov r2, 0           ; superblock
+    mov r3, r4
+    sys
+    cmp r0, 65535
+    je failed
 
-FROM THE SHELL
-  hexdump file            dump the bytes of a regular file
-  hexdump -p 0x0000 256   dump physical memory at an address
-  hexdump -p 0x0100       the kernel process table, as stored in frame 1
+    mov r0, 1
+    mov r1, 1
+    mov r2, r4
+    mov r3, 4           ; CRFS magic
+    sys
+    mov r0, 1
+    mov r1, 1
+    mov r2, nl
+    mov r3, 1
+    sys
 
-  Frame 0 holds the boot record, frame 1 the process table. Both are
-  rewritten by the kernel whenever a process is created or reaped, so a
-  dump of frame 1 always matches the output of ps.
+    mov r0, 31
+    mov r1, 8
+    sys
+    mov r1, 0
+    hlt
 
-THE PROCESS TABLE IS IN RAM
-  Frame 0 is the boot record. Frames 1 to 4 hold the process table: 32
-  slots of 128 bytes, one per task. The fields are
+failed:
+    mov r0, 1
+    mov r1, 2
+    mov r2, err
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
 
-    0    in use        1     state         2-3   pid        4-5   ppid
-    6-7  pc            8-9   sp            10-11 ax         12-13 exit
-    14-15 cpu ticks    16-17 wake tick     18-19 wait for   20    on stdin
-    21   page count    22    cwd device    23    cwd inode  24-39 page table
-    40   fd count      41-88 fd table      89-105 name      106-127 command
-
-  The kernel does not keep a second copy of any of this. ps(1) reads these
-  bytes, and so does the process panel. Run 'hexdump -p 0x0100' to see the
-  slot belonging to init, then compare it with ps.
-
-  Note how cwd is stored: two bytes, a device and an inode number. The
-  path text is rebuilt on demand by walking parent links on disk, which is
-  what a real kernel does with its dentry pointer.
-
-FROM THE PANELS
-  The Memory panel shows the frame bitmap, the MMU translator and the
-  bytes of one frame together. Type a virtual address, press the button
-  next to the result, and the frame it maps to is dumped with the target
-  byte highlighted. Each process owns a hue, grey is kernel, outlined
-  cells are free.
-
-  The Storage panel does the same for disks. Pick a device, click a block
-  to dump it, or select a file in the inode tree: its data blocks are
-  ringed in the map and its block pointers become buttons that jump
-  straight to the bytes. Amber is the superblock, orange a bitmap, purple
-  the inode table, blue a directory record, green file data.
-
-WHAT YOU WILL SEE
-  A process code page contains the literal source text of the program that
-  was loaded into it. The stack page starts with the argv vector written by
-  the loader. Freed frames are scrubbed on the next allocation, so a newly
-  allocated page never leaks the previous tenant's data.
-`
-
-export const MAN_STORAGE = `storage(7) - disks, the on-disk format, import and export
-
-ON-DISK FORMAT (CRFS)
-  A disk is an array of bytes and nothing else. Every structure below is a
-  field inside those bytes; there is no copy of the tree held anywhere.
-
-    block 0        superblock: magic "CRFS", block size, block count,
-                   inode count, inode table start, data start, label
-    block 1        block bitmap, one bit per block
-    block 2        inode bitmap, one bit per inode
-    block 3..k     inode table, 32 bytes per inode
-    block k+1..    data blocks
-
-  An inode is laid out as
-    offset 0   type    1 = file, 2 = directory, 3 = device
-    offset 1   flags   bit 0 is the execute bit
-    offset 2   size    16-bit length in bytes
-    offset 4   parent  inode number of the containing directory
-    offset 6   driver  device node minor number
-    offset 8   ptr[12] twelve direct block pointers
-
-  WHERE DOES A FILE START AND END?  The block pointers say which blocks
-  hold the file; they need not be adjacent. The size field says how far
-  into the last block the file runs. Nothing is stored inline and no
-  terminator byte is used: extent = pointer list, end = size. A file is
-  therefore capped at 12 blocks. A directory is an ordinary file whose
-  data is a run of 16-byte records, each holding a 2-byte inode number and
-  a 14-byte name; deleting a name rewrites that run.
-
-  Watch it happen: write a file, then select it in the Storage panel's
-  inode tree. Its blocks are ringed in the block map and listed as inode
-  pointers; the bitmap block has a bit set and the data block holds the
-  bytes you just wrote.
-
-DEVICES
-  /dev/rom   firmware, 256 blocks x 1024 B, mounted at /bin
-  /dev/sda   root disk, 192 blocks x 256 B, mounted at /
-             dirty blocks are written back to browser storage automatically
-  /dev/sdb   removable disk, 64 blocks x 256 B, not mounted at boot
-
-MOUNTING
-  lsblk                    list block devices and mount points
-  mount /dev/sdb /mnt      graft the disk image onto the /mnt directory
-  cp notes.txt /mnt/       copy a file onto the removable disk
-  umount /mnt              flush the image and detach the subtree
-
-WRITEBACK
-  There is no sync command. The kernel tracks a dirty flag and flushes
-  every modified device to browser storage about once a second, on
-  unmount, on panic and on shutdown. The Storage panel shows whether the
-  current state has reached the store yet. sync(2) still exists as call
-  17 for programs that want to force a flush.
-
-HOST TRANSFER
-  The Storage panel saves /dev/sdb to your computer as a .img file. That
-  file is a byte-for-byte copy of the medium, superblock first, exactly
-  what a disk imaging tool would produce. Loading it back restores the
-  medium; the kernel refuses images whose superblock magic is wrong.
-
-NOTES
-  Unmount before removing the disk; the kernel refuses to detach a busy
-  device with EBUSY. Writes past the end of a disk fail with ENOSPC.
-`
-
-export const MAN_SCRIPT = `script(7) - creating an executable
-
-A file becomes a program in two steps: give it a #! interpreter line, then
-set the execute bit. This is exactly what execve(2) does on a real system.
-
-  $ cat > hello.sh
-  #!/bin/sh
-  echo hello from a script
-  ls -l /bin
-  <Ctrl-D>
-
-  $ chmod +x hello.sh
-  $ ./hello.sh
-
-HOW IT WORKS
-  cat with no argument reads standard input; the shell has redirected fd 1
-  into the new file, so your keystrokes land on the disk. Ctrl-D closes the
-  stream. chmod sets the x bit on the inode. When you run ./hello.sh the
-  kernel reads the first line, finds #!/bin/sh, and spawns /bin/sh with the
-  script path as argv[0]; the shell then executes each line in turn.
-
-  Without the execute bit exec fails with EACCES; without a #! line it
-  fails with ENOEXEC. Scripts may live on the removable disk as well.
+.data
+nl:  .ascii "\\n"
+err: .asciz "block read failed\\n"
 `

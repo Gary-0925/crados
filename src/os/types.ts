@@ -1,12 +1,14 @@
 // crados 内核公共类型：系统调用协议、进程状态、错误码
 // 用户态程序只能通过 yield 一个 Syscall 对象陷入内核，与真实 CPU 的 int 0x80 对应
 
-export type Mode = 'kernel' | 'user'
 export type PState = 'new' | 'ready' | 'running' | 'blocked' | 'zombie'
+export interface ReadBytes {
+  bytes: Uint8Array
+}
 
 export type Syscall =
   | { call: 'yield' }
-  | { call: 'write'; fd: number; data: string }
+  | { call: 'write'; fd: number; data: string | Uint8Array }
   | { call: 'read'; fd: number; len?: number }
   | { call: 'open'; path: string; flags: 'r' | 'w' | 'a' }
   | { call: 'close'; fd: number }
@@ -24,21 +26,16 @@ export type Syscall =
   | { call: 'exit'; code: number }
   | { call: 'wait'; pid: number }
   | { call: 'sleep'; ticks: number }
+  | { call: 'sleepSeconds'; seconds: number }
   | { call: 'kill'; pid: number; sig: number }
   | { call: 'getpid' }
   | { call: 'getenv'; key: string }
   | { call: 'tcsetpgrp'; pid: number }
   | { call: 'view'; kind: number; arg: string }
   | { call: 'assemble'; source: string; output: string }
-  | { call: 'peek'; addr: number; len: number }
   | { call: 'mount'; dev: string; dir: string }
   | { call: 'umount'; target: string }
   | { call: 'sync' }
-  | { call: 'lsblk' }
-  | { call: 'ps' }
-  | { call: 'meminfo' }
-  | { call: 'fsinfo' }
-  | { call: 'kmsg' }
   | { call: 'time' }
 
 // 进程体：一个不断 yield 系统调用的生成器，内核是它的唯一执行者
@@ -78,7 +75,7 @@ export const strerror = (e: { err: string }): string => ERRMSG[e.err] ?? e.err
 // 用户态库：构造系统调用请求的辅助函数（相当于 libc wrapper）
 export const sys = {
   yield: (): Syscall => ({ call: 'yield' }),
-  write: (fd: number, data: string): Syscall => ({ call: 'write', fd, data }),
+  write: (fd: number, data: string | Uint8Array): Syscall => ({ call: 'write', fd, data }),
   read: (fd: number, len?: number): Syscall => ({ call: 'read', fd, len }),
   open: (path: string, flags: 'r' | 'w' | 'a' = 'r'): Syscall => ({ call: 'open', path, flags }),
   close: (fd: number): Syscall => ({ call: 'close', fd }),
@@ -96,21 +93,16 @@ export const sys = {
   exit: (code: number): Syscall => ({ call: 'exit', code }),
   wait: (pid: number): Syscall => ({ call: 'wait', pid }),
   sleep: (ticks: number): Syscall => ({ call: 'sleep', ticks }),
+  sleepSeconds: (seconds: number): Syscall => ({ call: 'sleepSeconds', seconds }),
   kill: (pid: number, sig = 15): Syscall => ({ call: 'kill', pid, sig }),
   getpid: (): Syscall => ({ call: 'getpid' }),
   getenv: (key: string): Syscall => ({ call: 'getenv', key }),
   tcsetpgrp: (pid: number): Syscall => ({ call: 'tcsetpgrp', pid }),
   view: (kind: number, arg = ''): Syscall => ({ call: 'view', kind, arg }),
   assemble: (source: string, output: string): Syscall => ({ call: 'assemble', source, output }),
-  peek: (addr: number, len: number): Syscall => ({ call: 'peek', addr, len }),
   mount: (dev: string, dir: string): Syscall => ({ call: 'mount', dev, dir }),
   umount: (target: string): Syscall => ({ call: 'umount', target }),
   sync: (): Syscall => ({ call: 'sync' }),
-  lsblk: (): Syscall => ({ call: 'lsblk' }),
-  ps: (): Syscall => ({ call: 'ps' }),
-  meminfo: (): Syscall => ({ call: 'meminfo' }),
-  fsinfo: (): Syscall => ({ call: 'fsinfo' }),
-  kmsg: (): Syscall => ({ call: 'kmsg' }),
   time: (): Syscall => ({ call: 'time' }),
 }
 

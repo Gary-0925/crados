@@ -1,10 +1,10 @@
-import type { ProcRow, Snapshot } from '@/os/kernel'
-import { hex, STATE_STYLE } from '@/ui/theme'
+import type { ProcRow, Snapshot } from '@/cp/snapshot'
+import { hex } from '@/cp/theme'
 import { cn } from '@/utils/cn'
 
 function Cell({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-md border border-[#30363d] bg-[#0d1117] px-2 py-1.5">
+    <div className="border-b border-[#21262d] py-1">
       <div className="text-[9px] uppercase tracking-wide text-[#6e7681]">{label}</div>
       <div className="mt-0.5 truncate text-[11px] tabular text-[#c9d1d9]">{value}</div>
     </div>
@@ -13,12 +13,11 @@ function Cell({ label, value }: { label: string; value: string }) {
 
 function Detail({ p }: { p: ProcRow }) {
   return (
-    <div className="mt-2 space-y-2 rounded-md border border-[#30363d] bg-[#010409] p-2.5">
+    <div className="mt-2 space-y-2 border-t border-[#30363d] pt-2.5">
       <div className="flex items-center justify-between text-[11px]">
-        <span className={STATE_STYLE[p.state].text}>
+        <span className="text-[#c9d1d9]">
           pid {p.pid} · {p.cmd}
         </span>
-        <span className="text-[#6e7681]">task_struct</span>
       </div>
       <div className="grid grid-cols-4 gap-1.5">
         <Cell label="pc" value={hex(p.pc)} />
@@ -26,11 +25,34 @@ function Detail({ p }: { p: ProcRow }) {
         <Cell label="ax" value={hex(p.ax)} />
         <Cell label="cpu ticks" value={String(p.ticksUsed)} />
       </div>
+      {p.cpuMode && (
+        <div className="grid grid-cols-4 gap-1.5">
+          <Cell label="mode" value={p.cpuMode} />
+          <Cell label="cause" value={String(p.cause ?? 0)} />
+          <Cell label="ivt" value={hex(p.ivtBase ?? 0)} />
+          <Cell label="ksp" value={hex(p.ksp ?? 0)} />
+        </div>
+      )}
+      {p.gprs.length > 0 && (
+        <div>
+          <div className="mb-1 text-[9px] uppercase tracking-wide text-[#6e7681]">
+            registers · flags {p.flags} {p.halted ? '· halted' : ''}
+          </div>
+          <div className="grid grid-cols-8 gap-1">
+            {p.gprs.map((v, i) => (
+              <div key={i} className="border-b border-[#21262d] py-1 text-center">
+                <div className="text-[8px] text-[#6e7681]">r{i}</div>
+                <div className="text-[9px] tabular text-[#c9d1d9]">{hex(v, 2)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-1.5">
         <Cell label="cwd" value={p.cwd} />
         <Cell
           label={p.state === 'zombie' ? 'exit status' : 'wait channel'}
-          value={p.state === 'zombie' ? String(p.exitCode ?? 0) : (p.waitDesc ?? '-')}
+          value={p.state === 'zombie' ? String(p.exitCode ?? 0) : (p.waitDesc ?? '—')}
         />
       </div>
       {p.children.length > 0 && (
@@ -53,10 +75,9 @@ function Detail({ p }: { p: ProcRow }) {
             {p.pts.map((t) => (
               <span
                 key={t.vpn}
-                title={`${t.seg} segment`}
                 className="rounded border border-[#30363d] px-1.5 py-px text-[10px] tabular text-[#8b949e]"
               >
-                v{t.vpn}→f{t.pfn}
+                v{t.vpn}→f{t.pfn}{t.supervisor ? ' S' : ''}
               </span>
             ))}
           </div>
@@ -82,11 +103,8 @@ export function ProcessesPanel({
   return (
     <div className="p-2.5">
       <div className="flex items-baseline justify-between text-[10px] text-[#8b949e]">
-        <span>进程表</span>
         <span className="tabular">
-          <span className="text-[#3fb950]">{counts.running} run</span> · {counts.ready} ready ·{' '}
-          <span className="text-[#d29922]">{counts.blocked} block</span> ·{' '}
-          <span className="text-[#f85149]">{counts.zombie} zombie</span>
+          {counts.running} run · {counts.ready} ready · {counts.blocked} block · {counts.zombie} zombie
         </span>
       </div>
 
@@ -101,7 +119,6 @@ export function ProcessesPanel({
           <span className="flex-1">command</span>
         </div>
         {snap.procs.map((p) => {
-          const st = STATE_STYLE[p.state]
           const isCur = p.pid === snap.currentPid
           return (
             <button
@@ -112,13 +129,10 @@ export function ProcessesPanel({
                 sel === p.pid ? 'bg-[#21262d]' : 'hover:bg-[#0d1117]',
               )}
             >
-              <span className={cn('w-2.5 text-[9px]', isCur ? 'text-[#3fb950]' : 'text-transparent')}>▸</span>
+              <span className="w-2.5 text-[9px] text-[#6e7681]">{isCur ? '*' : ''}</span>
               <span className="w-7 text-[#c9d1d9]">{p.pid}</span>
               <span className="w-7 text-[#6e7681]">{p.ppid}</span>
-              <span className={cn('flex w-16 items-center gap-1.5 text-[10px]', st.text)}>
-                <span className={cn('h-1.5 w-1.5 rounded-full', st.dot)} />
-                {st.label}
-              </span>
+              <span className="w-16 text-[10px] text-[#8b949e]">{p.state.toUpperCase()}</span>
               <span className="w-9 text-right text-[#6e7681]">{p.pages}p</span>
               <span className="w-9 text-right text-[#6e7681]">{p.ticksUsed}</span>
               <span className={cn('flex-1 truncate', p.state === 'zombie' ? 'text-[#6e7681] line-through' : 'text-[#c9d1d9]')}>

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
-import type { Kernel, SegClass, Snapshot } from '@/os/kernel'
-import { cn } from '@/utils/cn'
+import type { Kernel, SegClass } from '@/os/kernel'
+import { showCtl } from '@/ui/theme'
 
 const SEG_CLS: Record<SegClass, string> = {
   out: 'text-[#c9d1d9]',
@@ -9,7 +9,8 @@ const SEG_CLS: Record<SegClass, string> = {
   echo: 'text-[#e6edf3]',
 }
 
-export function Terminal({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
+// 控制台只依赖内核的 tty 设备，与 /cp 无关。
+export function Terminal({ kernel }: { kernel: Kernel }) {
   const boxRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -49,8 +50,11 @@ export function Terminal({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
     } else if (e.key === 'Backspace') {
       kernel.pressBackspace()
       e.preventDefault()
-    } else if (e.key.length === 1) {
-      kernel.typeChar(e.key)
+    } else if (e.key.length === 1 || e.code === 'Minus' || e.code === 'NumpadSubtract') {
+      // 某些输入法会把 Minus 的 e.key 报成 C0 控制字节，按物理键规范化
+      const ch =
+        e.code === 'Minus' ? (e.shiftKey ? '_' : '-') : e.code === 'NumpadSubtract' ? '-' : e.key
+      kernel.typeChar(ch)
       e.preventDefault()
     }
   }
@@ -63,6 +67,8 @@ export function Terminal({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
     e.preventDefault()
   }
 
+  const lines = kernel.consoleLines()
+
   return (
     <div
       ref={boxRef}
@@ -72,25 +78,19 @@ export function Terminal({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
       onClick={() => boxRef.current?.focus()}
       className="flex h-full min-h-0 cursor-text flex-col bg-[#010409] outline-none"
     >
-      <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#21262d] px-3 text-[10px] text-[#6e7681]">
-        <span>tty0 - console device, canonical mode</span>
-        <span>Ctrl-C interrupt · Ctrl-D EOF · Ctrl-L clear</span>
+      <div className="shrink-0 border-b border-[#21262d] px-3 py-1 text-[10px] text-[#6e7681]">
+        Ctrl-C interrupt · Ctrl-D EOF · Ctrl-L clear
       </div>
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        {snap.lines.map((line, i) => (
+        {lines.map((line, i) => (
           <div key={i} className="whitespace-pre-wrap break-all text-[12.5px] leading-[1.5]">
             {line.segs.map((s, j) => (
               <span key={j} className={SEG_CLS[s.c]}>
-                {s.t}
+                {showCtl(s.t)}
               </span>
             ))}
-            {i === snap.lines.length - 1 && (
-              <span
-                className={cn(
-                  'cursor-blink ml-px inline-block h-[13px] w-[7px] translate-y-[2px]',
-                  snap.panic ? 'bg-[#f85149]' : 'bg-[#58a6ff]',
-                )}
-              />
+            {i === lines.length - 1 && (
+              <span className="ml-px inline-block h-[13px] w-[7px] translate-y-[2px] bg-[#c9d1d9]" />
             )}
           </div>
         ))}

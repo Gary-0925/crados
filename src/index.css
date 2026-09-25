@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 @theme {
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-mono: Consolas, "Courier New", monospace;
 }
 
 :root {
@@ -40,25 +40,14 @@ body {
   color: #e6edf3;
 }
 
-@keyframes blink {
-  0%,
-  49% {
-    opacity: 1;
-  }
-  50%,
-  100% {
-    opacity: 0;
-  }
-}
-
-.cursor-blink {
-  animation: blink 1.1s step-end infinite;
-}
-
 .tabular {
   font-variant-numeric: tabular-nums;
 }
 
 .grid-cols-16 {
   grid-template-columns: repeat(16, minmax(0, 1fr));
+}
+
+.grid-cols-32 {
+  grid-template-columns: repeat(32, minmax(0, 1fr));
 }

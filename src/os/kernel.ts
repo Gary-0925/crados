@@ -2,28 +2,56 @@
 //
 // 存储的真相只有两处：BlockDev 的字节数组（磁盘）与 Memory 的字节数组（内存条）。
 // 文件系统的目录、inode、位图都是磁盘字节里的字段；执行程序必须先把磁盘上的
-// 映像逐块拷贝进物理页帧，CPU 再从内存取指--没有任何数据"住在" JS 对象里。
+// 映像逐块拷贝进物理页帧，CPU 再从内存取指——没有任何数据"住在" JS 对象里。
 
-import { BlockDev, downloadDev, dropDev, loadDev, saveDev, SPECS } from './blockdev'
-import { basename, CRFS, dirname, normalizePath, T_DEV, T_DIR, T_FILE, VFS } from './fs'
+import {
+  BlockDev,
+  diskSpec,
+  downloadDev,
+  dropDev,
+  listStoredDisks,
+  loadDev,
+  nextDiskName,
+  rememberDisk,
+  saveDev,
+  SPECS,
+} from './blockdev'
+import { basename, CRFS, dirname, DRV_TTY, normalizePath, T_DEV, T_DIR, T_FILE, VFS } from './fs'
 import type { FNode } from './fs'
-import { FRAME_COUNT, KERNEL_FRAMES, Memory, PAGE_SIZE, RAM_SIZE } from './memory'
-import type { Frame } from './memory'
+import {
+  FRAME_COUNT,
+  KERNEL_TEXT_FRAME,
+  Memory,
+  PAGE_SIZE,
+  RAM_SIZE,
+  USER_FRAME_START,
+} from './memory'
 import { assemble, disassemble, isExecutable, loadExe } from './isa'
 import { ASM_PROGRAMS } from './asmsrc'
-import { Fault, runExe } from './vm'
-import type { Bus, CpuState } from './vm'
-import { DEV_CODE, DEV_NAME, MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
-import type { PTE, VfsHooks } from './process'
-import { COUNT_S, HELLO_S, MAN_ASM, MAN_INSPECT, MAN_SCRIPT, MAN_STORAGE, MOTD, README } from './rootfs'
+import { GUEST_IDLE_SOURCE, GUEST_KERNEL_SOURCE } from './guestkernel'
+import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from './vm'
+import type { Bus } from './vm'
+import { deviceCode, deviceName, MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
+import type { VfsHooks } from './process'
+import { buildRootImage } from './rootimg'
 import { isErr } from './types'
-import type { BlkInfo, Err, Gen, Mode, ProcInfo, PState, Syscall } from './types'
+import type { BlkInfo, Err, Gen, ProcInfo, ReadBytes, Syscall } from './types'
 
 export const QUANTUM = 5
 const AUTOSYNC_MS = 1000 // 脏数据自动回写间隔，按真实时间计而非 tick
 const TURBO_BUDGET_MS = 6 // 不限速模式每帧允许占用的时间
-const DRV_TTY = 1
-const DRV_NULL = 2
+const SLICES_PER_PUMP = 8
+const KERNEL_STACK_VPN = 15
+const KERNEL_TEXT_PFN = KERNEL_TEXT_FRAME
+const KERNEL_TEXT_PAGES = FRAME_COUNT - KERNEL_TEXT_PFN
+const KERNEL_TEXT_BASE = KERNEL_TEXT_PFN * PAGE_SIZE
+const MMIO_TTY_OUT = 0xff00
+const MMIO_TTY_ERR = 0xff01
+const MMIO_TTY_STATUS = 0xff10
+const MMIO_TTY_DATA = 0xff11
+const MMIO_BLOCK = 0xfe00
+const UTF8_ENCODER = new TextEncoder()
+
 
 export type SegClass = 'out' | 'err' | 'sys' | 'echo'
 export interface Seg {
@@ -33,90 +61,17 @@ export interface Seg {
 export interface Line {
   segs: Seg[]
 }
-export interface SysEntry {
-  tick: number
-  pid: number
-  pname: string
-  text: string
-  ret: string
-  err: boolean
-}
-export interface ProcRow {
-  pid: number
-  ppid: number
-  name: string
-  cmd: string
-  state: PState
-  pc: number
-  sp: number
-  ax: number
-  pages: number
-  ticksUsed: number
-  cwd: string
-  children: number[]
-  exitCode: number | null
-  waitDesc: string | null
-  pts: PTE[]
-  fds: string[]
-}
-export interface FSNode {
-  ino: number
-  name: string
-  type: 'dir' | 'file' | 'dev'
-  size: number
-  blocks: number
-  exec: boolean
-  disk: string
-  path: string
-  data?: string
-  disasm?: string[]
-  blockList?: number[]
-  kids: FSNode[]
-}
-export interface BlockCell {
-  no: number
-  kind: string
-  label: string
-}
-export interface DiskView {
-  bytes: Uint8Array
-  map: BlockCell[]
-  blockSize: number
-}
-export interface Snapshot {
-  ticks: number
-  hz: number
-  paused: boolean
-  mode: Mode
-  currentPid: number
-  switches: number
-  quantum: number
-  procs: ProcRow[]
-  frames: Frame[]
-  mem: { total: number; used: number; free: number; framesUsed: number }
-  tree: FSNode
-  fs: { max: number; used: number; bytes: number }
-  disks: BlkInfo[]
-  usbLabel: string
-  storageOk: boolean
-  dirty: boolean
-  lastSync: number
-  turbo: boolean
-  tps: number
-  trace: SysEntry[]
-  kmsgText: string[]
-  lines: Line[]
-  fgPid: number | null
-  shellPid: number
-  panic: string | null
+// Optional observer; absent observers have no trace storage cost.
+export interface KernelObserver {
+  changed(): void
+  syscall?(tick: number, pid: number, pname: string, call: Syscall, result: unknown, blocked: boolean): void
 }
 
-function* idleGen(): Gen {
-  while (true) yield { call: 'yield' }
+function* unloadedGen(): Gen {
+  return
 }
 
-// 内核线程由宿主生成器承载；所有用户进程一律是 CRX 机器码
-type ExecSpec = { kind: 'kernel'; gen: Gen } | { kind: 'exe'; entry: number }
+type ExecSpec = { entry: number }
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s)
 const hexAddr = (n: number) => '0x' + n.toString(16).padStart(4, '0')
@@ -129,42 +84,48 @@ export class Kernel {
   private readonly fss = new Map<string, CRFS>()
   private readonly procs = new Map<number, Process>()
   private readonly romErrors: string[] = []
+  private kernelIvt = 0
   private nextPid = 0
 
   ticks = 0
+  instructions = 0
   hz = 20
   paused = false
-  mode: Mode = 'kernel'
   private currentPid = -1
   private lastPicked = -1
-  private switches = 0
   private shellPid = -1
   private fgPid: number | null = null
 
   private lines: Line[] = []
   private lineBuf = ''
   private lineQueue: (string | null)[] = []
-  private readonly trace: SysEntry[] = []
+  private inputPacket: Uint8Array | null | undefined
+  private inputOffset = 0
+  private ttyIrqPending = false
+  // TTY 是字节设备，UTF-8 只在驱动边界解码；stream 模式能跨 write 调用保留半个字符。
+  private readonly ttyDecoders = {
+    out: new TextDecoder('utf-8', { fatal: false }),
+    err: new TextDecoder('utf-8', { fatal: false }),
+  }
+  // Block controller registers (big-endian u16): command, device, block,
+  // buffer, status. TypeScript implements DMA only; CRFS remains unknown here.
+  private readonly blockRegs = new Uint8Array(10)
   private readonly klog: { tick: number; msg: string }[] = []
 
-  private usbPresent = false
-  private usbMount: string | null = null
+  // 可移动设备没有数量上限；键是设备名，值是它当前的挂载点
+  private readonly mounts = new Map<string, string>()
   private dirty = false
-  private lastSync = 0
   private lastSyncMs = 0
   private storageOk = true
   private persist = true
 
   turbo = false
-  private suppress = false // 批量执行时抑制快照生成
-  private tps = 0
-  private tpsAt = 0
-  private tpsTicks = 0
+  private suppress = false // 批量执行时合并通知，避免每 tick 都唤醒观察者
 
   panic: string | null = null
   private timer: ReturnType<typeof setInterval> | null = null
-  private readonly listeners = new Set<() => void>()
-  private snap!: Snapshot
+  observer: KernelObserver | null = null
+  private nextTimerIrq = performance.now()
 
   constructor() {
     this.boot()
@@ -177,9 +138,14 @@ export class Kernel {
       this.ticks++
       this.log(msg, true)
     }
-    stamp('crados 1.0 booting on browser/js')
+    stamp('crados 2.0 booting on browser/js')
     stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
-    stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${KERNEL_FRAMES} reserved for the kernel`)
+    stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B`)
+
+    if (!this.installGuestKernel()) {
+      this.setPanic('cannot install CRX kernel trap page')
+      return
+    }
 
     // ROM：固件镜像，每次上电重新烧写
     const rom = this.makeDev('rom')
@@ -196,8 +162,10 @@ export class Kernel {
     const sdafs = this.fss.get('sda')!
     const restored = loadDev(sda) && sdafs.valid()
     if (!restored) {
-      sdafs.format('crados-root')
-      this.buildRootTree(sdafs)
+      // 首次上电：把随系统分发的根盘镜像整体写入设备，与从主机导入 .img 等价
+      const image = buildRootImage()
+      sda.load(image.bytes)
+      for (const e of image.errors) this.log(`rootfs image: ${e}`)
     }
     this.vfs.umount('/')
     this.vfs.mount('/', sdafs)
@@ -205,14 +173,20 @@ export class Kernel {
     stamp(
       restored
         ? `sda: superblock valid, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`
-        : `sda: no valid superblock, mkfs done on ${sda.blockCount} blocks`,
+        : `sda: root image written, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`,
     )
     stamp('vfs: mounted /dev/sda on /, /dev/rom on /bin')
 
-    const sdb = this.makeDev('sdb')
-    if (loadDev(sdb) && this.fss.get('sdb')!.valid()) {
-      this.usbPresent = true
-      stamp(`sdb: removable medium present, label "${this.fss.get('sdb')!.label()}"`)
+    for (const name of listStoredDisks()) {
+      const dev = this.makeDev(name, diskSpec(name))
+      if (loadDev(dev) && this.fss.get(name)!.valid()) {
+        stamp(`${name}: medium present, label "${this.fss.get(name)!.label()}"`)
+        continue
+      }
+      // 内容已失效就撤掉这个设备，避免留下一个读不出内容的空盘
+      this.devs.delete(name)
+      this.fss.delete(name)
+      dropDev(name)
     }
 
     this.storageOk = this.persist ? saveDev(sda) : false
@@ -225,7 +199,10 @@ export class Kernel {
       return
     }
 
-    this.spawnKernelThread('idle', '[idle]', idleGen())
+    if (!this.startIdle()) {
+      this.setPanic('cannot execute CRX idle process')
+      return
+    }
     stamp(this.startInit())
     this.startTimer()
     this.emit()
@@ -234,7 +211,7 @@ export class Kernel {
   // 供 PCB 使用：工作目录以 (设备号, inode 号) 落在内存里，路径靠 parent 链回溯
   private readonly vfsHooks: VfsHooks = {
     pathOf: (dev, ino) => {
-      const fs = this.fss.get(DEV_NAME[dev] ?? 'sda')
+      const fs = this.fss.get(deviceName(dev))
       if (!fs || !fs.inodeUsed(ino)) return '/'
       const parts: string[] = []
       let cur = ino
@@ -251,13 +228,13 @@ export class Kernel {
     },
     lookup: (path) => {
       const node = this.vfs.resolve(path, '/')
-      if ('err' in node) return { dev: DEV_CODE.sda, ino: 1 }
-      return { dev: DEV_CODE[node.dev.spec.name] ?? DEV_CODE.sda, ino: node.ino }
+      if ('err' in node) return { dev: deviceCode('sda'), ino: 1 }
+      return { dev: deviceCode(node.dev.spec.name) || deviceCode('sda'), ino: node.ino }
     },
   }
 
-  private makeDev(name: string): BlockDev {
-    const dev = new BlockDev(SPECS[name])
+  private makeDev(name: string, spec = SPECS[name]): BlockDev {
+    const dev = new BlockDev(spec)
     this.devs.set(name, dev)
     this.fss.set(name, new CRFS(dev))
     return dev
@@ -283,47 +260,46 @@ export class Kernel {
     return compiled
   }
 
-  private buildRootTree(fs: CRFS) {
-    const mkdir = (parent: number, name: string): number => {
-      const r = fs.create(parent, name, T_DIR)
-      return typeof r === 'number' ? r : 0
+  // Load the privileged CRX kernel into reserved physical frames. Kernel mode
+  // fetches it through the direct physical map, so user page tables never map it.
+  private installGuestKernel(): boolean {
+    const built = assemble(GUEST_KERNEL_SOURCE)
+    if (built.errors.length || built.bytes.length < 16) {
+      for (const e of built.errors) this.log(`kernel asm: ${e}`)
+      return false
     }
-    const put = (parent: number, name: string, text: string, exec = false) => {
-      const ino = fs.create(parent, name, T_FILE)
-      if (typeof ino !== 'number') return
-      fs.write(ino, text)
-      if (exec) fs.setExec(ino, true)
-    }
-    mkdir(1, 'bin') // /bin 是 ROM 的挂载点
-    const etc = mkdir(1, 'etc')
-    const dev = mkdir(1, 'dev')
-    const usr = mkdir(1, 'usr')
-    mkdir(usr, 'bin')
-    mkdir(1, 'mnt')
-    mkdir(1, 'tmp')
-    const home = mkdir(1, 'home')
-    const user = mkdir(home, 'user')
+    const image = built.bytes.slice(16)
+    if (image.length > PAGE_SIZE * KERNEL_TEXT_PAGES || built.symbols.ivt === undefined) return false
 
-    put(etc, 'motd', MOTD)
-    put(user, 'README', README)
-    put(user, 'asm.7', MAN_ASM)
-    put(user, 'storage.7', MAN_STORAGE)
-    put(user, 'script.7', MAN_SCRIPT)
-    put(user, 'inspect.7', MAN_INSPECT)
-    put(user, 'hello.s', HELLO_S)
-    put(user, 'count.s', COUNT_S)
-
-    for (const [name, drv] of [
-      ['tty', DRV_TTY],
-      ['null', DRV_NULL],
-    ] as const) {
-      const ino = fs.create(dev, name, T_DEV)
-      if (typeof ino === 'number') fs.setDriver(ino, drv)
+    // Relocate absolute symbol references from image offset zero.
+    for (const at of built.relocations) {
+      if (at < 0 || at + 1 >= image.length) return false
+      const relative = (image[at] << 8) | image[at + 1]
+      const absolute = KERNEL_TEXT_BASE + relative
+      if (absolute > 0xffff) return false
+      image[at] = (absolute >> 8) & 0xff
+      image[at + 1] = absolute & 0xff
     }
+
+    for (let page = 0; page < KERNEL_TEXT_PAGES; page++) {
+      const pfn = KERNEL_TEXT_PFN + page
+      this.mem.zero(pfn)
+      const chunk = image.subarray(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+      this.mem.bytes.set(chunk, pfn * PAGE_SIZE)
+    }
+    this.kernelIvt = KERNEL_TEXT_BASE + built.symbols.ivt
+    return true
   }
 
-  private spawnKernelThread(name: string, cmd: string, gen: Gen) {
-    this.exec(null, name, cmd, [], { kind: 'kernel', gen }, new Uint8Array(0))
+  private startIdle(): boolean {
+    const built = assemble(GUEST_IDLE_SOURCE)
+    if (built.errors.length) {
+      for (const e of built.errors) this.log(`idle asm: ${e}`)
+      return false
+    }
+    const exe = loadExe(String.fromCharCode(...built.bytes))
+    if (!exe) return false
+    return !('err' in this.exec(null, 'idle', '[idle]', [], { entry: exe.entry }, exe.image))
   }
 
   // init 必须从 ROM 以 CRX 映像启动；不存在函数回退
@@ -333,7 +309,7 @@ export class Kernel {
       const image = this.vfs.fsOf(node).readBytes(node.ino)
       const exe = loadExe(String.fromCharCode(...image))
       if (exe) {
-        const r = this.exec(null, 'init', '/bin/init', [], { kind: 'exe', entry: exe.entry }, exe.image)
+        const r = this.exec(null, 'init', '/bin/init', [], { entry: exe.entry }, exe.image)
         if (!('err' in r)) return 'init: pid 1 started from /bin/init as machine code'
       }
     }
@@ -350,6 +326,7 @@ export class Kernel {
   // 并抑制中途的快照生成，否则光是渲染就会成为瓶颈
   private startTimer() {
     if (this.timer) clearInterval(this.timer)
+    this.nextTimerIrq = performance.now() + 1000 / this.hz
     this.timer = setInterval(
       () => {
         if (this.paused || this.panic) return
@@ -366,7 +343,7 @@ export class Kernel {
           this.emit()
         } catch (e) {
           this.suppress = false
-          console.error('[crados] tick fault', e)
+          this.setPanic(`host timer failure: ${(e as Error).message}`)
         }
       },
       this.turbo ? 0 : 1000 / this.hz,
@@ -375,7 +352,11 @@ export class Kernel {
 
   setSpeed(v: number | 'max') {
     this.turbo = v === 'max'
-    if (typeof v === 'number') this.hz = v
+    if (typeof v === 'number') {
+      this.hz = v
+      this.mem.setU16(0x0024, v)
+    }
+    this.nextTimerIrq = performance.now() + 1000 / this.hz
     this.startTimer()
     this.emit()
   }
@@ -387,67 +368,126 @@ export class Kernel {
     this.paused = true
     this.tick()
   }
-  subscribe = (fn: () => void): (() => void) => {
-    this.listeners.add(fn)
-    return () => this.listeners.delete(fn)
+  processes(): Process[] {
+    return [...this.procs.values()]
   }
-  getSnapshot = (): Snapshot => this.snap
-
+  filesystem(name: string): CRFS | undefined {
+    return this.fss.get(name)
+  }
+  consoleLines(): Line[] {
+    return this.lines
+  }
+  blockDevices(): BlkInfo[] {
+    return this.blkInfo()
+  }
+  fsStats() {
+    return this.statfs()
+  }
+  kmsg(): string[] {
+    return this.kmsgLines()
+  }
+  get runningPid(): number {
+    return this.currentPid
+  }
+  get foregroundPid(): number | null {
+    return this.mem.u16(0x002c) || this.fgPid
+  }
+  get storageReady(): boolean {
+    return this.storageOk
+  }
+  get pendingWriteback(): boolean {
+    return this.dirty
+  }
   // ---------- 调度 ----------
 
   private tick() {
     if (this.panic) return
     this.ticks++
-    this.mode = 'kernel'
 
-    for (const p of this.procs.values()) {
-      if (p.state === 'blocked' && p.wakeAt > 0 && p.wakeAt <= this.ticks) {
-        p.wakeAt = 0
-        p.state = 'ready'
-      }
+    // MAX 只增加 CPU cycle 吞吐。硬件 timer IRQ 由真实单调时间驱动，始终
+    // 保持 hz 频率；sleep 和抢占因此不会随 MAX 加速。
+    const nowMs = performance.now()
+    const timerDue = this.turbo || nowMs >= this.nextTimerIrq
+    if (!this.turbo && timerDue) {
+      const period = 1000 / this.hz
+      do this.nextTimerIrq += period
+      while (this.nextTimerIrq <= nowMs)
     }
 
-    let cur = this.procs.get(this.currentPid) ?? null
-    if (!cur || cur.state !== 'running' || cur.stepsInSlice >= QUANTUM || cur.pid === 0) {
-      const next = this.pick()
-      if (next) {
-        if (cur && cur.state === 'running') cur.state = 'ready'
-        if (next !== cur) this.switches++
-        next.state = 'running'
-        next.stepsInSlice = 0
-        this.currentPid = next.pid
-        cur = next
-      }
+    for (const process of this.procs.values()) {
+      if (process.state !== 'blocked' || process.sleepMode !== 2 || nowMs < process.wakeAt) continue
+      process.sleepMode = 0
+      process.wakeAt = 0
+      process.state = 'ready'
     }
 
-    if (cur && cur.state === 'running') {
-      cur.ticksUsed++
-      cur.stepsInSlice++
-      if (!cur.cpu) cur.regs.pc++
-      this.mode = 'user'
+    let timerPending = timerDue
+    const slices = this.turbo ? 1 : SLICES_PER_PUMP
+    for (let slice = 0; slice < slices && !this.panic; slice++) {
+      const kCurrentPid = this.mem.u16(0x0020)
+      if (kCurrentPid !== this.currentPid && this.procs.has(kCurrentPid)) {
+        const selected = this.procs.get(kCurrentPid)!
+        this.currentPid = kCurrentPid
+        for (const p of this.procs.values()) {
+          if (p !== selected && p.state === 'running') p.state = 'ready'
+        }
+        if (selected.state === 'ready') selected.state = 'running'
+      }
+
+      let cur = this.procs.get(this.currentPid) ?? null
+      if (!cur || cur.state !== 'running') {
+        const next = this.pick()
+        if (next) {
+          for (const p of this.procs.values()) {
+            if (p !== next && p.state === 'running') p.state = 'ready'
+          }
+          if (next !== cur) this.mem.setU16(0x0026, this.mem.u16(0x0026) + 1)
+          next.state = 'running'
+          this.currentPid = next.pid
+          this.mem.setU16(0x0020, next.pid)
+          this.mem.setU16(0x0022, next.slot)
+          cur = next
+        }
+      }
+
+      if (!cur || cur.state !== 'running') break
+      if (cur.cpu && cur.cpu.pendingIrq === NO_IRQ) {
+        if (this.ttyIrqPending) {
+          cur.cpu.pendingIrq = VECTOR_TTY
+          this.ttyIrqPending = false
+        } else if (timerPending) {
+          cur.cpu.pendingIrq = VECTOR_TIMER
+          timerPending = false
+        }
+      }
+
       let r: IteratorResult<Syscall, unknown>
       try {
         r = cur.gen.next(cur.pending)
       } catch (e) {
         const msg = e instanceof Fault ? e.message : (e as Error).message
         this.log(`trap: pid ${cur.pid} (${cur.name}) ${msg}`)
+        if (cur.pid <= 1) {
+          this.setPanic(`critical process ${cur.pid} (${cur.name}) fault: ${msg}`)
+          return
+        }
         this.doExit(cur, 139)
-        this.emit()
-        return
+        continue
       }
       cur.pending = undefined
-      this.mode = 'kernel'
-      if (cur.cpu) {
-        cur.regs.pc = cur.cpu.pc
-        cur.regs.sp = cur.cpu.sp
-        cur.regs.ax = cur.cpu.regs[0]
+      this.fgPid = this.mem.u16(0x002c) || this.fgPid
+      if (r.done) {
+        if (cur.pid <= 1) {
+          this.setPanic(`critical process ${cur.pid} (${cur.name}) returned unexpectedly`)
+          return
+        }
+        this.doExit(cur, 0)
+      } else {
+        this.dispatch(cur, r.value)
       }
-      if (r.done) this.doExit(cur, 0)
-      else this.dispatch(cur, r.value)
     }
 
     if (this.dirty && Date.now() - this.lastSyncMs >= AUTOSYNC_MS) this.flush(false)
-    this.writeKernelTables()
     this.emit()
   }
 
@@ -467,19 +507,145 @@ export class Kernel {
 
   // ---------- 进程与加载器 ----------
 
-  private makeBus(pfns: number[]): Bus {
+  private makeBus(p: Process): Bus {
     const mem = this.mem
-    const translate = (va: number): number => {
+    const translate = (va: number, forceUser = false): number => {
       const vpn = va >>> 8
-      if (va < 0 || vpn >= pfns.length) throw new Fault(va, 'page fault')
-      return pfns[vpn] * PAGE_SIZE + (va & 0xff)
+      const pte = p.pteAt(vpn)
+      if (va < 0) throw new Fault(va, 'page fault')
+
+      // Kernel instructions use a physical direct map. The sole exception is
+      // the per-process supervisor stack at VPN 15. Access to user virtual
+      // memory must use ULDB/USTB (forceUser=true), never an ordinary load.
+      if (!forceUser && p.cpu?.mode === 'kernel') {
+        if (pte?.supervisor) return pte.pfn * PAGE_SIZE + (va & 0xff)
+        if (va < RAM_SIZE) return va
+        throw new Fault(va, 'kernel address fault')
+      }
+
+      if (pte !== null) {
+        if (pte.supervisor) throw new Fault(va, 'supervisor page fault')
+        return pte.pfn * PAGE_SIZE + (va & 0xff)
+      }
+      throw new Fault(va, 'page fault')
+    }
+    const readMem = (va: number, forceUser = false) => mem.bytes[translate(va, forceUser)]
+    const writeMem = (va: number, b: number, forceUser = false) => {
+      mem.bytes[translate(va, forceUser)] = b & 0xff
+    }
+    const reg16 = (off: number) => (this.blockRegs[off] << 8) | this.blockRegs[off + 1]
+    const setReg16 = (off: number, value: number) => {
+      this.blockRegs[off] = (value >> 8) & 0xff
+      this.blockRegs[off + 1] = value & 0xff
+    }
+    const loadInputPacket = () => {
+      if (this.inputPacket !== undefined || !this.lineQueue.length) return
+      const line = this.lineQueue.shift()
+      this.inputPacket = line === null || line === undefined ? null : UTF8_ENCODER.encode(line)
+      this.inputOffset = 0
+    }
+    const ttyStatus = () => {
+      loadInputPacket()
+      if (this.inputPacket === undefined) return 0
+      if (this.inputPacket === null) return 2
+      return this.inputPacket.length === 0 ? 3 : 1
+    }
+    const ttyData = () => {
+      loadInputPacket()
+      if (this.inputPacket === undefined) return 0
+      if (this.inputPacket === null || this.inputPacket.length === 0) {
+        this.inputPacket = undefined
+        this.inputOffset = 0
+        return 0
+      }
+      const value = this.inputPacket[this.inputOffset++]
+      if (this.inputOffset >= this.inputPacket.length) {
+        this.inputPacket = undefined
+        this.inputOffset = 0
+      }
+      return value
+    }
+    const runBlockCommand = () => {
+      const command = reg16(0)
+      if (command === 3) {
+        let ok = true
+        if (this.persist) {
+          for (const [name, disk] of this.devs) {
+            if (name === 'rom') continue
+            ok = saveDev(disk) && ok
+          }
+        }
+        this.storageOk = ok
+        this.dirty = false
+        this.lastSyncMs = Date.now()
+        setReg16(8, ok ? 1 : 0xffff)
+        return
+      }
+      const name = deviceName(reg16(2))
+      const dev = this.devs.get(name)
+      const block = reg16(4)
+      const buffer = reg16(6)
+      if (!dev || block >= dev.blockCount) {
+        setReg16(8, 0xffff)
+        return
+      }
+      try {
+        const bytes = dev.block(block)
+        if (command === 1 || command === 4) {
+          const forceUser = command === 1
+          for (let i = 0; i < bytes.length; i++) writeMem(buffer + i, bytes[i], forceUser)
+        } else if (command === 2 || command === 5) {
+          const forceUser = command === 2
+          for (let i = 0; i < bytes.length; i++) bytes[i] = readMem(buffer + i, forceUser)
+          this.dirty = true
+        } else {
+          setReg16(8, 0xffff)
+          return
+        }
+        setReg16(8, 1)
+      } catch {
+        setReg16(8, 0xffff)
+      }
     }
     return {
-      limit: pfns.length * PAGE_SIZE,
-      read: (va) => mem.bytes[translate(va)],
-      write: (va, b) => {
-        mem.bytes[translate(va)] = b & 0xff
+      get limit() {
+        return p.cpu?.mode === 'kernel' ? RAM_SIZE : p.addressLimit
       },
+      read: (va) => {
+        if (p.cpu?.mode === 'kernel' && va === MMIO_TTY_STATUS) return ttyStatus()
+        if (p.cpu?.mode === 'kernel' && va === MMIO_TTY_DATA) return ttyData()
+        if (p.cpu?.mode === 'kernel' && va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
+          return this.blockRegs[va - MMIO_BLOCK]
+        }
+        if (p.cpu?.mode === 'kernel' && va >= 0xff00) return 0
+        return readMem(va)
+      },
+      readUser: (va) => readMem(va, true),
+      writeUser: (va, b) => writeMem(va, b, true),
+      write: (va, b) => {
+        if (p.cpu?.mode === 'kernel' && va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
+          const off = va - MMIO_BLOCK
+          this.blockRegs[off] = b & 0xff
+          if (off === 1) runBlockCommand()
+          return
+        }
+        if (p.cpu?.mode === 'kernel' && va >= 0xff00) {
+          this.mmioWrite(va, b)
+          return
+        }
+        writeMem(va, b)
+      },
+    }
+  }
+
+  // TypeScript only supplies the virtual UART hardware. It does not inspect
+  // syscalls or file descriptors; those decisions are made by CRX kernel code.
+  private mmioWrite(port: number, byte: number) {
+    const raw = Uint8Array.of(byte & 0xff)
+    if (port === MMIO_TTY_OUT) {
+      this.conWrite(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
+    } else if (port === MMIO_TTY_ERR) {
+      this.conWrite(this.ttyDecoders.err.decode(raw, { stream: true }), 'err')
     }
   }
 
@@ -507,43 +673,46 @@ export class Kernel {
     if (slot < 0) return { err: 'EAGAIN' }
     const pid = this.nextPid++
     const codePages = Math.max(1, Math.ceil(image.length / PAGE_SIZE))
-    const segs = [...Array<string>(codePages).fill('text'), 'heap', 'stack']
-    const pfns = this.mem.alloc(pid, segs)
+    if (codePages + 1 > KERNEL_STACK_VPN) return { err: 'EFBIG' }
+    // Dynamic pages are allocated explicitly with page_alloc.
+    const pfns = this.mem.alloc(codePages + 2)
     if (!pfns) return { err: 'ENOMEM' }
 
     // 加载：磁盘映像逐页拷贝进物理帧，此后 CPU 只面向内存
     this.mem.writeBytesPages(pfns.slice(0, codePages), image)
-    const stackVpn = pfns.length - 1
+    const stackVpn = codePages
     const stackFrame = pfns[stackVpn]
+    const kernelStackFrame = pfns[codePages + 1]
     // argv 区位于栈页起始处：argc 在 r1，argv 基地址在 r2，字符串以 NUL 分隔
     const argvText = args.length ? args.join('\0') + '\0' : ''
-    this.mem.writeAt(stackFrame * PAGE_SIZE, spec.kind === 'kernel' ? `kernel-thread=${name}\npid=${pid}\n` : argvText)
+    this.mem.writeAt(stackFrame * PAGE_SIZE, argvText)
 
     const env = parent ? { ...parent.env } : { USER: 'root', HOME: '/', PATH: '/usr/bin:/bin', SHELL: '/bin/sh' }
-    let gen: Gen
-    let cpu: CpuState | null = null
-    if (spec.kind === 'kernel') {
-      gen = spec.gen
-    } else {
-      cpu = {
-        regs: new Uint16Array(8),
-        pc: spec.entry,
-        sp: pfns.length * PAGE_SIZE - 2,
-        flag: 0,
-        halted: false,
-      }
-      cpu.regs[1] = args.length
-      cpu.regs[2] = stackVpn * PAGE_SIZE
-      gen = runExe(cpu, this.makeBus(pfns))
-    }
-
-    const p = new Process(this.mem, slot, gen, env, this.vfsHooks)
+    const p = new Process(this.mem, slot, unloadedGen(), env, this.vfsHooks)
     p.init(pid, parent ? parent.pid : 0, name, cmd, parent ? parent.cwd : '/')
+    p.pageTable = [
+      ...pfns.slice(0, codePages + 1).map((pfn, vpn) => ({ vpn, pfn })),
+      { vpn: KERNEL_STACK_VPN, pfn: kernelStackFrame, supervisor: true },
+    ]
+    const cpu = p.createCpuState()
     p.cpu = cpu
-    p.pageTable = pfns.map((pfn, vpn) => ({ vpn, pfn, seg: segs[vpn] }))
-    p.regs.sp = cpu ? cpu.sp : stackFrame * PAGE_SIZE + PAGE_SIZE - 1
-    p.regs.bp = p.regs.sp
-    if (cpu) p.regs.pc = cpu.pc
+    cpu.pc = spec.entry
+    cpu.sp = (stackVpn + 1) * PAGE_SIZE - 2
+    cpu.flag = 0
+    cpu.halted = false
+    cpu.mode = 'user'
+    cpu.irqEnabled = true
+    cpu.pendingIrq = NO_IRQ
+    cpu.cause = 0
+    cpu.ivtBase = this.kernelIvt
+    cpu.ksp = (KERNEL_STACK_VPN + 1) * PAGE_SIZE - 2
+    cpu.usp = cpu.sp
+    cpu.regs[1] = args.length
+    cpu.regs[2] = stackVpn * PAGE_SIZE
+    p.gen = runExe(cpu, this.makeBus(p), (count) => {
+      this.instructions += count
+    })
+    p.regs.sp = p.cpu ? p.cpu.sp : stackFrame * PAGE_SIZE + PAGE_SIZE - 1
 
     if (parent) {
       for (const fd of [0, 1, 2]) {
@@ -568,24 +737,35 @@ export class Kernel {
     return p
   }
 
-  // 帧 0 是引导记录；帧 1..4 是 PCB 表，由 Process 直接读写，内核不得覆盖
+  // Frame 0 is the KCB; frames 1..12 hold PCBs.
   private writeKernelTables() {
-    this.mem.zero(0)
-    this.mem.writeAt(
-      0,
-      `crados 1.0 \nram=${RAM_SIZE} pagesize=${PAGE_SIZE} frames=${FRAME_COUNT}\n` +
-        `quantum=${QUANTUM} hz=${this.hz} tick=${this.ticks} nproc=${this.procs.size}\n` +
-        `pcb base=${PCB_BASE} size=${PCB_SIZE} slots=${MAX_PROCS}\n`,
-    )
+    const banner = 'crados 2.0\n'
+    for (let i = 0; i < 32; i++) {
+      this.mem.bytes[i] = i < banner.length ? banner.charCodeAt(i) : 0
+    }
+    this.mem.setU16(0x0024, this.hz)
+    this.mem.setU16(0x0030, this.kernelIvt)
+    this.mem.setU16(0x0032, this.procs.size)
+    this.mem.setU16(0x0034, RAM_SIZE)
+    this.mem.setU16(0x0036, PAGE_SIZE)
+    this.mem.setU16(0x0038, PCB_BASE)
+    this.mem.setU16(0x003a, PCB_SIZE)
+    this.mem.setU16(0x003c, QUANTUM)
+    this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
   }
 
   private doExit(p: Process, code: number) {
+    if (p.pid <= 1) {
+      this.setPanic(`critical process ${p.pid} (${p.name}) attempted to exit with status ${code}`)
+      return
+    }
     p.state = 'zombie'
     p.exitCode = code
+    p.sleeping = false
     p.wakeAt = 0
     p.readStdin = false
     p.waitFor = null
-    this.mem.freePid(p.pid)
+    this.mem.freeFrames(p.pageTable.map((pte) => pte.pfn))
     p.pageTable = []
     p.fds.clear()
     this.writeKernelTables()
@@ -620,14 +800,11 @@ export class Kernel {
   }
 
   private killInit() {
-    const init = this.procs.get(1)
-    if (init) this.doExit(init, 0x8f)
     this.setPanic('Attempted to kill init! exitcode=0x0000008f')
   }
 
   private setPanic(msg: string) {
     this.panic = msg
-    this.mode = 'kernel'
     this.log(`Kernel panic - not syncing: ${msg}`, true)
     this.flush(true)
     this.emit()
@@ -642,53 +819,56 @@ export class Kernel {
   private flush(quiet: boolean): number {
     let blocks = 0
     let ok = true
-    for (const name of ['sda', 'sdb']) {
-      if (name === 'sdb' && !this.usbPresent) continue
+    for (const name of this.devs.keys()) {
+      if (name === 'rom') continue // ROM 每次上电重新烧写，无需回写
       const fs = this.fsOf(name)
       blocks += fs.usedBlocks()
       ok = (this.persist ? saveDev(this.devs.get(name)!) : false) && ok
     }
     this.storageOk = ok
     this.dirty = false
-    this.lastSync = this.ticks
     this.lastSyncMs = Date.now()
     if (!quiet) this.log(`sync: ${blocks} block(s) written to persistent store`)
     return blocks
   }
 
   private sysMount(dev: string, dir: string, cwd: string): Err | 0 {
-    if (basename(dev) !== 'sdb') return { err: 'ENODEV' }
-    if (!this.usbPresent) return { err: 'ENODEV' }
-    if (this.usbMount) return { err: 'EBUSY' }
+    const name = basename(dev)
+    if (!this.devs.has(name) || name === 'rom') return { err: 'ENODEV' }
+    if (this.mounts.has(name)) return { err: 'EBUSY' }
     const target = this.vfs.resolve(dir, cwd)
     if ('err' in target) return { err: target.err }
     if (target.type !== T_DIR) return { err: 'ENOTDIR' }
-    const fs = this.fsOf('sdb')
+    const fs = this.fsOf(name)
     if (!fs.valid()) return { err: 'EINVAL' }
     const abs = normalizePath(dir, cwd)
+    if (abs === '/' || [...this.mounts.values()].includes(abs)) return { err: 'EBUSY' }
     this.vfs.mount(abs, fs)
-    this.usbMount = abs
-    this.log(`sdb: mounted on ${abs}, label "${fs.label()}", ${fs.usedBlocks()} blocks in use`)
+    this.mounts.set(name, abs)
+    this.log(`${name}: mounted on ${abs}, label "${fs.label()}", ${fs.usedBlocks()} blocks in use`)
     return 0
   }
 
   private sysUmount(target: string, cwd: string): Err | 0 {
-    const abs = basename(target) === 'sdb' ? this.usbMount : normalizePath(target, cwd)
-    if (!this.usbMount || abs !== this.usbMount) return { err: 'EINVAL' }
+    const byName = basename(target)
+    const abs = this.mounts.has(byName) ? this.mounts.get(byName)! : normalizePath(target, cwd)
+    const name = [...this.mounts.entries()].find(([, at]) => at === abs)?.[0]
+    if (!name) return { err: 'EINVAL' }
     for (const p of this.procs.values())
-      if (p.state !== 'zombie' && p.cwd.startsWith(this.usbMount)) return { err: 'EBUSY' }
-    this.vfs.umount(this.usbMount)
-    if (this.persist) saveDev(this.devs.get('sdb')!)
-    this.log(`sdb: unmounted from ${this.usbMount}`)
-    this.usbMount = null
+      if (p.state !== 'zombie' && p.cwd.startsWith(abs)) return { err: 'EBUSY' }
+    this.vfs.umount(abs)
+    this.mounts.delete(name)
+    if (this.persist) saveDev(this.devs.get(name)!)
+    this.log(`${name}: unmounted from ${abs}`)
     return 0
   }
 
   private blkInfo(): BlkInfo[] {
-    const row = (name: string, mount: string | null, present: boolean): BlkInfo => {
+    return [...this.devs.keys()].map((name) => {
       const dev = this.devs.get(name)!
       const fs = this.fsOf(name)
-      const used = present && fs.valid() ? fs.usedBlocks() : 0
+      const used = fs.valid() ? fs.usedBlocks() : 0
+      const mount = name === 'sda' ? '/' : name === 'rom' ? '/bin' : (this.mounts.get(name) ?? null)
       return {
         name,
         model: dev.spec.model,
@@ -698,70 +878,83 @@ export class Kernel {
         usedBlocks: used,
         blockSize: dev.blockSize,
         removable: dev.spec.removable,
-        present,
+        present: true,
         mountpoint: mount,
         persistent: this.storageOk,
       }
-    }
-    return [row('sda', '/', true), row('sdb', this.usbMount, this.usbPresent), row('rom', '/bin', true)]
+    })
   }
 
   // ---------- UI 存储操作 ----------
 
-  attachUsb(label = 'usb'): Err | 0 {
-    if (this.usbPresent) return { err: 'EBUSY' }
-    this.fsOf('sdb').format(label)
-    this.usbPresent = true
-    if (this.persist) saveDev(this.devs.get('sdb')!)
-    this.log(`usb-storage: /dev/sdb attached, mkfs done, label "${label}"`)
+  // 新建空盘：分配下一个可用的 sdX
+  attachDisk(label = 'disk'): Err | 0 {
+    const name = nextDiskName(this.devs.keys())
+    if (!name) return { err: 'ENOSPC' }
+    const dev = this.makeDev(name, diskSpec(name))
+    this.fsOf(name).format(label)
+    if (this.persist) {
+      saveDev(dev)
+      rememberDisk(name)
+    }
+    this.log(`${name}: attached, mkfs done, label "${label}"`)
     this.emit()
     return 0
   }
 
-  detachUsb(): Err | 0 {
-    if (!this.usbPresent) return { err: 'ENODEV' }
-    if (this.usbMount) return { err: 'EBUSY' }
-    this.usbPresent = false
-    this.devs.get('sdb')!.bytes.fill(0)
-    dropDev('sdb')
-    this.log('usb-storage: /dev/sdb detached')
+  detachDisk(name: string): Err | 0 {
+    const dev = this.devs.get(name)
+    if (!dev || name === 'sda' || name === 'rom') return { err: 'ENODEV' }
+    if (this.mounts.has(name)) return { err: 'EBUSY' }
+    this.devs.delete(name)
+    this.fss.delete(name)
+    dropDev(name)
+    this.log(`${name}: detached`)
     this.emit()
     return 0
   }
 
-  exportUsb(): Err | 0 {
-    if (!this.usbPresent) return { err: 'ENODEV' }
-    const dev = this.devs.get('sdb')!
-    downloadDev(dev, `${this.fsOf('sdb').label() || 'usb'}.img`)
-    this.log(`sdb: raw image of ${dev.size} bytes written to host`)
+  // 导出整盘字节。sda 导出的 .img 与首次上电写入的根盘镜像同构。
+  exportDisk(name: string): Err | 0 {
+    const dev = this.devs.get(name)
+    if (!dev) return { err: 'ENODEV' }
+    downloadDev(dev, `${name}.img`)
+    this.log(`${name}: raw image of ${dev.size} bytes written to host`)
     this.emit()
     return 0
   }
 
-  importUsb(raw: Uint8Array, filename: string): Err | 0 {
-    if (this.usbMount) return { err: 'EBUSY' }
-    const dev = this.devs.get('sdb')!
-    if (raw.length > dev.size) return { err: 'ENOSPC' }
+  // 导入镜像：每次都占用一个新的 sdX，不覆盖已有设备
+  importDisk(raw: Uint8Array, filename: string): Err | 0 {
+    const name = nextDiskName(this.devs.keys())
+    if (!name) return { err: 'ENOSPC' }
+    const spec = diskSpec(name)
+    if (raw.length > spec.blockSize * spec.blockCount) return { err: 'ENOSPC' }
+    const dev = this.makeDev(name, spec)
     dev.load(raw)
-    const fs = this.fsOf('sdb')
-    if (!fs.valid()) {
-      dev.bytes.fill(0)
+    if (!this.fsOf(name).valid()) {
+      this.devs.delete(name)
+      this.fss.delete(name)
       return { err: 'EINVAL' }
     }
-    this.usbPresent = true
-    if (this.persist) saveDev(dev)
-    this.log(`usb-storage: image ${filename} loaded, ${fs.usedInodes()} inodes, label "${fs.label()}"`)
+    if (this.persist) {
+      saveDev(dev)
+      rememberDisk(name)
+    }
+    const fs = this.fsOf(name)
+    this.log(`${name}: image ${filename} loaded, ${fs.usedInodes()} inodes, label "${fs.label()}"`)
     this.emit()
     return 0
   }
 
-  formatUsb(): Err | 0 {
-    if (this.usbMount) return { err: 'EBUSY' }
-    if (!this.usbPresent) return { err: 'ENODEV' }
-    const fs = this.fsOf('sdb')
-    fs.format(fs.label() || 'usb')
-    if (this.persist) saveDev(this.devs.get('sdb')!)
-    this.log('sdb: mkfs complete, all data blocks free')
+  formatDisk(name: string): Err | 0 {
+    const dev = this.devs.get(name)
+    if (!dev || name === 'sda' || name === 'rom') return { err: 'ENODEV' }
+    if (this.mounts.has(name)) return { err: 'EBUSY' }
+    const fs = this.fsOf(name)
+    fs.format(fs.label() || name)
+    if (this.persist) saveDev(dev)
+    this.log(`${name}: mkfs complete, all data blocks free`)
     this.emit()
     return 0
   }
@@ -769,72 +962,43 @@ export class Kernel {
   wipeRoot() {
     this.persist = false
     this.storageOk = false
-    dropDev('sda')
-    dropDev('sdb')
+    for (const name of this.devs.keys()) {
+      if (name !== 'rom') dropDev(name)
+    }
     this.log('sda: persistent store cleared, writes are volatile until reboot')
     this.emit()
-  }
-
-  // ---------- 窥探接口 ----------
-
-  ramBytes(): Uint8Array {
-    return this.mem.bytes
-  }
-
-  frameOwnerLabel(pfn: number): string {
-    const f = this.mem.frames[pfn]
-    if (!f) return 'invalid frame'
-    if (f.owner === null) return 'free'
-    if (f.owner === 'kernel') return pfn === 0 ? 'kernel: boot record' : 'kernel: process table'
-    const p = this.procs.get(f.owner)
-    return `pid ${f.owner} (${p?.name ?? 'gone'}) ${f.seg} segment`
-  }
-
-  diskLayout(name: string): DiskView | null {
-    const dev = this.devs.get(name)
-    if (!dev) return null
-    if (name === 'sdb' && !this.usbPresent) return null
-    return { bytes: dev.bytes, map: this.fsOf(name).blockMap(), blockSize: dev.blockSize }
   }
 
   // ---------- 系统调用 ----------
 
   private dispatch(p: Process, sc: Syscall) {
     if (sc.call === 'yield') return
-    const entry: SysEntry = { tick: this.ticks, pid: p.pid, pname: p.name, text: '', ret: '…', err: false }
     let result: unknown = 0
     let blocked = false
 
     switch (sc.call) {
       case 'write':
-        entry.text = `write(${sc.fd}, ${JSON.stringify(clip(sc.data, 18))})`
         result = this.sysWrite(p, sc.fd, sc.data)
         break
       case 'read': {
-        entry.text = `read(${sc.fd}${sc.len ? `, ${sc.len}` : ''})`
         const r = this.sysRead(p, sc.fd, sc.len)
         if (r === undefined) blocked = true
         else result = r
         break
       }
       case 'open':
-        entry.text = `open("${sc.path}", ${sc.flags})`
         result = this.sysOpen(p, sc.path, sc.flags)
         break
       case 'close':
-        entry.text = `close(${sc.fd})`
         result = p.fds.delete(sc.fd) ? 0 : { err: 'EBADF' }
         break
       case 'dup':
-        entry.text = `dup(${sc.fd})`
         result = this.sysDup(p, sc.fd, -1)
         break
       case 'dup2':
-        entry.text = `dup2(${sc.from}, ${sc.to})`
         result = this.sysDup(p, sc.from, sc.to)
         break
       case 'readdir': {
-        entry.text = `getdents("${sc.path}")`
         const node = this.vfs.resolve(sc.path, p.cwd)
         if ('err' in node) result = { err: node.err }
         else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
@@ -852,7 +1016,6 @@ export class Kernel {
         break
       }
       case 'stat': {
-        entry.text = `stat("${sc.path}")`
         const node = this.vfs.resolve(sc.path, p.cwd)
         result =
           'err' in node
@@ -868,19 +1031,15 @@ export class Kernel {
         break
       }
       case 'mkdir':
-        entry.text = `mkdir("${sc.path}")`
         result = this.sysCreate(p, sc.path, T_DIR)
         break
       case 'unlink':
-        entry.text = `unlink("${sc.path}")`
         result = this.sysUnlink(p, sc.path)
         break
       case 'rename':
-        entry.text = `rename("${sc.from}", "${sc.to}")`
         result = this.sysRename(p, sc.from, sc.to)
         break
       case 'chmod': {
-        entry.text = `chmod("${sc.path}", ${sc.exec ? '+x' : '-x'})`
         const node = this.vfs.resolve(sc.path, p.cwd)
         if ('err' in node) result = { err: node.err }
         else {
@@ -891,7 +1050,6 @@ export class Kernel {
         break
       }
       case 'chdir': {
-        entry.text = `chdir("${sc.path}")`
         const node = this.vfs.resolve(sc.path, p.cwd)
         if ('err' in node) result = { err: node.err }
         else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
@@ -902,21 +1060,16 @@ export class Kernel {
         break
       }
       case 'getcwd':
-        entry.text = 'getcwd()'
         result = p.cwd
         break
       case 'spawn':
-        entry.text = `execve("${sc.path}", [${sc.args.join(', ')}])`
         result = this.sysSpawn(p, sc.path, sc.args)
         break
       case 'exit':
-        entry.text = `exit(${sc.code})`
-        this.tracePush(entry)
-        entry.ret = '-'
+        this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, false)
         this.doExit(p, sc.code)
         return
       case 'wait': {
-        entry.text = `waitpid(${sc.pid})`
         const kids = this.childrenOf(p.pid)
         const zombie = kids.find((k) => k.state === 'zombie' && (sc.pid === -1 || k.pid === sc.pid))
         if (zombie) {
@@ -931,19 +1084,28 @@ export class Kernel {
         break
       }
       case 'sleep':
-        entry.text = `nanosleep(${sc.ticks} ticks)`
         if (sc.ticks <= 0) result = 0
         else {
+          // Syscall 6 is handled in the CRX kernel. This branch exists only for
+          // compatibility with a host-generated request.
           p.state = 'blocked'
-          p.wakeAt = this.ticks + sc.ticks
+          p.sleepMode = 1
+          p.wakeAt = this.mem.u16(0x0028) + sc.ticks
+          blocked = true
+        }
+        break
+      case 'sleepSeconds':
+        if (sc.seconds <= 0) result = 0
+        else {
+          p.state = 'blocked'
+          p.sleepMode = 2
+          p.wakeAt = Math.ceil(performance.now() + sc.seconds * 1000)
           blocked = true
         }
         break
       case 'kill': {
-        entry.text = `kill(${sc.pid}, ${sc.sig})`
         if (sc.pid === 1) {
-          this.tracePush(entry)
-          entry.ret = '-'
+          this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, false)
           this.killInit()
           return
         }
@@ -959,96 +1121,43 @@ export class Kernel {
         }
         break
       }
-      case 'peek': {
-        entry.text = `peek(${hexAddr(sc.addr)}, ${sc.len})`
-        const raw = this.mem.peek(sc.addr, sc.len)
-        result = raw ? { addr: sc.addr, bytes: [...raw] } : { err: 'EINVAL' }
-        break
-      }
       case 'mount':
-        entry.text = `mount("${sc.dev}", "${sc.dir}")`
         result = this.sysMount(sc.dev, sc.dir, p.cwd)
         break
       case 'umount':
-        entry.text = `umount("${sc.target}")`
         result = this.sysUmount(sc.target, p.cwd)
         break
       case 'sync':
-        entry.text = 'sync()'
         result = this.flush(false)
         break
-      case 'lsblk':
-        entry.text = 'ioctl(BLKGETINFO)'
-        result = this.blkInfo()
-        break
       case 'getpid':
-        entry.text = 'getpid()'
         result = p.pid
         break
       case 'getenv':
-        entry.text = `getenv("${sc.key}")`
         result = p.env[sc.key] ?? ''
         break
       case 'tcsetpgrp':
-        entry.text = `tcsetpgrp(${sc.pid})`
         this.fgPid = sc.pid
         result = 0
         break
       case 'view':
-        entry.text = `readview(${sc.kind}, "${sc.arg}")`
         result = this.sysView(sc.kind, sc.arg, p)
         break
       case 'assemble':
-        entry.text = `assemble("${sc.source}", "${sc.output}")`
         result = this.sysAssemble(sc.source, sc.output, p)
         break
-      case 'ps':
-        entry.text = 'readproc()'
-        result = this.procInfoList()
-        break
-      case 'meminfo':
-        entry.text = 'sysinfo()'
-        result = this.mem.stats()
-        break
-      case 'fsinfo':
-        entry.text = 'statfs()'
-        result = this.statfs()
-        break
-      case 'kmsg':
-        entry.text = 'syslog(READ_ALL)'
-        result = this.kmsgLines()
-        break
       case 'time':
-        entry.text = 'clock_gettime()'
         result = { ticks: this.ticks, hz: this.hz }
         break
     }
 
-    this.tracePush(entry)
     if (blocked) {
-      entry.ret = 'blocked'
+      this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, true)
       return
     }
-    if (isErr(result)) {
-      entry.ret = `-1 ${result.err}`
-      entry.err = true
-    } else {
-      entry.ret =
-        result === null
-          ? 'EOF'
-          : typeof result === 'string'
-            ? JSON.stringify(clip(result, 26))
-            : typeof result === 'number'
-              ? String(result)
-              : clip(JSON.stringify(result), 40)
-      if (typeof result === 'number') p.regs.ax = result
-    }
+    if (typeof result === 'number') p.regs.ax = result
+    this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, result, false)
     p.pending = result
-  }
-
-  private tracePush(e: SysEntry) {
-    this.trace.push(e)
-    if (this.trace.length > 160) this.trace.shift()
   }
 
   private statfs() {
@@ -1121,19 +1230,9 @@ export class Kernel {
       }
       return out
     }
-    if (kind === 8) {
-      const pages: Record<string, string> = {
-        crados: README,
-        asm: MAN_ASM,
-        storage: MAN_STORAGE,
-        script: MAN_SCRIPT,
-        inspect: MAN_INSPECT,
-      }
-      return clip(pages[arg] ?? `man: no manual entry for ${arg}\n`, 1190)
-    }
     if (kind === 9)
       return [
-        'crados commands',
+        'crados commands (every file in /bin is CRX machine code)',
         '',
         'files:   ls cat head wc cp mv rm rmdir mkdir touch chmod echo',
         'process: ps kill sleep count pid',
@@ -1141,7 +1240,8 @@ export class Kernel {
         'kernel:  mem dmesg hexdump objdump uname whoami',
         'build:   as source.s -o program',
         'shell:   cd pwd clear exit; > redirects; & runs in background',
-        'manual:  man crados | asm | storage | script | inspect',
+        'manual:  man [README|asm|storage|inspect|script]',
+        '         append .zh for Chinese, e.g. man asm.zh',
         '',
       ].join('\n')
     return { err: 'EINVAL' }
@@ -1226,32 +1326,32 @@ export class Kernel {
     return 0
   }
 
-  private sysWrite(p: Process, fd: number, data: string): number | Err {
+  private sysWrite(p: Process, fd: number, data: string | Uint8Array): number | Err {
     const f = p.fds.get(fd)
     if (!f) return { err: 'EBADF' }
     if (f.kind === 'stdin' || (f.kind === 'file' && f.flags === 'r')) return { err: 'EBADF' }
+    const raw = typeof data === 'string' ? UTF8_ENCODER.encode(data) : data
     if (f.kind === 'stdout') {
-      this.conWrite(data, f.id === 2 ? 'err' : 'out')
-      return data.length
+      const cls = f.id === 2 ? 'err' : 'out'
+      this.conWrite(this.ttyDecoders[cls].decode(raw, { stream: true }), cls)
+      return raw.length
     }
     if (f.kind === 'tty') {
-      this.conWrite(data, 'out')
-      return data.length
+      this.conWrite(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
+      return raw.length
     }
-    if (f.kind === 'null') return data.length
+    if (f.kind === 'null') return raw.length
     // 直接按偏移写盘：只有受影响的块被改写，不经任何中间副本
     const fs = this.fss.get(f.dev)!
     const at = f.flags === 'a' ? fs.isize(f.ino) : f.pos
-    const raw = new Uint8Array(data.length)
-    for (let i = 0; i < data.length; i++) raw[i] = data.charCodeAt(i) & 0xff
     const r = fs.writeAt(f.ino, at, raw)
     if (isErr(r)) return r
-    p.fds.seek(fd, at + data.length) // 文件偏移回写进 PCB 的 fd 表
+    p.fds.seek(fd, at + raw.length) // 文件偏移回写进 PCB 的 fd 表
     this.dirty = true
-    return data.length
+    return raw.length
   }
 
-  private sysRead(p: Process, fd: number, len?: number): string | null | Err | undefined {
+  private sysRead(p: Process, fd: number, len?: number): ReadBytes | null | Err | undefined {
     const f = p.fds.get(fd)
     if (!f) return { err: 'EBADF' }
     if (f.kind === 'stdout') return { err: 'EBADF' }
@@ -1262,16 +1362,17 @@ export class Kernel {
         p.readStdin = true
         return undefined
       }
-      return this.lineQueue.shift() ?? null
+      const line = this.lineQueue.shift()
+      return line === null || line === undefined ? null : { bytes: UTF8_ENCODER.encode(line) }
     }
     const fs = this.fss.get(f.dev)!
     const size = fs.isize(f.ino)
-    if (f.pos >= size) return ''
+    if (f.pos >= size) return { bytes: new Uint8Array(0) }
     // 机器码程序按缓冲区大小分次读取；不给长度则读到文件末尾
     const want = len && len > 0 ? Math.min(len, size - f.pos) : size - f.pos
     const raw = fs.readAt(f.ino, f.pos, want)
     p.fds.seek(fd, f.pos + want)
-    return String.fromCharCode(...raw)
+    return { bytes: raw }
   }
 
   private lowestFd(p: Process): number {
@@ -1348,7 +1449,7 @@ export class Kernel {
       const exe = loadExe(String.fromCharCode(...image))
       if (!exe) return { err: 'ENOEXEC' }
       this.log(`execve: CRX image, text ${exe.textLen} B, data ${exe.dataLen} B, entry ${hexAddr(exe.entry)}`)
-      return this.launch(p, node.name, `${node.name} ${args.join(' ')}`.trim(), args, { kind: 'exe', entry: exe.entry }, exe.image)
+      return this.launch(p, node.name, `${node.name} ${args.join(' ')}`.trim(), args, { entry: exe.entry }, exe.image)
     }
 
     const head = String.fromCharCode(...image.subarray(0, 64)).split('\n', 1)[0]
@@ -1365,7 +1466,7 @@ export class Kernel {
       basename(abs),
       `${basename(abs)} ${args.join(' ')}`.trim(),
       [abs, ...args],
-      { kind: 'exe', entry: interpExe.entry },
+      { entry: interpExe.entry },
       interpExe.image,
     )
   }
@@ -1396,6 +1497,9 @@ export class Kernel {
 
   typeChar(ch: string) {
     if (this.panic) return
+    // canonical tty 只接收可打印字符；Ctrl-C/D/L 由对应的行规入口处理。
+    // 这样宿主浏览器产生的 DC1..DC4 等控制字节不会污染 argv 或文件。
+    if (!ch || (ch.charCodeAt(0) < 0x20 && ch !== '\t')) return
     if (this.lineBuf.length < 256) this.lineBuf += ch
     this.conWrite(ch, 'echo')
     this.emit()
@@ -1406,7 +1510,7 @@ export class Kernel {
     this.lineQueue.push(this.lineBuf)
     this.lineBuf = ''
     this.conWrite('\n', 'echo')
-    this.wakeReader()
+    this.ttyIrqPending = true
     this.emit()
   }
 
@@ -1430,7 +1534,7 @@ export class Kernel {
     }
     this.lineQueue.push(null)
     this.conWrite('\n', 'echo')
-    this.wakeReader()
+    this.ttyIrqPending = true
     this.emit()
   }
 
@@ -1438,33 +1542,19 @@ export class Kernel {
     if (this.panic) return
     this.conWrite('^C\n', 'err')
     this.lineBuf = ''
-    const fg = this.fgPid !== null ? this.procs.get(this.fgPid) : undefined
+    const fgPid = this.foregroundPid
+    const fg = fgPid !== null ? this.procs.get(fgPid) : undefined
     if (fg && fg.pid !== this.shellPid && fg.state !== 'zombie') this.killSig(fg, 2)
-    else
-      for (const p of this.procs.values())
-        if (p.state === 'blocked' && p.readStdin) {
-          p.readStdin = false
-          p.pending = ''
-          p.state = 'ready'
-          break
-        }
+    else {
+      this.lineQueue.push('')
+      this.ttyIrqPending = true
+    }
     this.emit()
   }
 
   pressCtrlL() {
     this.lines = []
     this.emit()
-  }
-
-  private wakeReader() {
-    for (const p of [...this.procs.values()].sort((a, b) => a.pid - b.pid)) {
-      if (p.state === 'blocked' && p.readStdin) {
-        p.readStdin = false
-        p.pending = this.lineQueue.length ? (this.lineQueue.shift() ?? null) : null
-        p.state = 'ready'
-        return
-      }
-    }
   }
 
   private conWrite(text: string, cls: SegClass) {
@@ -1509,115 +1599,8 @@ export class Kernel {
     return this.klog.map((e) => `[${(e.tick / this.hz).toFixed(4).padStart(9)}] ${e.msg}`)
   }
 
-  // ---------- 快照 ----------
-
-  private fdDesc(p: Process): string[] {
-    return [...p.fds.entries()].map(([fd, f]) => {
-      switch (f.kind) {
-        case 'stdin':
-          return `${fd} -> tty0 (stdin)`
-        case 'stdout':
-          return `${fd} -> tty0 (${f.id === 2 ? 'stderr' : 'stdout'})`
-        case 'tty':
-          return `${fd} -> /dev/tty`
-        case 'null':
-          return `${fd} -> /dev/null`
-        case 'file':
-          return `${fd} -> ${f.dev}:inode ${f.ino} (${f.flags}) offset ${f.pos}`
-      }
-    })
-  }
-
-  private buildTree(path: string): FSNode {
-    const node = this.vfs.resolve(path, '/')
-    if ('err' in node)
-      return { ino: 0, name: basename(path), type: 'file', size: 0, blocks: 0, exec: false, disk: '?', path, kids: [] }
-    const fs = this.vfs.fsOf(node)
-    const kids =
-      node.type === T_DIR
-        ? fs
-            .entries(node.ino)
-            .map((e) => this.buildTree(path === '/' ? `/${e.name}` : `${path}/${e.name}`))
-            .sort((a, b) => a.name.localeCompare(b.name))
-        : []
-
-    const isFile = node.type === T_FILE
-    const raw = isFile && node.size <= 4096 ? fs.readBytes(node.ino) : null
-    const binary = raw ? isExecutable(String.fromCharCode(...raw.subarray(0, 4))) : false
-    const exe = binary && raw ? loadExe(String.fromCharCode(...raw)) : null
-    return {
-      ino: node.ino,
-      name: path === '/' ? '/' : basename(path),
-      type: TYPE_NAME[node.type] ?? 'file',
-      size: node.size,
-      blocks: node.type === T_DEV ? 0 : fs.blocksOf(node.ino).length,
-      exec: node.exec,
-      disk: node.dev.spec.name,
-      path,
-      data: raw && !binary ? clip(String.fromCharCode(...raw), 600) : undefined,
-      disasm: exe ? disassemble(exe.image, exe.textLen, 48) : undefined,
-      blockList: node.type === T_DEV ? undefined : fs.blocksOf(node.ino),
-      kids,
-    }
-  }
-
-  private buildSnapshot(): Snapshot {
-    const m = this.mem.stats()
-    return {
-      ticks: this.ticks,
-      hz: this.hz,
-      paused: this.paused,
-      mode: this.mode,
-      currentPid: this.currentPid,
-      switches: this.switches,
-      quantum: QUANTUM,
-      procs: [...this.procs.values()].map((p) => ({
-        pid: p.pid,
-        ppid: p.ppid,
-        name: p.name,
-        cmd: p.cmd,
-        state: p.state,
-        pc: p.regs.pc,
-        sp: p.regs.sp,
-        ax: p.regs.ax,
-        pages: p.pageTable.length,
-        ticksUsed: p.ticksUsed,
-        cwd: p.cwd,
-        children: this.childrenOf(p.pid).map((c) => c.pid),
-        exitCode: p.exitCode,
-        waitDesc: p.waitDesc() as string | null,
-        pts: p.pageTable,
-        fds: this.fdDesc(p),
-      })),
-      frames: this.mem.frames,
-      mem: { total: m.total, used: m.used, free: m.free, framesUsed: m.framesUsed },
-      tree: this.buildTree('/'),
-      fs: this.statfs(),
-      disks: this.blkInfo(),
-      usbLabel: this.usbPresent ? this.fsOf('sdb').label() : '',
-      storageOk: this.storageOk,
-      dirty: this.dirty,
-      lastSync: this.lastSync,
-      turbo: this.turbo,
-      tps: this.tps,
-      trace: this.trace,
-      kmsgText: this.kmsgLines(),
-      lines: this.lines,
-      fgPid: this.fgPid,
-      shellPid: this.shellPid,
-      panic: this.panic,
-    }
-  }
-
   private emit() {
     if (this.suppress) return
-    const now = performance.now()
-    if (now - this.tpsAt >= 400) {
-      this.tps = Math.round(((this.ticks - this.tpsTicks) * 1000) / (now - this.tpsAt))
-      this.tpsAt = now
-      this.tpsTicks = this.ticks
-    }
-    this.snap = this.buildSnapshot()
-    for (const fn of this.listeners) fn()
+    this.observer?.changed()
   }
 }

@@ -15,32 +15,97 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # 纯净版：只有 /os 与 /ui，整个 /cp 目录不参与打包
+  build-plain:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
 
       - name: Install dependencies
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
+      - name: Select plain entry
+        run: printf "export { default } from './app/Plain'\n" > src/App.tsx
+
+      - name: Fail if the control panel leaked into the bundle
+        run: |
+          npm run build
+          if grep -q "ControlPanel" dist/index.html; then
+            echo "control panel code found in the plain build" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plain
+          path: dist/index.html
+          retention-days: 1
+
+  # 透明版：在纯净系统之上挂载 /cp 观测层
+  build-transparent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Select transparent entry
+        run: printf "export { default } from './app/Transparent'\n" > src/App.tsx
+
       - run: npm run build
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
+      - name: Rename to transparent.html
+        run: mv dist/index.html dist/transparent.html
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: transparent
+          path: dist/transparent.html
+          retention-days: 1
+
+  # Pages 每次部署替换整个站点，因此两个版本必须合并成一份产物再发布
   deploy:
-    needs: build
+    needs: [build-plain, build-transparent]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Create site directory
+        run: mkdir -p site
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plain
+          path: site
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: transparent
+          path: site
+
+      - name: Verify both pages exist
+        run: |
+          test -f site/index.html
+          test -f site/transparent.html
+          ls -lh site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
       - id: deployment
         uses: actions/deploy-pages@v4

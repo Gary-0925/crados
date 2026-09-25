@@ -1,19 +1,10 @@
 import { useRef, useState } from 'react'
-import {
-  ChevronDown,
-  ChevronRight,
-  Download,
-  Eraser,
-  File,
-  Folder,
-  SquareTerminal,
-  Trash2,
-  Upload,
-  Usb,
-} from 'lucide-react'
-import type { FSNode, Kernel, Snapshot } from '@/os/kernel'
+import { ChevronDown, ChevronRight, Download, Eraser, Trash2, Upload, Usb } from 'lucide-react'
+import type { Kernel } from '@/os/kernel'
+import { saveDev } from '@/os/blockdev'
 import { isErr, strerror } from '@/os/types'
-import { HexDump } from '@/ui/HexDump'
+import type { FSNode, Snapshot } from '@/cp/snapshot'
+import { HexDump } from '@/cp/HexDump'
 import { cn } from '@/utils/cn'
 
 const BLOCK_TONE: Record<string, string> = {
@@ -28,7 +19,6 @@ const BLOCK_TONE: Record<string, string> = {
 
 const DISK_TONE: Record<string, string> = {
   sda: 'text-[#58a6ff]',
-  sdb: 'text-[#bc8cff]',
   rom: 'text-[#d29922]',
 }
 
@@ -92,27 +82,17 @@ function Node({
         style={{ paddingLeft: depth * 12 + 5 }}
       >
         {isDir ? (
-          <>
-            {expanded ? (
-              <ChevronDown size={11} className="shrink-0 text-[#6e7681]" />
-            ) : (
-              <ChevronRight size={11} className="shrink-0 text-[#6e7681]" />
-            )}
-            <Folder size={12} className="shrink-0 text-[#8b949e]" />
-          </>
+          expanded ? (
+            <ChevronDown size={11} className="shrink-0 text-[#6e7681]" />
+          ) : (
+            <ChevronRight size={11} className="shrink-0 text-[#6e7681]" />
+          )
         ) : (
-          <>
-            <span className="w-[11px] shrink-0" />
-            {node.type === 'dev' ? (
-              <SquareTerminal size={12} className="shrink-0 text-[#58a6ff]" />
-            ) : (
-              <File size={12} className={cn('shrink-0', node.exec ? 'text-[#3fb950]' : 'text-[#8b949e]')} />
-            )}
-          </>
+          <span className="w-[11px] shrink-0" />
         )}
         <span className={cn('truncate', isDir ? 'text-[#e6edf3]' : 'text-[#8b949e]')}>{node.name}</span>
         {node.exec && node.type === 'file' && <span className="text-[9px] text-[#3fb950]">x</span>}
-        <span className={cn('ml-auto pl-2 text-[9px] tabular', DISK_TONE[node.disk] ?? 'text-[#6e7681]')}>
+        <span className={cn('ml-auto pl-2 text-[9px] tabular', DISK_TONE[node.disk] ?? 'text-[#bc8cff]')}>
           {node.type === 'dev' ? 'dev' : node.disk}
         </span>
       </button>
@@ -134,7 +114,15 @@ function find(node: FSNode, path: string): FSNode | null {
   return null
 }
 
-export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot }) {
+export function StoragePanel({
+  kernel,
+  snap,
+  onMutate,
+}: {
+  kernel: Kernel
+  snap: Snapshot
+  onMutate: () => void
+}) {
   const [dev, setDev] = useState('sda')
   const [view, setView] = useState<'files' | 'blocks'>('files')
   const [block, setBlock] = useState(0)
@@ -143,14 +131,17 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
   const [msg, setMsg] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const sdb = snap.disks.find((d) => d.name === 'sdb')!
-  const active = snap.disks.find((d) => d.name === dev)?.present ? dev : 'sda'
+  const active = snap.disks.some((d) => d.name === dev) ? dev : 'sda'
   const info = snap.disks.find((d) => d.name === active)!
+  const removable = info.removable
 
   const sel = selPath ? find(snap.tree, selPath) : null
   const owned = sel && sel.disk === active && sel.blockList ? new Set(sel.blockList) : new Set<number>()
 
-  const layout = kernel.diskLayout(active)
+  const activeFs = kernel.filesystem(active)
+  const layout = activeFs
+    ? { bytes: activeFs.dev.bytes, map: activeFs.blockMap(), blockSize: activeFs.dev.blockSize }
+    : null
   const bs = layout?.blockSize ?? 256
   const cur = layout ? Math.min(block, layout.map.length - 1) : 0
 
@@ -163,13 +154,13 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
 
   const pickFile = (n: FSNode) => {
     setSelPath(n.path)
-    if (n.disk !== active && snap.disks.some((d) => d.name === n.disk && d.present)) setDev(n.disk)
+    if (n.disk !== active && snap.disks.some((d) => d.name === n.disk)) setDev(n.disk)
     if (n.blockList?.length) setBlock(n.blockList[0])
   }
 
   const onImport = async (f: File) => {
     const raw = new Uint8Array(await f.arrayBuffer())
-    run(kernel.importUsb(raw, f.name), `loaded ${raw.length} bytes from ${f.name}`)
+    run(kernel.importDisk(raw, f.name), `loaded ${raw.length} bytes from ${f.name}`)
     if (fileRef.current) fileRef.current.value = ''
   }
 
@@ -181,14 +172,12 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
             {snap.disks.map((d) => (
               <button
                 key={d.name}
-                disabled={!d.present}
                 onClick={() => {
                   setDev(d.name)
                   setBlock(0)
                 }}
                 className={cn(
                   'flex-1 px-2 py-1 text-[10.5px]',
-                  !d.present && 'cursor-not-allowed opacity-30',
                   active === d.name ? 'bg-[#21262d] text-[#e6edf3]' : 'text-[#6e7681] hover:text-[#c9d1d9]',
                 )}
               >
@@ -196,46 +185,26 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
               </button>
             ))}
           </div>
-          {sdb.present ? (
-            <>
-              <IconBtn label="导出 sdb 镜像" onClick={() => run(kernel.exportUsb(), 'image saved')}>
-                <Download size={12} />
-              </IconBtn>
-              <IconBtn label="导入镜像" onClick={() => fileRef.current?.click()} disabled={!!sdb.mountpoint}>
-                <Upload size={12} />
-              </IconBtn>
-              <IconBtn
-                label="格式化 sdb"
-                onClick={() => run(kernel.formatUsb(), 'mkfs complete')}
-                disabled={!!sdb.mountpoint}
-              >
-                <Eraser size={12} />
-              </IconBtn>
-              <IconBtn
-                label="拔出 sdb"
-                onClick={() => run(kernel.detachUsb(), 'device detached')}
-                disabled={!!sdb.mountpoint}
-                danger
-              >
-                <Usb size={12} />
-              </IconBtn>
-            </>
-          ) : (
-            <>
-              <IconBtn label="插入空白 U 盘" onClick={() => run(kernel.attachUsb('usb'), 'medium attached')}>
-                <Usb size={12} />
-              </IconBtn>
-              <IconBtn label="从电脑导入镜像" onClick={() => fileRef.current?.click()}>
-                <Upload size={12} />
-              </IconBtn>
-            </>
-          )}
+          <IconBtn label={`导出 ${active} 镜像`} onClick={() => run(kernel.exportDisk(active), 'image saved')}>
+            <Download size={12} />
+          </IconBtn>
+          <IconBtn label="导入镜像为新设备" onClick={() => fileRef.current?.click()}>
+            <Upload size={12} />
+          </IconBtn>
+          <IconBtn label="新建空盘" onClick={() => run(kernel.attachDisk(), 'disk attached')}>
+            <Usb size={12} />
+          </IconBtn>
           <IconBtn
-            label="清除浏览器持久化数据"
-            onClick={() => {
-              kernel.wipeRoot()
-              setMsg('persistent store cleared - 重启后恢复出厂状态')
-            }}
+            label={`格式化 ${active}`}
+            onClick={() => run(kernel.formatDisk(active), 'mkfs complete')}
+            disabled={!removable || !!info.mountpoint}
+          >
+            <Eraser size={12} />
+          </IconBtn>
+          <IconBtn
+            label={`移除 ${active}`}
+            onClick={() => run(kernel.detachDisk(active), 'device detached')}
+            disabled={!removable || !!info.mountpoint}
             danger
           >
             <Trash2 size={12} />
@@ -243,14 +212,12 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
         </div>
 
         <div className="flex items-baseline gap-2 text-[9.5px] text-[#6e7681]">
-          <span className="text-[#8b949e]">{info.model}</span>
           <span className="tabular">
             {info.usedBlocks}/{info.blocks} blk × {info.blockSize} B
           </span>
           <span>{info.mountpoint ?? 'not mounted'}</span>
-          <span className={cn('ml-auto', snap.dirty ? 'text-[#d29922]' : 'text-[#3fb950]')}>
-            {!snap.storageOk ? '存储不可用' : snap.dirty ? '写回中…' : '已自动保存'}
-          </span>
+          {!snap.storageOk && <span className="ml-auto text-[#f85149]">存储不可用</span>}
+          {snap.storageOk && snap.dirty && <span className="ml-auto text-[#d29922]">写回中</span>}
         </div>
       </div>
 
@@ -346,7 +313,7 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
         ) : (
           layout && (
             <>
-              <div className="grid grid-cols-16 gap-[3px]">
+              <div className="grid max-h-48 grid-cols-32 gap-[2px] overflow-y-auto rounded-md border border-[#21262d] p-1">
                 {layout.map.map((b) => (
                   <button
                     key={b.no}
@@ -371,20 +338,15 @@ export function StoragePanel({ kernel, snap }: { kernel: Kernel; snap: Snapshot 
                 <span className="truncate pl-2 text-[#8b949e]">{layout.map[cur].label}</span>
               </div>
               <div className="mt-1.5 overflow-x-auto rounded-md border border-[#30363d] bg-[#0d1117] p-2">
-                <HexDump bytes={layout.bytes.subarray(cur * bs, (cur + 1) * bs)} base={cur * bs} />
-              </div>
-              <div className="mt-1.5 flex flex-wrap gap-x-2.5 text-[9px] text-[#6e7681]">
-                {[
-                  ['super', 'superblock'],
-                  ['bitmap', 'bitmap'],
-                  ['itable', 'inodes'],
-                  ['dir', 'dirents'],
-                  ['file', 'data'],
-                ].map(([k, label]) => (
-                  <span key={k} className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-sm" style={{ background: BLOCK_TONE[k] }} /> {label}
-                  </span>
-                ))}
+                <HexDump
+                  bytes={layout.bytes.subarray(cur * bs, (cur + 1) * bs)}
+                  base={cur * bs}
+                  onByteChange={(address, value) => {
+                    layout.bytes[address] = value
+                    if (active !== 'rom') saveDev(activeFs!.dev)
+                    onMutate()
+                  }}
+                />
               </div>
             </>
           )

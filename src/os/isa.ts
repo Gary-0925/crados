@@ -39,6 +39,26 @@ export const OP = {
   PUSHI: 0x1c,
   LDW: 0x1d,
   STW: 0x1e,
+  // Privileged instructions. SYS is callable from user mode; it enters the
+  // vector table. SVC performs the compatibility service only in kernel mode.
+  IRET: 0x1f,
+  SVC: 0x20,
+  CLI: 0x21,
+  STI: 0x22,
+  // Bitwise arithmetic
+  ANDI: 0x23,
+  ANDR: 0x24,
+  ORI: 0x25,
+  ORR: 0x26,
+  XORI: 0x27,
+  XORR: 0x28,
+  SHLI: 0x29,
+  SHLR: 0x2a,
+  SHRI: 0x2b,
+  SHRR: 0x2c,
+  SCHED: 0x2d,
+  ULDB: 0x2e,
+  USTB: 0x2f,
 } as const
 
 const MNEMONIC: Record<number, string> = Object.fromEntries(
@@ -54,6 +74,11 @@ const ARITH: Record<string, [number, number]> = {
   div: [OP.DIVI, OP.DIVR],
   mod: [OP.MODI, OP.MODR],
   cmp: [OP.CMPI, OP.CMPR],
+  and: [OP.ANDI, OP.ANDR],
+  or: [OP.ORI, OP.ORR],
+  xor: [OP.XORI, OP.XORR],
+  shl: [OP.SHLI, OP.SHLR],
+  shr: [OP.SHRI, OP.SHRR],
 }
 const JUMPS: Record<string, number> = {
   jmp: OP.JMP,
@@ -70,6 +95,8 @@ export interface AsmResult {
   dataLen: number
   entry: number
   symbols: Record<string, number>
+  // 需要随映像装载基址调整的 16 位字，偏移相对于去掉 CRX header 后的 image。
+  relocations: number[]
   errors: string[]
 }
 
@@ -93,6 +120,21 @@ function parseLiteral(tok: string): number | string {
   return tok // 留作符号，第二趟解析
 }
 
+// 剥离行注释：引号内的分号属于字符串，不是注释起点
+function stripComment(raw: string): string {
+  let quote = false
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]
+    if (c === '\\' && quote) {
+      i++
+      continue
+    }
+    if (c === '"') quote = !quote
+    else if (c === ';' && !quote) return raw.slice(0, i)
+  }
+  return raw
+}
+
 function splitOperands(rest: string): string[] {
   const out: string[] = []
   let cur = ''
@@ -114,11 +156,12 @@ export function assemble(source: string): AsmResult {
   const code: Pending[] = []
   const data: number[] = []
   const dataFixups: { at: number; label: string; line: number }[] = []
+  const relocations: number[] = []
   let section: 'text' | 'data' = 'text'
 
   const lines = source.split('\n')
   lines.forEach((raw, idx) => {
-    const line = raw.split(';')[0].trim()
+    const line = stripComment(raw).trim()
     if (!line) return
     const lineNo = idx + 1
 
@@ -197,7 +240,10 @@ export function assemble(source: string): AsmResult {
       emit(JUMPS[mnemonic], 0, 0, parseLiteral(ops[0]))
       return
     }
-    if (mnemonic === 'ldb' || mnemonic === 'stb' || mnemonic === 'ldw' || mnemonic === 'stw') {
+    if (
+      mnemonic === 'ldb' || mnemonic === 'stb' || mnemonic === 'ldw' || mnemonic === 'stw' ||
+      mnemonic === 'uldb' || mnemonic === 'ustb'
+    ) {
       const mem = ops.find((o) => o.includes('['))
       const reg = ops.find((o) => !o.includes('['))
       const m = mem ? /\[\s*(r[0-7])\s*(?:\+\s*([\w'x]+))?\s*\]/.exec(mem) : null
@@ -207,6 +253,8 @@ export function assemble(source: string): AsmResult {
       }
       const off = m[2] ? parseLiteral(m[2]) : 0
       if (mnemonic === 'ldb') emit(OP.LDB, regNo(reg), regNo(m[1]), off)
+      else if (mnemonic === 'uldb') emit(OP.ULDB, regNo(reg), regNo(m[1]), off)
+      else if (mnemonic === 'ustb') emit(OP.USTB, regNo(m[1]), regNo(reg), off)
       else if (mnemonic === 'ldw') emit(OP.LDW, regNo(reg), regNo(m[1]), off)
       else if (mnemonic === 'stw') emit(OP.STW, regNo(m[1]), regNo(reg), off)
       else emit(OP.STB, regNo(m[1]), regNo(reg), off)
@@ -228,6 +276,11 @@ export function assemble(source: string): AsmResult {
     }
     if (mnemonic === 'ret') return void emit(OP.RET)
     if (mnemonic === 'sys') return void emit(OP.SYS)
+    if (mnemonic === 'iret') return void emit(OP.IRET)
+    if (mnemonic === 'svc') return void emit(OP.SVC)
+    if (mnemonic === 'cli') return void emit(OP.CLI)
+    if (mnemonic === 'sti') return void emit(OP.STI)
+    if (mnemonic === 'sched') return void emit(OP.SCHED)
     if (mnemonic === 'hlt') return void emit(OP.HLT)
     if (mnemonic === 'nop') return void emit(OP.NOP)
 
@@ -248,10 +301,12 @@ export function assemble(source: string): AsmResult {
     }
     data[f.at] = (target >> 8) & 0xff
     data[f.at + 1] = target & 0xff
+    relocations.push(dataBase + f.at)
   }
 
   const text = new Uint8Array(dataBase)
   code.forEach((c, i) => {
+    const at = i * WORD
     let imm = c.imm
     if (typeof imm === 'string') {
       const target = symbols[imm]
@@ -259,8 +314,8 @@ export function assemble(source: string): AsmResult {
         errors.push(`${c.line}: undefined symbol '${imm}'`)
         imm = 0
       } else imm = target
+      relocations.push(at + 2)
     }
-    const at = i * WORD
     text[at] = c.op
     text[at + 1] = ((c.d & 0xf) << 4) | (c.s & 0xf)
     text[at + 2] = (imm >> 8) & 0xff
@@ -280,7 +335,7 @@ export function assemble(source: string): AsmResult {
   bytes.set(text, HEADER_SIZE)
   bytes.set(Uint8Array.from(data), HEADER_SIZE + text.length)
 
-  return { bytes, textLen, dataLen: data.length, entry, symbols, errors }
+  return { bytes, textLen, dataLen: data.length, entry, symbols, relocations, errors }
 }
 
 export function isExecutable(data: string): boolean {
@@ -303,9 +358,6 @@ export function loadExe(data: string): ExeHeader | null {
   return { textLen, dataLen, entry, image: raw.subarray(HEADER_SIZE) }
 }
 
-export const bytesToBinaryString = (b: Uint8Array): string =>
-  Array.from(b, (x) => String.fromCharCode(x)).join('')
-
 export function disassemble(image: Uint8Array, textLen: number, limit = 64): string[] {
   const out: string[] = []
   const reg = (n: number) => `r${n}`
@@ -315,14 +367,15 @@ export function disassemble(image: Uint8Array, textLen: number, limit = 64): str
     const s = image[at + 1] & 0xf
     const imm = (image[at + 2] << 8) | image[at + 3]
     const name = MNEMONIC[op] ?? '.byte'
-    const base = name.slice(0, 3) // movi/movr → mov，算术类助记符去掉寻址后缀
     let text: string
     switch (op) {
       case OP.MOVI: case OP.ADDI: case OP.SUBI: case OP.MULI: case OP.DIVI: case OP.MODI: case OP.CMPI:
-        text = `${base} ${reg(d)}, ${imm}`
+      case OP.ANDI: case OP.ORI: case OP.XORI: case OP.SHLI: case OP.SHRI:
+        text = `${name.replace(/i$/, '')} ${reg(d)}, ${imm}`
         break
       case OP.MOVR: case OP.ADDR: case OP.SUBR: case OP.MULR: case OP.DIVR: case OP.MODR: case OP.CMPR:
-        text = `${base} ${reg(d)}, ${reg(s)}`
+      case OP.ANDR: case OP.ORR: case OP.XORR: case OP.SHLR: case OP.SHRR:
+        text = `${name.replace(/r$/, '')} ${reg(d)}, ${reg(s)}`
         break
       case OP.JMP: case OP.JE: case OP.JNE: case OP.JLT: case OP.JGT: case OP.CALL:
         text = `${name} 0x${imm.toString(16).padStart(4, '0')}`
@@ -338,6 +391,12 @@ export function disassemble(image: Uint8Array, textLen: number, limit = 64): str
         break
       case OP.STW:
         text = `stw [${reg(d)}+${imm}], ${reg(s)}`
+        break
+      case OP.ULDB:
+        text = `uldb ${reg(d)}, [${reg(s)}+${imm}]`
+        break
+      case OP.USTB:
+        text = `ustb [${reg(d)}+${imm}], ${reg(s)}`
         break
       case OP.PUSH:
         text = `push ${reg(d)}`

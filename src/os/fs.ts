@@ -4,7 +4,7 @@
 //   block 0        超级块
 //   block 1        块位图（每 bit 一个块）
 //   block 2        inode 位图
-//   block 3..k     inode 表（每个 inode 32 字节）
+//   block 3..k     inode 表（每个 inode 48 字节）
 //   block k+1..    数据块
 //
 // 文件的起止怎么标记：inode 里有 12 个直接块指针和一个 16 位 size 字段。
@@ -15,8 +15,9 @@ import { BlockDev } from './blockdev'
 import type { Err } from './types'
 
 export const MAGIC = 0x43524653 // "CRFS"
-export const INODE_SIZE = 32
-export const NDIRECT = 12
+// inode 48 字节：头部 8 字节 + 20 个 16 位直接块指针，单文件上限 20 × 块大小
+export const INODE_SIZE = 48
+export const NDIRECT = 20
 export const DIRENT_SIZE = 16
 export const NAME_MAX = 14
 
@@ -24,6 +25,10 @@ export const T_FREE = 0
 export const T_FILE = 1
 export const T_DIR = 2
 export const T_DEV = 3
+
+// 设备节点的 driver 字段，等价于真实系统的次设备号
+export const DRV_TTY = 1
+export const DRV_NULL = 2
 
 // 超级块字段偏移
 const SB_MAGIC = 0
@@ -54,16 +59,11 @@ export interface FNode {
   path: string
 }
 
-const enc = (s: string): Uint8Array => {
-  const out = new Uint8Array(s.length)
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff
-  return out
-}
-const dec = (b: Uint8Array): string => {
-  let s = ''
-  for (let i = 0; i < b.length; i += 0x4000) s += String.fromCharCode(...b.subarray(i, i + 0x4000))
-  return s
-}
+const _enc = new TextEncoder()
+const _dec = new TextDecoder('utf-8', { fatal: false })
+// 文件内容按 UTF-8 存储：字节与字符长度解耦，与块写入时的字节计数一致
+const enc = (s: string): Uint8Array => _enc.encode(s)
+const dec = (b: Uint8Array): string => _dec.decode(b)
 
 export const normalizePath = (path: string, cwd: string): string => {
   const raw = path.startsWith('/') ? path : cwd + '/' + path
@@ -113,17 +113,20 @@ export class CRFS {
     if (root !== 1) throw new Error('mkfs: root inode must be 1')
   }
 
+  // 只接受当前盘上布局。任何旧版容量或元数据布局都由调用方重新 mkfs。
   valid(): boolean {
-    return ((this.dev.u16(SB_MAGIC) << 16) | this.dev.u16(SB_MAGIC + 2)) >>> 0 === MAGIC
+    if (((this.dev.u16(SB_MAGIC) << 16) | this.dev.u16(SB_MAGIC + 2)) >>> 0 !== MAGIC) return false
+    return (
+      this.dev.u16(SB_BSIZE) === this.dev.blockSize &&
+      this.dev.u16(SB_BLOCKS) === this.dev.blockCount &&
+      this.dev.u16(SB_INODES) === this.inodeCount &&
+      this.dev.u16(SB_ITABLE) === this.itableStart &&
+      this.dev.u16(SB_DATA) === this.dataStart
+    )
   }
 
   label(): string {
     return dec(this.dev.bytes.subarray(SB_LABEL, SB_LABEL + LABEL_MAX)).replace(/\0+$/, '')
-  }
-
-  setLabel(s: string) {
-    this.dev.bytes.fill(0, SB_LABEL, SB_LABEL + LABEL_MAX)
-    this.dev.bytes.set(enc(s.slice(0, LABEL_MAX)), SB_LABEL)
   }
 
   // ---------- 位图 ----------
@@ -255,22 +258,21 @@ export class CRFS {
 
   writeBytes(ino: number, data: Uint8Array): number | Err {
     if (data.length > this.maxFileSize()) return { err: 'EFBIG' }
-    const need = Math.ceil(data.length / this.dev.blockSize)
-    const have = this.blocksOf(ino)
-    if (need > have.length) {
-      const free = this.freeBlocks()
-      if (need - have.length > free) return { err: 'ENOSPC' }
+    const bs = this.dev.blockSize
+    const need = Math.ceil(data.length / bs)
+    const blocks = this.blocksOf(ino)
+    const missing = Math.max(0, need - blocks.length)
+    if (missing > this.freeBlocks()) return { err: 'ENOSPC' }
+
+    for (let i = 0; i < missing; i++) {
+      const block = this.allocBlock()
+      if (block < 0) return { err: 'ENOSPC' }
+      blocks.push(block)
     }
-    for (const b of have) this.freeBlock(b)
-    for (let k = 0; k < NDIRECT; k++) this.setPtr(ino, k, 0)
-    for (let k = 0; k < need; k++) {
-      const b = this.allocBlock()
-      if (b < 0) {
-        this.setSize(ino, 0)
-        return { err: 'ENOSPC' }
-      }
-      this.setPtr(ino, k, b)
-      this.dev.writeBlock(b, data.subarray(k * this.dev.blockSize, (k + 1) * this.dev.blockSize))
+    for (let i = need; i < blocks.length; i++) this.freeBlock(blocks[i])
+    for (let i = 0; i < NDIRECT; i++) this.setPtr(ino, i, i < need ? blocks[i] : 0)
+    for (let i = 0; i < need; i++) {
+      this.dev.writeBlock(blocks[i], data.subarray(i * bs, (i + 1) * bs))
     }
     this.setSize(ino, data.length)
     return data.length
@@ -280,7 +282,6 @@ export class CRFS {
     return this.writeBytes(ino, enc(text))
   }
 
-  // 部分读：只碰落在 [pos, pos+len) 区间内的那几个块
   readAt(ino: number, pos: number, len: number): Uint8Array {
     const size = this.isize(ino)
     const end = Math.min(size, pos + len)
@@ -298,8 +299,8 @@ export class CRFS {
     return out
   }
 
-  // 部分写：按需分配块，只改写受影响的块，size 只在文件被撑大时增长
   writeAt(ino: number, pos: number, data: Uint8Array): number | Err {
+    if (data.length === 0) return 0
     const bs = this.dev.blockSize
     const end = pos + data.length
     if (end > this.maxFileSize()) return { err: 'EFBIG' }
@@ -309,14 +310,24 @@ export class CRFS {
     for (let k = 0; k <= lastK; k++) if (!this.ptr(ino, k)) needed++
     if (needed > this.freeBlocks()) return { err: 'ENOSPC' }
 
+    for (let k = 0; k <= lastK; k++) {
+      if (this.ptr(ino, k)) continue
+      const block = this.allocBlock()
+      if (block < 0) return { err: 'ENOSPC' }
+      this.setPtr(ino, k, block)
+    }
+
+    const oldSize = this.isize(ino)
+    for (let at = oldSize; at < pos; ) {
+      const block = this.ptr(ino, Math.floor(at / bs))
+      const inBlock = at % bs
+      const n = Math.min(bs - inBlock, pos - at)
+      this.dev.block(block).fill(0, inBlock, inBlock + n)
+      at += n
+    }
+
     for (let at = pos; at < end; ) {
-      const k = Math.floor(at / bs)
-      let b = this.ptr(ino, k)
-      if (!b) {
-        b = this.allocBlock()
-        if (b < 0) return { err: 'ENOSPC' }
-        this.setPtr(ino, k, b)
-      }
+      const b = this.ptr(ino, Math.floor(at / bs))
       const inBlock = at % bs
       const n = Math.min(bs - inBlock, end - at)
       this.dev.block(b).set(data.subarray(at - pos, at - pos + n), inBlock)
@@ -473,10 +484,6 @@ export class VFS {
   // 最长前缀匹配，模拟真实内核的 vfsmount 查找
   private owner(abs: string): Mount {
     return this.mounts.find((m) => m.path === '/' || abs === m.path || abs.startsWith(m.path + '/'))!
-  }
-
-  root(): CRFS {
-    return this.mounts[this.mounts.length - 1].fs
   }
 
   resolve(path: string, cwd: string): FNode | Err {

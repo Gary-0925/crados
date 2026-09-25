@@ -3,75 +3,70 @@
 
 export const PAGE_SIZE = 256
 export const FRAME_COUNT = 64
-// frame 0: boot record; frame 1..16: 32 PCBs x 128 B; frame 17: tty/kmsg scratch
-export const KERNEL_FRAMES = 18
+// Low physical memory stores KCB/PCBs/device scratch. The CRX kernel lives at
+// the top of RAM, outside every 16-page user virtual address space.
+//   frame 0: KCB; frame 1..12: 16 PCBs; frame 13: scratch
+//   frame 14..39: user pages; frame 40..63: CRX kernel
+export const USER_FRAME_START = 14
+export const KERNEL_TEXT_FRAME = 40
 export const RAM_SIZE = PAGE_SIZE * FRAME_COUNT
-
-export type FrameOwner = number | 'kernel' | null
-
-export interface Frame {
-  no: number
-  owner: FrameOwner
-  seg: string
-}
 
 const enc = new TextEncoder()
 
 export class Memory {
-  readonly frames: Frame[] = []
   readonly bytes = new Uint8Array(RAM_SIZE)
 
   constructor() {
     for (let i = 0; i < FRAME_COUNT; i++) {
-      const kernel = i < KERNEL_FRAMES
-      this.frames.push({ no: i, owner: kernel ? 'kernel' : null, seg: kernel ? 'ktext' : '' })
+      const kernel = i < USER_FRAME_START || i >= KERNEL_TEXT_FRAME
+      this.setBitmapBit(i, kernel)
     }
   }
 
-  alloc(pid: number, segs: string[]): number[] | null {
+  private setBitmapBit(pfn: number, used: boolean) {
+    const at = 0x0040 + (pfn >> 3)
+    const mask = 1 << (pfn & 7)
+    if (used) {
+      this.bytes[at] |= mask
+    } else {
+      this.bytes[at] &= ~mask
+    }
+  }
+
+  isAllocated(pfn: number): boolean {
+    const at = 0x0040 + (pfn >> 3)
+    return (this.bytes[at] & (1 << (pfn & 7))) !== 0
+  }
+
+  alloc(count: number): number[] | null {
     const got: number[] = []
-    for (const seg of segs) {
-      const f = this.frames.find((x) => x.owner === null)
-      if (!f) {
+    for (let page = 0; page < count; page++) {
+      let pfn = -1
+      for (let candidate = USER_FRAME_START; candidate < KERNEL_TEXT_FRAME; candidate++) {
+        if (!this.isAllocated(candidate)) {
+          pfn = candidate
+          break
+        }
+      }
+      if (pfn < 0) {
         this.freeFrames(got)
         return null
       }
-      f.owner = pid
-      f.seg = seg
-      this.zero(f.no) // 分配即清零，避免上一个进程的残留数据泄漏
-      got.push(f.no)
+      this.setBitmapBit(pfn, true)
+      this.zero(pfn)
+      got.push(pfn)
     }
     return got
   }
 
   freeFrames(pfns: number[]) {
     for (const n of pfns) {
-      this.frames[n].owner = null
-      this.frames[n].seg = ''
-    }
-  }
-
-  freePid(pid: number) {
-    for (const f of this.frames) {
-      if (f.owner === pid) {
-        f.owner = null
-        f.seg = ''
-      }
+      this.setBitmapBit(n, false)
     }
   }
 
   zero(pfn: number) {
     this.bytes.fill(0, pfn * PAGE_SIZE, (pfn + 1) * PAGE_SIZE)
-  }
-
-  // 把文本按字节写入若干连续页（超出部分截断，与真实加载器一致）
-  writePages(pfns: number[], text: string) {
-    const data = enc.encode(text)
-    for (let i = 0; i < pfns.length; i++) {
-      const chunk = data.subarray(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
-      if (!chunk.length) break
-      this.bytes.set(chunk, pfns[i] * PAGE_SIZE)
-    }
   }
 
   writeBytesPages(pfns: number[], data: Uint8Array) {
@@ -87,28 +82,21 @@ export class Memory {
     this.bytes.set(data.subarray(0, Math.max(0, RAM_SIZE - pa)), pa)
   }
 
-  frameBytes(pfn: number): Uint8Array {
-    return this.bytes.subarray(pfn * PAGE_SIZE, (pfn + 1) * PAGE_SIZE)
+  u16(at: number): number {
+    return (this.bytes[at] << 8) | this.bytes[at + 1]
   }
-
-  peek(pa: number, len: number): Uint8Array | null {
-    if (pa < 0 || pa >= RAM_SIZE) return null
-    return this.bytes.subarray(pa, Math.min(RAM_SIZE, pa + len))
+  setU16(at: number, v: number) {
+    this.bytes[at] = (v >> 8) & 0xff
+    this.bytes[at + 1] = v & 0xff
   }
-
   stats() {
     let used = 0
-    let byProc = 0
-    for (const f of this.frames) {
-      if (f.owner !== null) used++
-      if (typeof f.owner === 'number') byProc++
-    }
+    for (let pfn = 0; pfn < FRAME_COUNT; pfn++) if (this.isAllocated(pfn)) used++
     return {
       total: RAM_SIZE,
       used: used * PAGE_SIZE,
       free: (FRAME_COUNT - used) * PAGE_SIZE,
       framesUsed: used,
-      framesByProc: byProc,
     }
   }
 }

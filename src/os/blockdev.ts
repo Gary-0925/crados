@@ -12,8 +12,28 @@ export interface DevSpec {
 
 export const SPECS: Record<string, DevSpec> = {
   rom: { name: 'rom', model: 'CRADOS-FIRMWARE', blockSize: 1024, blockCount: 256, inodeCount: 64, removable: false },
-  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 256, blockCount: 192, inodeCount: 64, removable: false },
-  sdb: { name: 'sdb', model: 'CRADOS-USB', blockSize: 256, blockCount: 64, inodeCount: 32, removable: true },
+  // 一个 256 B 的块位图可寻址 2048 个块，因此 512 KiB 是当前 CRFS v1 的自然上限。
+  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 256, blockCount: 2048, inodeCount: 64, removable: false },
+}
+
+// 导入的镜像按 sdb、sdc、sdd… 顺序占位，容量与根盘一致，便于整盘互换
+export const diskSpec = (name: string): DevSpec => ({
+  name,
+  model: 'CRADOS-DISK',
+  blockSize: SPECS.sda.blockSize,
+  blockCount: SPECS.sda.blockCount,
+  inodeCount: SPECS.sda.inodeCount,
+  removable: true,
+})
+
+// sdb 起按字母递增，跳过已占用的名字
+export function nextDiskName(taken: Iterable<string>): string | null {
+  const used = new Set(taken)
+  for (let i = 1; i < 26; i++) {
+    const name = 'sd' + String.fromCharCode(97 + i)
+    if (!used.has(name)) return name
+  }
+  return null
 }
 
 export class BlockDev {
@@ -33,13 +53,6 @@ export class BlockDev {
 
   block(no: number): Uint8Array {
     return this.bytes.subarray(no * this.blockSize, (no + 1) * this.blockSize)
-  }
-
-  readBlock(no: number, out: Uint8Array, at: number): number {
-    const src = this.block(no)
-    const n = Math.min(src.length, out.length - at)
-    out.set(src.subarray(0, n), at)
-    return n
   }
 
   writeBlock(no: number, data: Uint8Array) {
@@ -71,6 +84,33 @@ export class BlockDev {
 // ---------- 持久化：整盘字节以 base64 存入浏览器 ----------
 
 const KEY = (name: string) => `crados.dev.${name}`
+const INDEX_KEY = 'crados.disks'
+
+// 记录曾经持久化过哪些可移动设备，重启后据此重新装载
+export function listStoredDisks(): string[] {
+  try {
+    const raw = localStorage.getItem(INDEX_KEY)
+    const list = raw ? (JSON.parse(raw) as unknown) : []
+    return Array.isArray(list) ? list.filter((n): n is string => typeof n === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function setStoredDisks(names: string[]) {
+  try {
+    localStorage.setItem(INDEX_KEY, JSON.stringify(names))
+  } catch {}
+}
+
+export function rememberDisk(name: string) {
+  const list = listStoredDisks()
+  if (!list.includes(name)) setStoredDisks([...list, name])
+}
+
+export function forgetDisk(name: string) {
+  setStoredDisks(listStoredDisks().filter((n) => n !== name))
+}
 
 const toB64 = (b: Uint8Array): string => {
   let s = ''
@@ -108,9 +148,8 @@ export function loadDev(dev: BlockDev): boolean {
 export function dropDev(name: string) {
   try {
     localStorage.removeItem(KEY(name))
-  } catch {
-    /* ignore */
-  }
+  } catch {}
+  forgetDisk(name)
 }
 
 export function downloadDev(dev: BlockDev, filename: string) {
