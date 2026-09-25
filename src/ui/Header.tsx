@@ -1,4 +1,4 @@
-import { Github, Pause, Play, RotateCcw, StepForward } from 'lucide-react'
+import { ArrowUpRight, Pause, Play, RotateCcw, StepForward } from 'lucide-react'
 import type { Kernel } from '@/os/kernel'
 import { cn } from '@/utils/cn'
 
@@ -17,8 +17,8 @@ export function Header({ kernel, ips, onReboot }: { kernel: Kernel; ips?: number
         aria-label="View Gary-0925/crados on GitHub"
         className="inline-flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[10px] font-medium text-[#c9d1d9] transition-colors hover:border-[#8b949e] hover:text-[#f0f6fc]"
       >
-        <Github size={11} />
-        <span>Github</span>
+        <ArrowUpRight size={11} />
+        <span>GitHub</span>
       </a>
 
       <span className="hidden items-baseline gap-1 md:inline-flex">
