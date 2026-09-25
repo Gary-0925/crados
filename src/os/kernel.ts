@@ -799,10 +799,6 @@ export class Kernel {
     this.doExit(p, 128 + sig)
   }
 
-  private killInit() {
-    this.setPanic('Attempted to kill init! exitcode=0x0000008f')
-  }
-
   private setPanic(msg: string) {
     this.panic = msg
     this.log(`Kernel panic - not syncing: ${msg}`, true)
@@ -1104,15 +1100,6 @@ export class Kernel {
         }
         break
       case 'kill': {
-        if (sc.pid === 1) {
-          this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, false)
-          this.killInit()
-          return
-        }
-        if (sc.pid === 0) {
-          result = { err: 'EPERM' }
-          break
-        }
         const t = this.procs.get(sc.pid)
         if (!t) result = { err: 'ESRCH' }
         else {

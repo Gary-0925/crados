@@ -20,7 +20,7 @@ export function PanicOverlay({
         <div className="mt-3 rounded-md border border-[#f85149]/40 bg-[#f85149]/10 px-3 py-2 text-[12px] text-[#ff7b72]">
           {panic}
         </div>
-        <div className="mt-3 max-h-52 overflow-hidden rounded-md border border-[#30363d] bg-[#0d1117] p-2 text-[10.5px] leading-relaxed text-[#8b949e]">
+        <div className="mt-3 max-h-100 overflow-hidden rounded-md border border-[#30363d] bg-[#0d1117] p-2 text-[10.5px] leading-relaxed text-[#8b949e]">
           {log.slice(-12).map((l, i) => (
             <div key={i}>{l}</div>
           ))}
