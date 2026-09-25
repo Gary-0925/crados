@@ -1,6 +1,6 @@
 ## crados 2.0 (Cradle OS) - a transparent OS
 
-Try plain version at <https://gary-0925.github.io/crados/transparent>, or transparent version at <https://gary-0925.github.io/crados/transparent>.
+Try plain version at <https://gary-0925.github.io/crados/>, or transparent version at <https://gary-0925.github.io/crados/transparent>.
 
 You could run `man` or `man README.zh` at <https://gary-0925.github.io/crados/transparent> to get more information，have fun!
 
