@@ -33,9 +33,9 @@ checked against ownership, not against a firmware flag. block_read and
 block_write require euid 0. A file created by a process is owned by that
 euid. /home/user and /usr/bin are sticky, so a user cannot unlink root's
 files. mv requires write permission on both the source and destination
-directories. A file's effective mode is the intersection of its own
-flags with those of every ancestor directory up to the root: no
-ancestor grants a bit, the file does not have it. The root directory of
+directories. A file's effective mode is its own flags
+ANDed with every ancestor's up to the root: an ancestor lacking a bit
+denies it to all descendants. The root directory of
 a formatted disk is sticky and world-writable, so areas like /tmp keep
 working under this rule while system directories stay protected. PATH searches /bin before /usr/bin, so a program in
 /usr/bin cannot shadow ls.

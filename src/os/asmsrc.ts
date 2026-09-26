@@ -504,6 +504,8 @@ external:
     mov r1, redir
     mov r2, 1
     sys
+    cmp r0, 65535       ; 已存在查写权限，不存在查创建权限，失败一律报错
+    je redirfail
     mov r4, r0          ; output fd
     mov r0, 24          ; saved = dup(1)
     mov r1, 1
@@ -578,6 +580,15 @@ logout:
     mov r1, 0
     hlt
 
+redirfail:
+    mov r0, 1
+    mov r1, 2
+    mov r2, rfail
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
+
 .data
 line:   .space 192
 onebyte: .byte 0
@@ -602,6 +613,7 @@ bgmsg:  .asciz "[background]\\n"
 nf:     .asciz "sh: command not found\\n"
 bye:    .asciz "logout\\n"
 sfail:  .asciz "sh: cannot open script\\n"
+rfail:  .asciz "sh: cannot open redirection target\\n"
 `,
 
   cat: `; cat — with an argument copy that file, without one copy standard input
