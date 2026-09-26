@@ -14,7 +14,12 @@ into it. A disk image is a block array whose first block is the superblock.
 ## The process table is in RAM
 
 Frame 0 is the boot record. Frames 1 to 12 hold the process table: 16
-slots of 192 bytes, one per task.
+slots of 192 bytes, one per task. Frame 13 is the kernel scratch page
+(0x0D00); frames 14 to 19 are reserved kernel windows — the dmesg ring
+buffer at 0x0E00 and the device-info block at 0x1200. Frames 20 to 163
+are the user page pool. Frames 164 to 253 hold the kernel image itself
+(90 pages, 22.5 KiB, mapped at 0xA400), and frames 254 to 255 are the
+MMIO window.
 
     0     in use       1     state        2-3   pid
     4-5   ppid         6-7   pc           8-9   sp

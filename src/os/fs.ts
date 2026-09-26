@@ -69,8 +69,11 @@ export const UID_USER_NAME = 'user'
 
 // 超级块空闲区：偏移 14 是特性字，偏移 32 起每个 inode 一个大端 uid。
 // 64 × 2 = 128 字节，落在最小的 256 B 超级块里，不占用数据块。
+// 特性位：FEAT_CREDS 表示 inode 模式/属主已初始化；
+// FEAT_ACCOUNTS 表示账户表（/etc/passwd）已就位。
 const SB_FEAT = 14
 const FEAT_CREDS = 0x0001
+const FEAT_ACCOUNTS = 0x0002
 export const SB_UID = 32
 
 export const ITABLE_START = 3
@@ -166,6 +169,12 @@ export class CRFS {
   }
   markCreds() {
     this.dev.setU16(SB_FEAT, this.dev.u16(SB_FEAT) | FEAT_CREDS)
+  }
+  accountsReady(): boolean {
+    return (this.dev.u16(SB_FEAT) & FEAT_ACCOUNTS) !== 0
+  }
+  markAccounts() {
+    this.dev.setU16(SB_FEAT, this.dev.u16(SB_FEAT) | FEAT_ACCOUNTS)
   }
 
   // ---------- 位图 ----------
@@ -539,23 +548,39 @@ export function lookupAbs(fs: CRFS, path: string): number {
   return ino
 }
 
-// 登录策略：家目录和 /usr/bin 归用户，且带 sticky，用户删不掉 root 的文件。
-// /tmp 对所有人可写。调用前 inode 模式应已按类型填好。
-export function applyLoginPolicy(fs: CRFS) {
-  const home = lookupAbs(fs, '/home/user')
-  if (home) {
-    fs.setOwner(home, UID_USER)
-    fs.setFlags(home, MODE_DIR | M_STICKY)
-  }
-  const ubin = lookupAbs(fs, '/usr/bin')
-  if (ubin) {
-    fs.setOwner(ubin, UID_USER)
-    fs.setFlags(ubin, MODE_DIR | M_STICKY)
-  }
+// 系统盘权限策略：/tmp 对所有人可写（1777 + sticky，sticky 让人删不掉
+// 别人的文件）；/etc 与其下的账户表、根目录之外的系统目录保持 0755。
+// 调用前 inode 模式应已按类型填好。账户的家目录由 useradd 负责创建。
+export function applySystemPolicy(fs: CRFS) {
   const tmp = lookupAbs(fs, '/tmp')
   if (tmp) {
     fs.setOwner(tmp, UID_ROOT)
     fs.setFlags(tmp, MODE_TMP)
+  }
+  const etc = lookupAbs(fs, '/etc')
+  if (etc) {
+    fs.setOwner(etc, UID_ROOT)
+    fs.setFlags(etc, MODE_DIR)
+  }
+  const passwd = lookupAbs(fs, '/etc/passwd')
+  if (passwd) {
+    fs.setOwner(passwd, UID_ROOT)
+    fs.setFlags(passwd, MODE_FILE) // 0644：哈希很弱，这是教学系统
+  }
+  const home = lookupAbs(fs, '/home')
+  if (home) {
+    fs.setOwner(home, UID_ROOT)
+    fs.setFlags(home, MODE_DIR)
+  }
+  const roothome = lookupAbs(fs, '/root')
+  if (roothome) {
+    fs.setOwner(roothome, UID_ROOT)
+    fs.setFlags(roothome, MODE_DIR)
+  }
+  const ubin = lookupAbs(fs, '/usr/bin')
+  if (ubin) {
+    fs.setOwner(ubin, UID_ROOT)
+    fs.setFlags(ubin, MODE_DIR)
   }
 }
 

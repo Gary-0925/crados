@@ -26,23 +26,29 @@ An inode is laid out as
     offset 8   ptr[20] twenty direct block pointers
 
 Owner uids live in the superblock, at byte 32 plus inode*2, one
-big-endian u16 each. The login shell is uid 1. uid 0 bypasses the
-checks. /bin is root-owned like any system directory: a non-root user
-cannot create, delete or rewrite entries there, because permission is
-checked against ownership, not against a firmware flag. block_read and
-block_write require euid 0. A file created by a process is owned by that
-euid. /home/user and /usr/bin are sticky, so a user cannot unlink root's
-files. mv requires write permission on both the source and destination
-directories. A file's effective mode is its own flags
-ANDed with every ancestor's up to the root: an ancestor lacking a bit
-denies it to all descendants. The root directory of
-a formatted disk is sticky and world-writable, so areas like /tmp keep
-working under this rule while system directories stay protected. PATH searches /bin before /usr/bin, so a program in
-/usr/bin cannot shadow ls.
+big-endian u16 each. A login shell runs with the uid of its account,
+and uid 0 bypasses the checks. /bin is root-owned like any system
+directory: a non-root user cannot create, delete or rewrite entries
+there, because permission is checked against ownership, not against a
+firmware flag. block_read and block_write need the 'b' permission
+letter (every account, including root, has it by default). A file
+created by a process is owned by that euid. /tmp is world-writable
+(mode 1777) with the sticky bit, so one account cannot delete another
+account's scratch files; each /home/<name> directory is owned by its
+account. mv requires write permission on both the source and
+destination directories. A permission check reads only the file's own
+flags, Unix style; the rule that a child never out-permissions its
+parent is enforced at write time instead. A new file's mode is ANDed
+with its parent directory's flags, and chmod clamps the requested mode
+the same way, so a 0755 directory can never produce a world-writable
+child no matter what is asked. The root directory of a formatted disk
+is sticky and world-writable (1777); the factory image then installs
+the system tree and tightens the system directories. PATH searches
+/bin before /usr/bin, so a program in /usr/bin cannot shadow ls.
 
 ls -l shows the mode, the owner, the size and the name of each entry.
-The owner is read from that uid table: uid 0 is shown as root, uid 1 as
-user, every other uid as a number. The line comes from readview
+The owner is read from that uid table: uid 0 is shown as root, every
+other uid as a number. The line comes from readview
 kind 8, so ls only needs search permission on the directories, not read
 permission on the file.
 

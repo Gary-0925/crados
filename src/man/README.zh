@@ -20,12 +20,15 @@ sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有�
 
     /bin        系统程序，每次上电安装到 sda
     /usr/man    本手册
-    /home/user  你自己的文件和示例源码
+    /root       root 的家目录，含示例源码
+    /home       useradd 创建的家目录
     /mnt        /dev/sdb 的挂载点
     /tmp        临时目录
     /usr/bin    存放你自己编译的程序
 
 ## 上手
+
+出厂只有一个账户：`root`，密码为空。登录后：
 
     ls -l /bin
     cat count.s
@@ -41,9 +44,38 @@ sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有�
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 权限。登录 shell 是 uid 1。运行 'kill 1' 得到 EPERM。
-   只有 euid 0 可以信号 init，那样才会恐慌。
-6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
+5. 账户。出厂只有 root 一个账户，密码为空。运行 'useradd alice'，
+   再用 'passwd alice' 给她设密码，'exit' 后以 alice 登录。'users'
+   打印账户表；'chperm alice lk' 修改她的权限字母（去掉 'l' 即锁定
+   账户）。只有 root 可以 useradd、替别人 passwd、chperm、chown。
+6. 权限。非 root 的 shell 杀不掉 root 的进程：以 root 运行
+   'sleep 60 &'，再以 alice 执行 'kill <pid>'——在拿到 'k' 字母之前
+   会返回 EPERM。
+7. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
+
+## 账户与权限字母
+
+账户表存放在 /etc/passwd，每行一个账户：
+
+    root:0:-:lmbka        名字:uid:密码散列:权限
+
+散列是密码的 djb2 值的十进制表示；'-' 表示没有密码。出厂状态只有
+一个账户：root，密码为空。useradd 创建账户（默认权限 'lmbk'），
+userdel 删除，passwd 设密码，users 打印账户表。
+
+每个账户带一组权限字母：
+
+    l   login    允许在控制台开启登录会话
+    m   mount    允许挂载/卸载块设备
+    b   block    允许读写裸块设备
+    k   kill     允许给不属于自己的进程发信号
+    a   admin    登录会话以有效 uid 0 运行
+
+uid 0（root）天然拥有全部字母。从其他账户的权限里去掉 'l' 即锁定：
+控制台会拒绝启动它的 shell。'chperm <名字> <字母>' 重写字母集合，
+例如 'chperm alice lmbka' 把 alice 提为管理员。只有 root 可以
+useradd、userdel、chperm、chown 或修改别人的密码。'su <名字>' 在
+会话内切换账户；root 无需密码，其他情况要输入目标账户的密码。
 
 ## 手册
 

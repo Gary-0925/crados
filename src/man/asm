@@ -61,10 +61,14 @@ r1-r3 the arguments; r0 receives the result. 0xffff means failure.
     29 page_alloc(vpn)     30 clock_gettime()   31 page_free(vpn)
     32 block_read(dev,blk,buf)   33 block_write(dev,blk,buf)
     34 sleep_seconds(seconds)
+    35 getuid()             r0 = real uid, r1 = effective uid
+    36 ttyecho(on)          on 0 silences canonical echo (password entry)
+    38 spawnas(path,uid)    root only: start a login session as an account
+    39 chown(path,uid)      root only: change the owner of a file
 
 getdents fills a buffer with 16-byte records: 15 bytes of NUL-padded name
 plus one type byte. That is why these calls take a buffer and a length.
 
 ## Sources
 
-See hello.s and count.s in /home/user.
+See hello.s and count.s in /root.

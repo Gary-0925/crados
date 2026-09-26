@@ -83,6 +83,8 @@ function trap(cpu: CpuState, bus: Bus): Syscall | null {
       return { call: 'hwreap', pid: a1 }
     case 42:
       return { call: 'hwmount' }
+    case 43:
+      return { call: 'hwacct', op: a1, arg: a2 }
     case 44:
       return {
         call: 'hwassemble',

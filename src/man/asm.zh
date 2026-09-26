@@ -57,6 +57,10 @@ jgt 测试。地址空间从 0 开始：先 .text，再 .data，栈在最高一�
     29 page_alloc(vpn)     30 clock_gettime()   31 page_free(vpn)
     32 block_read(dev,blk,buf)   33 block_write(dev,blk,buf)
     34 sleep_seconds(seconds)
+    35 getuid()             r0 = 真实 uid，r1 = 有效 uid
+    36 ttyecho(on)          on 为 0 时关闭回显（输入密码用）
+    38 spawnas(path,uid)    仅 root：以某账户身份启动登录会话
+    39 chown(path,uid)      仅 root：修改文件属主
 
 机器码无法消费结构化的值，所以 read、getdents、getcwd、getenv 一律采用
 「缓冲区 + 长度」的形式。getdents 填的是 16 字节定长记录：15 字节 NUL
@@ -64,4 +68,4 @@ jgt 测试。地址空间从 0 开始：先 .text，再 .data，栈在最高一�
 
 ## 示例
 
-/home/user 下的 hello.s 与 count.s。
+/root 下的 hello.s 与 count.s。

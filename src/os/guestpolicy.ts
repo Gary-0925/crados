@@ -20,7 +20,6 @@ import {
   M_WRITE,
   SB_UID,
   UID_ROOT,
-  UID_USER_NAME,
 } from './fs'
 import { PCB_EUID, PCB_UID } from './process'
 
@@ -69,7 +68,8 @@ gp_bd_no:
     ret
 
 ; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
-; 有效 flags = inode flags ∩ 父目录 flags，判定统一走 gp_bit_decide（r7 = 其他人位）。
+; 判定只看 inode 自己的 flags（Unix 语义），走 gp_bit_decide（r7 = 其他人位）。
+; 「子不超父」由创建（gp_create）和 chmod（gp_cap_flags）在写入时保证。
 vfs_may:
     call ino_in_range
     cmp r0, 0
@@ -100,10 +100,6 @@ vfs_may:
     call vfs_u8
     cmp r0, 65535
     je vfs_may_no
-    mov r4, 0
-    mov r2, r0
-    ldw r1, [r4+0x00B0]
-    call gp_cap_flags
     mov r4, 0
     mov r6, r0
     ldw r1, [r4+0x00B6]
@@ -145,8 +141,6 @@ may_write_ino:
     mul r1, ${INODE_SIZE}
     add r1, ${ITABLE_BYTE + I_FLAGS}
     call crfs_u8
-    mov r2, r0
-    call gp_cap_flags_sda
     mov r3, r0
 may_flag_have:
     mov r4, 0
@@ -174,13 +168,30 @@ may_yes:
     mov r0, 0
     ret
 
+; gp_perm_ok: r1 = 权限字母 (108 l / 109 m / 98 b / 107 k)。
+; 宿主查 sda 上 /etc/passwd 的当前账户：0 允许，0xffff 拒绝。
+; euid 0 永远允许。除 r0 外不破坏任何寄存器（svc 会写 r0/r1）。
+gp_perm_ok:
+    push r2
+    mov r2, r1
+    mov r1, 1
+    mov r0, 43
+    svc
+    pop r2
+    ret
+
 ; gp_may_signal: r1 = 目标 pid。0 允许，0xffff 拒绝。kernel.ts 的 maySignalFg 是它的宿主镜像。
+; root、带 k 权限的账户、或与目标同属主的进程可以发信号。
 gp_may_signal:
     push r1
     call current_euid
-    pop r1
     cmp r0, ${UID_ROOT}
-    je gp_ms_yes
+    je gp_ms_root
+    mov r1, 107
+    call gp_perm_ok
+    cmp r0, 0
+    je gp_ms_yes_pop
+    call current_euid
     mov r7, r0
     mov r4, 0
 gp_ms_scan:
@@ -201,14 +212,17 @@ gp_ms_next:
 gp_ms_hit:
     ldw r6, [r5+${PCB_EUID}]
     cmp r6, r7
-    je gp_ms_yes
+    je gp_ms_yes_pop
     ldw r6, [r5+${PCB_UID}]
     cmp r6, r7
-    je gp_ms_yes
+    je gp_ms_yes_pop
 gp_ms_no:
+    pop r1
     mov r0, 65535
     ret
-gp_ms_yes:
+gp_ms_root:
+gp_ms_yes_pop:
+    pop r1
     mov r0, 0
     ret
 
@@ -658,86 +672,37 @@ gp_dir_commit:
     call crfs_write_u16
     ret
 
-; r1 = inode, r2 = flags. A regular file is capped to its parent directory's flags.
-; Directories and devices are unchanged. Returns the flags to store or test.
-; gp_cap_flags: r1 = inode, r2 = 自身 flags，返回有效 flags = 自身沿整条祖先链
-; 逐级 AND（含根目录）。任何祖先没有的位，后代就不可能有。parent 号在本
-; 文件系统里恒小于 child 号，链条一旦不单调立即视为终止，天然防环。
+; gp_cap_flags: r1 = inode, r2 = 候选 flags → r0 = r2 ∩ 父目录 flags（根目录不封顶）。
+; 只在 chmod 时用：不允许给文件加上父目录都没有的位。权限检查本身只看
+; inode 自己的 flags（Unix 语义），目录的位负责守住目录里的进出。
+; vfs_u8/vfs_u16 破坏 r1-r5，候选值暂存 0x0078。
 gp_cap_flags:
     mov r4, 0
-    stw [r4+0x0076], r1
     stw [r4+0x0078], r2
-gp_cap_step:
-    mov r4, 0
-    ldw r1, [r4+0x0076]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_done
-    add r0, ${I_FLAGS}
-    mov r1, r0
-    call vfs_u8
-    cmp r0, 65280
-    je gp_cap_done
-    mov r4, 0
-    ldw r5, [r4+0x0078]
-    and r5, r0
-    stw [r4+0x0078], r5
-    ldw r1, [r4+0x0076]
     cmp r1, 1
-    je gp_cap_done
+    je gp_cap_keep
     call vfs_inode
     cmp r0, 65280
-    je gp_cap_done
+    je gp_cap_keep
     add r0, ${I_PARENT}
     mov r1, r0
     call vfs_u16
+    cmp r0, 65535
+    je gp_cap_keep
+    cmp r0, 0
+    je gp_cap_keep
+    mov r1, r0
+    call vfs_inode
     cmp r0, 65280
-    je gp_cap_done
+    je gp_cap_keep
+    add r0, ${I_FLAGS}
+    mov r1, r0
+    call vfs_u8
     mov r4, 0
-    ldw r5, [r4+0x0076]
-    cmp r0, r5
-    je gp_cap_done
-    jgt gp_cap_done
-    stw [r4+0x0076], r0
-    jmp gp_cap_step
-gp_cap_done:
-    mov r4, 0
-    ldw r0, [r4+0x0078]
-    ret
-
-; gp_cap_flags_sda: 同 gp_cap_flags，但走 sda 直读视图（写路径用）。
-gp_cap_flags_sda:
-    mov r4, 0
-    stw [r4+0x0076], r1
+    ldw r2, [r4+0x0078]
+    and r2, r0
     stw [r4+0x0078], r2
-gp_cap_sda_step:
-    mov r4, 0
-    ldw r1, [r4+0x0076]
-    mul r1, ${INODE_SIZE}
-    add r1, ${ITABLE_BYTE + I_FLAGS}
-    call crfs_u8
-    cmp r0, 65535
-    je gp_cap_sda_done
-    mov r4, 0
-    ldw r5, [r4+0x0078]
-    and r5, r0
-    stw [r4+0x0078], r5
-    ldw r1, [r4+0x0076]
-    cmp r1, 1
-    je gp_cap_sda_done
-    mul r1, ${INODE_SIZE}
-    add r1, ${ITABLE_BYTE + I_PARENT}
-    call crfs_u16
-    cmp r0, 65535
-    je gp_cap_sda_done
-    mov r4, 0
-    ldw r5, [r4+0x0076]
-    cmp r0, r5
-    je gp_cap_sda_done
-    jgt gp_cap_sda_done
-    stw [r4+0x0076], r0
-    jmp gp_cap_sda_step
-gp_cap_sda_done:
+gp_cap_keep:
     mov r4, 0
     ldw r0, [r4+0x0078]
     ret
@@ -1066,11 +1031,16 @@ gp_chmod_or:
     xor r2, 65535
     and r0, r2
     and r0, 255
-    mov r2, r0
+    ; 上限只取父目录一级（且不包含 inode 自己的旧模式），否则任何尚未
+    ; 置位的权限都永远设不上去。
+    stw [r4+0x005C], r0
     ldw r1, [r4+0x0056]
+    ldw r2, [r4+0x005C]
     call gp_cap_flags
-    mov r2, r0
+    stw [r4+0x005C], r0
+gp_chmod_store:
     mov r4, 0
+    ldw r2, [r4+0x005C]
     ldw r1, [r4+0x005A]
     call crfs_write_u8
     cmp r0, 0
@@ -1989,12 +1959,128 @@ gp_spawn_check:
     jne gp_fail
 gp_spawn_image:
     call gp_fill_ids
-    call gp_login_fix
     call gp_fill_env
     call gp_fill_argv
     mov r0, 40
     mov r1, spawn_req
     svc
+    iret
+
+; 系统调用 38: spawnas(path, uid)。仅限 euid 0（init 与 setuid-root 的 login）。
+; 宿主核对账户存在且未锁定（op 2），并填写登录环境块与 home 目录（op 3）；
+; 这里负责解析程序、确定 uid/euid 后按登录会话启动。
+gp_spawnas:
+    mov r4, 0
+    stw [r4+0x0050], r1
+    stw [r4+0x005E], r2
+    call current_euid
+    cmp r0, ${UID_ROOT}
+    jne gp_fail
+    mov r0, 43
+    mov r1, 2
+    ldw r2, [r4+0x005E]
+    svc
+    ; op2 合法返回 1/2；0 或 0xffff（锁定/不存在）都必须拒绝
+    cmp r0, 0
+    je gp_fail
+    cmp r0, 65535
+    je gp_fail
+    mov r6, r0
+    call gp_req_zero
+    ldw r1, [r4+0x0050]
+    call gp_basename
+    ldw r1, [r4+0x0050]
+    call gp_has_slash
+    cmp r0, 0
+    jne gp_sa_abs
+    ldw r1, [r4+0x0050]
+    call gp_search
+    cmp r0, 65535
+    je gp_fail
+    jmp gp_sa_check
+gp_sa_abs:
+    ldw r1, [r4+0x0050]
+    call vfs_resolve
+    cmp r0, 65535
+    je gp_fail
+gp_sa_check:
+    mov r4, 0
+    stw [r4+0x0056], r0
+    ldw r5, [r4+0x0040]
+    stw [r4+0x0058], r5
+    mov r1, r0
+    call vfs_inode
+    cmp r0, 65280
+    je gp_fail
+    mov r1, r0
+    call vfs_u8
+    cmp r0, 1
+    jne gp_fail
+    mov r4, 0
+    ldw r1, [r4+0x0056]
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
+    call vfs_may
+    cmp r0, 0
+    jne gp_fail
+    ldw r5, [r4+0x005E]
+    stw [r4+0x005A], r5
+    cmp r6, 2
+    jne gp_sa_user
+    mov r5, 0
+gp_sa_user:
+    stw [r4+0x005C], r5
+    call gp_read_head
+    cmp r0, 1
+    je gp_sa_image
+    cmp r0, 2
+    jne gp_fail
+    call gp_shebang
+    cmp r0, 0
+    jne gp_fail
+gp_sa_image:
+    call gp_fill_ids
+    mov r0, 43
+    mov r1, 3
+    mov r2, spawn_req
+    svc
+    cmp r0, 0
+    jne gp_fail
+    mov r1, spawn_req
+    mov r5, 1
+    stb [r1+268], r5
+    mov r0, 40
+    mov r1, spawn_req
+    svc
+    iret
+
+; 系统调用 39: chown(path, uid)。仅限 euid 0。改写 inode 属主表。
+gp_chown:
+    mov r4, 0
+    stw [r4+0x0052], r2
+    call current_euid
+    cmp r0, ${UID_ROOT}
+    jne gp_fail
+    call vfs_resolve
+    cmp r0, 65535
+    je gp_fail
+    mov r4, 0
+    stw [r4+0x0056], r0
+    ldw r5, [r4+0x0040]
+    cmp r5, 254
+    je gp_fail
+    ldw r5, [r4+0x0042]
+    cmp r5, 1
+    jne gp_fail
+    call gp_use_vdev
+    ldw r1, [r4+0x0056]
+    mul r1, 2
+    add r1, ${SB_UID}
+    ldw r2, [r4+0x0052]
+    call crfs_write_u16
+    cmp r0, 0
+    jne gp_fail
+    mov r0, 0
     iret
 
 gp_req_zero:
@@ -2247,65 +2333,6 @@ gp_fill_ids:
     stw [r1+4], r5
     ret
 
-gp_login_fix:
-    mov r1, spawn_req
-    add r1, 8
-    mov r2, gp_sh
-    call gp_kcmp
-    cmp r0, 0
-    jne gp_login_done
-    mov r4, 0
-    ldw r5, [r4+0x0054]
-    cmp r5, 0
-    jne gp_login_done
-    ldw r5, [r4+0x005C]
-    cmp r5, 0
-    jne gp_login_done
-    mov r5, 1
-    stw [r4+0x005A], r5
-    stw [r4+0x005C], r5
-    mov r1, spawn_req
-    stw [r1+2], r5
-    stw [r1+4], r5
-    mov r5, 1
-    stb [r1+268], r5
-    mov r1, 1
-    mov r4, 0
-    stb [r4+0x0048], r1
-    mov r1, gp_home
-    call vfs_resolve
-    mov r1, 0
-    mov r4, 0
-    stb [r4+0x0048], r1
-    cmp r0, 65535
-    je gp_login_done
-    mov r1, spawn_req
-    mov r4, 0
-    ldw r5, [r4+0x0040]
-    stb [r1+266], r5
-    stb [r1+267], r0
-gp_login_done:
-    ret
-
-; r1 and r2 are kernel strings.
-gp_kcmp:
-gp_kcmp_loop:
-    ldb r3, [r1+0]
-    ldb r4, [r2+0]
-    cmp r3, r4
-    jne gp_kcmp_no
-    cmp r3, 0
-    je gp_kcmp_yes
-    add r1, 1
-    add r2, 1
-    jmp gp_kcmp_loop
-gp_kcmp_yes:
-    mov r0, 0
-    ret
-gp_kcmp_no:
-    mov r0, 1
-    ret
-
 gp_fill_env:
     mov r1, spawn_req
     ldb r0, [r1+268]
@@ -2327,9 +2354,9 @@ gp_env_inherit:
     add r2, 1
     add r3, 1
     jmp gp_env_inherit
+; 登录会话的环境块由 gp_spawnas 通过宿主账户表填好，这里不再覆盖。
 gp_env_login:
-    mov r1, gp_login_env
-    jmp gp_env_copy_k
+    ret
 gp_env_root:
     mov r1, gp_root_env
 gp_env_copy_k:
@@ -2467,8 +2494,13 @@ gp_as_dest:
     iret
 
 gp_mount:
-    call current_euid
-    cmp r0, ${UID_ROOT}
+    push r1
+    push r2
+    mov r1, 109
+    call gp_perm_ok
+    pop r2
+    pop r1
+    cmp r0, 0
     jne gp_fail
     mov r4, 0
     stw [r4+0x0050], r1
@@ -2571,8 +2603,11 @@ gp_dev_no:
     ret
 
 gp_umount:
-    call current_euid
-    cmp r0, ${UID_ROOT}
+    push r1
+    mov r1, 109
+    call gp_perm_ok
+    pop r1
+    cmp r0, 0
     jne gp_fail
     mov r4, 0
     stw [r4+0x0050], r1
@@ -3023,7 +3058,7 @@ gp_ncopy:
 gp_ncopy_done:
     ret
 
-; Device catalog at 0xA800, 8 records of 64 bytes. Host publishes facts only.
+; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
 gp_lsblk:
     mov r1, gp_lsblk_hdr
     call gp_puts
@@ -3033,7 +3068,7 @@ gp_lsblk_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0xA800
+    add r5, 0x1200
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_lsblk_next
@@ -3102,7 +3137,7 @@ gp_df_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0xA800
+    add r5, 0x1200
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_df_next
@@ -3165,11 +3200,11 @@ gp_df_next:
     add r6, 1
     jmp gp_df_loop
 
-; kmsg lives at 0xA400: u16 length, then text. The host only appends events.
+; kmsg lives at 0x0E00: u16 length, then text. The host only appends events.
 gp_dmesg:
-    mov r4, 0xA400
+    mov r4, 0x0E00
     ldw r6, [r4+0]
-    mov r5, 0xA402
+    mov r5, 0x0E02
     mov r7, 0
 gp_dmesg_loop:
     cmp r7, r6
@@ -3430,15 +3465,8 @@ gp_bin:
     .asciz "/bin/"
 gp_usr:
     .asciz "/usr/bin/"
-gp_home:
-    .asciz "/home/user"
-gp_sh:
-    .asciz "sh"
-gp_login_env:
-    .ascii "USER\\0${UID_USER_NAME}\\0HOME\\0/home/user\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
-    .byte 0
 gp_root_env:
-    .ascii "USER\\0root\\0HOME\\0/\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
+    .ascii "USER\\0root\\0HOME\\0/root\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
     .byte 0
 gp_ps_hdr:
     .asciz "  PID  PPID   UID STAT MEM TIME COMMAND\\n"
@@ -3466,12 +3494,13 @@ gp_pages_nl:
     .asciz " pages\\n"
 gp_help_text:
     .ascii "crados commands (every file in /bin is CRX machine code)\\n\\n"
-    .ascii "files:   ls [-l] cat head wc cp mv rm rmdir mkdir touch chmod echo\\n"
+    .ascii "files:   ls [-l] cat head wc cp mv rm rmdir mkdir touch chmod chown echo\\n"
     .ascii "process: ps kill sleep count pid\\n"
     .ascii "storage: lsblk df mount umount   (writeback is automatic)\\n"
+    .ascii "account: login su passwd useradd userdel users chperm\\n"
     .ascii "kernel:  mem dmesg hexdump objdump uname whoami\\n"
     .ascii "build:   as source.s -o program\\n"
     .ascii "shell:   cd pwd clear exit; > redirects; & runs in background\\n"
-    .ascii "manual:  man [README|asm|storage|inspect|script]\\n"
+    .ascii "manual:  man [README|asm|storage|inspect|script|accounts]\\n"
     .asciz "         append .zh for Chinese, e.g. man asm.zh\\n"
 `
