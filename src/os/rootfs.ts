@@ -42,7 +42,7 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Permissions. The login shell is uid 1000. 'kill 1' returns
+5. Permissions. The login shell is uid 1. 'kill 1' returns
    EPERM. Only euid 0 may signal init, and that still panics.
 6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
 
@@ -95,7 +95,7 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 权限。登录 shell 是 uid 1000。运行 'kill 1' 得到 EPERM。
+5. 权限。登录 shell 是 uid 1。运行 'kill 1' 得到 EPERM。
    只有 euid 0 可以信号 init，那样才会恐慌。
 6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
 
@@ -271,23 +271,26 @@ An inode is laid out as
                        bit3 other read, bit4 other write, bit5 setuid,
                        bit6 sticky, bit7 other exec. Shown as rwxrwxst.
                        chmod [u|o|a][+|-][rwxst] file. x follows u/o/a.
-                       Owner or root, not firmware
+                       Owner or root, not firmware. Non-root cannot set setuid.
     offset 2   size    16-bit length in bytes
     offset 4   parent  inode number of the containing directory
     offset 6   driver  device node minor number
     offset 8   ptr[20] twenty direct block pointers
 
 Owner uids live in the superblock, at byte 32 plus inode*2, one
-big-endian u16 each. The login shell is uid 1000. uid 0 bypasses the
-checks. /bin is firmware: syscall writes return EROFS. block_write
-requires euid 0. A file created by a process is owned by that euid.
+big-endian u16 each. The login shell is uid 1. uid 0 bypasses the
+checks. /bin is firmware: syscall writes return EROFS. block_read and
+block_write require euid 0. A file created by a process is owned by that euid.
 /home/user and /usr/bin are sticky, so a user cannot unlink root's files.
+mv requires write permission on both the source and destination directories.
+A regular file's mode is the intersection of its own flags and its parent
+directory's flags: it cannot grant a bit the directory does not have.
 PATH searches /bin before /usr/bin, so a program in /usr/bin cannot
 shadow ls.
 
 ls -l shows the mode, the owner, the size and the name of each entry.
-The owner is read from that uid table: root is uid 0, user is uid 1000,
-any other uid is printed as a number. The line comes from readview
+The owner is read from that uid table: uid 0 is shown as root, every other
+uid is printed as a number. The line comes from readview
 kind 8, so ls only needs search permission on the directories, not read
 permission on the file.
 
@@ -296,6 +299,8 @@ CRX kernel. Its read-only VFS walks inodes and directory blocks on any
 device, crossing mount points through a table at 0x00C0 in the KCB.
 The ROM has 1 KiB blocks, so the kernel reads it 256 B at a time with
 block controller command 6, one sector into its scratch page.
+ps, mem, help, lsblk, df, dmesg and hexdump are formatted by that kernel.
+objdump checks the path itself, then asks the host to decode instructions.
 
     -rwxr-x-- root    464 cat
     drwxrwx-t root      0 tmp/
@@ -378,26 +383,28 @@ inode 的布局：
                       bit3 其他人读，bit4 其他人写，bit5 setuid，
                       bit6 sticky，bit7 其他人执行。显示为 rwxrwxst。
                       chmod [u|o|a][+|-][rwxst] file，x 也看 u/o/a。
-                      属主或 root 可以改，固件不行
+                      属主或 root 可以改，固件不行。非 root 不能置 setuid。
     偏移 2    size    16 位字节长度
     偏移 4    parent  所在目录的 inode 号
     偏移 6    driver  设备号
     偏移 8    ptr[20] 二十个直接块指针
 
 属主 uid 在超级块里，字节 32 起每个 inode 一个大端 u16。登录 shell 是
-uid 1000。uid 0 跳过检查。/bin 是固件，系统调用写它返回 EROFS。
-block_write 需要 euid 0。进程创建的文件属主就是它的 euid。/home/user
-和 /usr/bin 带 sticky，用户删不掉 root 的文件。PATH 先搜 /bin 再搜
+uid 1。uid 0 跳过检查。/bin 是固件，系统调用写它返回 EROFS。
+block_read 和 block_write 都需要 euid 0。进程创建的文件属主就是它的 euid。/home/user
+和 /usr/bin 带 sticky，用户删不掉 root 的文件。mv 要同时有源目录和目标目录的写权限。
+普通文件的模式是自身标志与所在目录标志的交集，不能给出目录没有的位。PATH 先搜 /bin 再搜
 /usr/bin，所以 /usr/bin 里的程序不能盖住 ls。
 
 ls -l 显示每一项的模式、属主、大小和名字。属主就取自这张 uid 表：uid 0
-显示为 root，uid 1000 显示为 user，其他 uid 直接显示数字。这一行由
+显示为 root，其他 uid 直接显示数字。这一行由
 readview 第 8 类给出，所以 ls 只需要沿途目录的搜索权，不需要文件的读权限。
 
 ls 用到的两个调用 getdents 和 readview 第 8 类，全部由 CRX 内核完成。它的
 只读 VFS 能在任意设备上解析 inode 和目录块，经 KCB 0x00C0 的挂载表跨越
 挂载点。ROM 的块是 1 KiB，内核用块控制器的命令 6 每次读 256 B 扇区，
-正好放进它的一页暂存区。
+正好放进它的一页暂存区。ps、mem、help、lsblk、df、dmesg 和 hexdump
+都由这个内核排版。objdump 自己检查路径，再请宿主解码指令。
 
     -rwxr-x-- root    464 cat
     drwxrwx-t root      0 tmp/
@@ -760,7 +767,8 @@ err:
 `
 
 export const BLOCK_S = `; block.s — read the sda superblock through the CRX MMIO driver
-; build: as block.s -o block      run: ./block      output: CRFS
+; block_read requires euid 0, so the login shell (uid 1) is refused.
+; build: as block.s -o block      run: ./block
 .text
 _start:
     mov r0, 29          ; page_alloc(vpn 8)

@@ -554,7 +554,7 @@ scriptmode: .byte 0
 scriptfd: .word 0
 selfpid: .word 0
 banner: .asciz "crados 3.0\\nType help for commands.\\n"
-pre:    .asciz "user@crados:"
+pre:    .asciz "1@crados:"
 post:   .asciz "$ "
 home:   .asciz "/home/user"
 bgmsg:  .asciz "[background]\\n"

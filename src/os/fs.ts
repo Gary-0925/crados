@@ -64,7 +64,7 @@ export const MODE_DEV = M_READ | M_WRITE | M_OREAD | M_OWRITE // 0666
 export const MODE_TMP = MODE_DIR | M_OWRITE | M_STICKY // 1777
 
 export const UID_ROOT = 0
-export const UID_USER = 1000
+export const UID_USER = 1
 
 // 超级块空闲区：偏移 14 是特性字，偏移 32 起每个 inode 一个大端 uid。
 // 64 × 2 = 128 字节，落在最小的 256 B 超级块里，不占用数据块。
@@ -235,6 +235,7 @@ export class CRFS {
     return this.dev.u8(this.inodeAt(ino) + I_FLAGS)
   }
   setFlags(ino: number, mode: number) {
+    if (!this.inodeOk(ino)) return
     this.dev.setU8(this.inodeAt(ino) + I_FLAGS, mode & 0xff)
   }
   iexec(ino: number): boolean {
@@ -248,7 +249,12 @@ export class CRFS {
     return this.dev.u16(SB_UID + ino * 2)
   }
   setOwner(ino: number, uid: number) {
+    if (!this.inodeOk(ino)) return
     this.dev.setU16(SB_UID + ino * 2, uid)
+  }
+
+  private inodeOk(ino: number): boolean {
+    return ino > 0 && ino < this.inodeCount
   }
 
   // 旧盘没有 uid 表。按类型补上模式，已有的执行位保留，属主先记为 root。
@@ -452,6 +458,7 @@ export class CRFS {
     if (this.lookup(dirIno, name)) return { err: 'EEXIST' }
     const ino = this.allocInode(type, dirIno)
     if (ino < 0) return { err: 'ENOSPC' }
+    if (type === T_FILE) this.setFlags(ino, this.iflags(ino) & this.iflags(dirIno))
     const r = this.link(dirIno, name, ino)
     if (r !== 0) {
       this.setBit(2, ino, false)

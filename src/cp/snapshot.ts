@@ -122,10 +122,15 @@ function formatCall(sc: Syscall): string {
     case 'tcsetpgrp': return `tcsetpgrp(${sc.pid})`
     case 'view': return `readview(${sc.kind}, "${sc.arg}")`
     case 'assemble': return `assemble("${sc.source}", "${sc.output}")`
+    case 'hwexec': return `hwexec(${sc.at})`
+    case 'hwreap': return `hwreap(${sc.pid})`
+    case 'hwmount': return 'hwmount()'
+    case 'hwassemble': return `hwassemble(${sc.srcDev}:${sc.srcIno} -> ${sc.dstDev}:${sc.dstIno})`
     case 'mount': return `mount("${sc.dev}", "${sc.dir}")`
     case 'umount': return `umount("${sc.target}")`
     case 'sync': return 'sync()'
     case 'time': return 'clock_gettime()'
+    default: return (sc as { call: string }).call
   }
 }
 
