@@ -1039,10 +1039,6 @@ export class Kernel {
   }
 
   private killSig(p: Process, sig: number) {
-    if (p.pid <= 1) {
-      this.setPanic('Attempted to kill init')
-      return
-    }
     const name = sig === 2 ? 'SIGINT' : sig === 9 ? 'SIGKILL' : sig === 15 ? 'SIGTERM' : `signal ${sig}`
     this.log(`signal: pid ${p.pid} (${p.name}) terminated by ${name}`)
     this.doExit(p, 128 + sig)
@@ -1302,11 +1298,8 @@ export class Kernel {
         return
       case 'kill': {
         const t = this.procs.get(sc.pid)
-        if (!t) result = { err: 'ESRCH' }
-        else {
-          this.killSig(t, sc.sig)
-          result = 0
-        }
+        this.killSig(t, sc.sig)
+        result = 0
         break
       }
       case 'hwexec':
