@@ -32,6 +32,11 @@ export type Syscall =
   | { call: 'tcsetpgrp'; pid: number }
   | { call: 'view'; kind: number; arg: string }
   | { call: 'assemble'; source: string; output: string }
+  | { call: 'hwexec'; at: number }
+  | { call: 'hwreap'; pid: number }
+  | { call: 'hwmount' }
+  | { call: 'hwassemble'; srcDev: number; srcIno: number; dstDev: number; dstIno: number }
+  | { call: 'hwdisasm'; at: number }
   | { call: 'mount'; dev: string; dir: string }
   | { call: 'umount'; target: string }
   | { call: 'sync' }

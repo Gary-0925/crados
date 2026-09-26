@@ -56,16 +56,6 @@ export interface RegisterFile {
 
 const isErrVal = (v: unknown): boolean => typeof v === 'object' && v !== null && 'err' in v
 
-const cstr = (bus: Bus, va: number, max = 1024): string => {
-  let out = ''
-  for (let i = 0; i < max; i++) {
-    const b = bus.readUser(va + i)
-    if (b === 0) break
-    out += String.fromCharCode(b)
-  }
-  return out
-}
-
 const putBytes = (bus: Bus, va: number, bytes: Uint8Array, max: number): number => {
   const n = Math.min(bytes.length, max > 0 ? max : bytes.length)
   for (let i = 0; i < n; i++) bus.writeUser(va + i, bytes[i])
@@ -76,79 +66,33 @@ const putBytes = (bus: Bus, va: number, bytes: Uint8Array, max: number): number 
 const putStr = (bus: Bus, va: number, text: string, max: number): number =>
   putBytes(bus, va, UTF8_ENCODER.encode(text), max)
 
-const argv = (bus: Bus, at: number, argc: number): string[] => {
-  const out: string[] = []
-  let p = at
-  for (let i = 0; i < argc; i++) {
-    const s = cstr(bus, p, 256)
-    out.push(s)
-    p += s.length + 1
-  }
-  return out
-}
-
-// 系统调用号 → 标准 Syscall 对象；用户二进制与 /bin 原生程序走同一张表
+// Host services only. User syscalls are handled by the CRX kernel; svc from
+// supervisor mode is how that kernel asks for a CPU, a reap, or a toolchain.
 function trap(cpu: CpuState, bus: Bus): Syscall | null {
-  const [num, a1, a2, a3] = [cpu.regs[0], cpu.regs[1], cpu.regs[2], cpu.regs[3]]
+  const num = cpu.regs[0]
+  const a1 = cpu.regs[1]
+  const a2 = cpu.regs[2]
   switch (num) {
-    case 1: {
-      const len = Math.min(a3, 4096)
-      const count = len > 0 ? len : cstr(bus, a2).length
-      const bytes = Uint8Array.from({ length: count }, (_, i) => bus.readUser(a2 + i))
-      return sys.write(a1, bytes)
-    }
-    case 2:
-      return sys.read(a1, a3 > 0 ? a3 : undefined)
     case 3:
       return sys.exit(a1)
-    case 4:
-      return sys.open(cstr(bus, a1), a2 === 1 ? 'w' : a2 === 2 ? 'a' : 'r')
-    case 5:
-      return sys.close(a1)
-    case 6:
-      return sys.sleep(a1)
-    case 7:
-      return sys.getpid()
-    case 8:
-      return sys.time()
-    case 9:
-      return sys.spawn(cstr(bus, a1), a2 && a3 ? argv(bus, a2, a3) : [])
-    case 10:
-      return sys.wait(a1 === 0xffff ? -1 : a1)
-    case 12:
-      return sys.getcwd()
-    case 13:
-      return sys.unlink(cstr(bus, a1))
-    case 14:
-      return sys.mkdir(cstr(bus, a1))
-    case 15:
-      return sys.chmod(cstr(bus, a1), a2, a3)
-    case 16:
-      return sys.rename(cstr(bus, a1), cstr(bus, a2))
-    case 17:
-      return sys.sync()
-    case 18:
-      return sys.getenv(cstr(bus, a1))
-    case 20:
-      return sys.mount(cstr(bus, a1), cstr(bus, a2))
-    case 21:
-      return sys.umount(cstr(bus, a1))
     case 22:
       return sys.kill(a1, a2 || 15)
-    case 23:
-      return sys.chdir(cstr(bus, a1))
-    case 24:
-      return sys.dup(a1)
-    case 25:
-      return sys.dup2(a1, a2)
-    case 26:
-      return sys.view(a1, a2 ? cstr(bus, a2) : '')
-    case 27:
-      return sys.assemble(cstr(bus, a1), cstr(bus, a2))
-    case 28:
-      return sys.tcsetpgrp(a1)
-    case 34:
-      return sys.sleepSeconds(a1)
+    case 40:
+      return { call: 'hwexec', at: a1 }
+    case 41:
+      return { call: 'hwreap', pid: a1 }
+    case 42:
+      return { call: 'hwmount' }
+    case 44:
+      return {
+        call: 'hwassemble',
+        srcDev: bus.read(a1),
+        srcIno: bus.read(a1 + 1),
+        dstDev: bus.read(a1 + 2),
+        dstIno: bus.read(a1 + 3),
+      }
+    case 45:
+      return { call: 'hwdisasm', at: a1 }
     default:
       return null
   }

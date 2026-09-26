@@ -16,48 +16,34 @@ import {
   saveDev,
   SPECS,
 } from './blockdev'
+import { applyLoginPolicy, CRFS, M_OEXEC, T_FILE, UID_ROOT, UID_USER, VFS } from './fs'
 import {
-  applyLoginPolicy,
-  basename,
-  CRFS,
-  dirname,
-  DRV_TTY,
-  M_EXEC,
-  M_OEXEC,
-  M_OREAD,
-  M_OWRITE,
-  M_READ,
-  M_SETUID,
-  M_STICKY,
-  M_WRITE,
-  normalizePath,
-  T_DEV,
-  T_DIR,
-  T_FILE,
-  UID_ROOT,
-  UID_USER,
-  VFS,
-} from './fs'
-import type { FNode } from './fs'
-import {
+  DEVINFO_BASE,
+  DEVINFO_SLOTS,
+  DEVINFO_STRIDE,
   FRAME_COUNT,
   KERNEL_TEXT_FRAME,
   KERNEL_TEXT_PAGES,
+  KMSG_BASE,
+  KMSG_SIZE,
   Memory,
   PAGE_SIZE,
   RAM_SIZE,
+  RESERVED_FRAME,
+  RESERVED_FRAMES,
   USER_FRAME_START,
 } from './memory'
-import { assemble, disassemble, isExecutable, loadExe } from './isa'
+import { assemble, disassemble, loadExe } from './isa'
 import { ASM_PROGRAMS } from './asmsrc'
 import { GUEST_IDLE_SOURCE, GUEST_KERNEL_SOURCE } from './guestkernel'
+import { GUEST_POLICY_SOURCE } from './guestpolicy'
 import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from './vm'
 import type { Bus } from './vm'
 import { deviceCode, deviceName, MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
 import type { VfsHooks } from './process'
 import { buildRootImage } from './rootimg'
 import { isErr } from './types'
-import type { BlkInfo, Err, Gen, ProcInfo, ReadBytes, Syscall } from './types'
+import type { BlkInfo, Err, Gen, Syscall } from './types'
 
 export const QUANTUM = 5
 const AUTOSYNC_MS = 1000 // 脏数据自动回写间隔，按真实时间计而非 tick
@@ -100,8 +86,6 @@ type ExecSpec = { entry: number }
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s)
 const hexAddr = (n: number) => '0x' + n.toString(16).padStart(4, '0')
-const TYPE_NAME: Record<number, 'dir' | 'file' | 'dev'> = { 1: 'file', 2: 'dir', 3: 'dev' }
-
 export class Kernel {
   readonly mem = new Memory()
   readonly vfs = new VFS()
@@ -290,14 +274,17 @@ export class Kernel {
   // Load the privileged CRX kernel into reserved physical frames. Kernel mode
   // fetches it through the direct physical map, so user page tables never map it.
   private installGuestKernel(): boolean {
-    const built = assemble(GUEST_KERNEL_SOURCE)
+    const built = assemble(GUEST_KERNEL_SOURCE + GUEST_POLICY_SOURCE)
     if (built.errors.length || built.bytes.length < 16) {
       for (const e of built.errors) this.log(`kernel asm: ${e}`)
       return false
     }
     const image = built.bytes.slice(16)
     // 文本必须停在 MMIO 窗口前面，否则中断向量会被读成 0。
-    if (image.length > PAGE_SIZE * KERNEL_TEXT_PAGES || KERNEL_TEXT_BASE + image.length > 0xff00 || built.symbols.ivt === undefined) return false
+    if (image.length > PAGE_SIZE * KERNEL_TEXT_PAGES || KERNEL_TEXT_BASE + image.length > 0xff00 || built.symbols.ivt === undefined) {
+      this.log(`kernel asm: image ${image.length} B does not fit in ${PAGE_SIZE * KERNEL_TEXT_PAGES} B`)
+      return false
+    }
 
     // Relocate absolute symbol references from image offset zero.
     for (const at of built.relocations) {
@@ -610,9 +597,19 @@ export class Kernel {
         return
       }
       const name = deviceName(reg16(2))
-      const dev = this.devs.get(name)
+      const dev = name ? this.devs.get(name) : undefined
       const block = reg16(4)
       const buffer = reg16(6)
+      // 命令 1/2 是用户态 block_read/block_write。找不到进程时拒绝，不能当成 root。
+      if ((command === 1 || command === 2) && this.euidOf(this.currentPid) !== UID_ROOT) {
+        setReg16(8, 0xffff)
+        return
+      }
+      // 命令 4/5/6 只服务内核自己的暂存页。用户可控的缓冲区不能从这里写进物理内存。
+      if ((command === 4 || command === 5 || command === 6) && buffer !== 0x0d00) {
+        setReg16(8, 0xffff)
+        return
+      }
       // 命令 6：按 256 B 扇区读到内核物理缓冲区。块大小不同的设备（ROM 是 1 KiB）
       // 也能逐扇区读进内核那一页暂存区；怎么解析这些字节由 CRX 内核决定。
       if (command === 6) {
@@ -631,12 +628,8 @@ export class Kernel {
       }
       try {
         const bytes = dev.block(block)
-        // 命令 2 是用户态 block_write。命令 4/5 是内核自己的 CRFS 搬运，不在这里卡 euid。
-        if (command === 2 && this.euidOf(this.currentPid) !== UID_ROOT) {
-          setReg16(8, 0xffff)
-          return
-        }
-        if ((command === 2 || command === 5) && name === 'rom') {
+        // 命令 4 是内核读，ROM 可以读。用户态块读写和内核写都不能改固件。
+        if ((command === 1 || command === 2 || command === 5) && name === 'rom') {
           setReg16(8, 0xffff)
           return
         }
@@ -747,13 +740,6 @@ export class Kernel {
       p.egid = parent.egid
     }
     if (setuid !== undefined) p.euid = setuid
-    // init 拉起的交互 shell 是登录会话，落到 uid 1000。setuid 的 sh 也不例外。
-    if (name === 'sh' && !args.length && p.euid === UID_ROOT) {
-      p.uid = UID_USER
-      p.euid = UID_USER
-      p.gid = UID_USER
-      p.egid = UID_USER
-    }
     p.pageTable = [
       ...pfns.slice(0, codePages + 1).map((pfn, vpn) => ({ vpn, pfn })),
       { vpn: KERNEL_STACK_VPN, pfn: kernelStackFrame, supervisor: true },
@@ -788,13 +774,6 @@ export class Kernel {
       p.fds.set(1, { kind: 'stdout', id: 1 })
       p.fds.set(2, { kind: 'stdout', id: 2 })
     }
-    if (name === 'sh' && !args.length) {
-      p.cwd = '/home/user'
-      p.env.USER = 'user'
-      p.env.HOME = '/home/user'
-      this.shellPid = pid
-      this.fgPid = pid
-    }
     p.state = 'ready'
     this.procs.set(pid, p)
     this.writeKernelTables()
@@ -819,6 +798,7 @@ export class Kernel {
     this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
     this.mem.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
     this.writeMountTable()
+    this.publishDevinfo()
   }
 
   // 把 VFS 挂载关系写成 CRX 内核能读的表：每项是宿主设备、挂载点在宿主上的
@@ -867,21 +847,150 @@ export class Kernel {
     this.tryReap(p)
   }
 
+  // CRX wait scans the zombie PCB itself. Waking the parent is the only host step;
+  // releasing the slot is svc 41, after the guest has copied pid and status.
   private tryReap(child: Process) {
     const parent = this.procs.get(child.ppid)
     if (parent && parent.state === 'blocked' && (parent.waitFor === -1 || parent.waitFor === child.pid)) {
-      parent.waitFor = null
-      parent.pending = { pid: child.pid, code: child.exitCode ?? 0 }
       parent.state = 'ready'
-      this.removeChild(parent, child)
-      if (parent.pid === this.shellPid) this.fgPid = parent.pid
     }
   }
 
-  // 回收 PCB：清掉内存里的 inuse 标志，槽位随即可被新进程复用
-  private removeChild(_parent: Process, child: Process) {
+  // svc 40: the guest already resolved the path, checked permission, and filled
+  // the request. The host only loads the authorized image and attaches a CPU.
+  private hwExec(parent: Process, at: number): number | Err {
+    const b = this.mem.bytes
+    const dev = b[at] ?? 0
+    const ino = b[at + 1] ?? 0
+    const uid = this.mem.u16(at + 2)
+    const euid = this.mem.u16(at + 4)
+    const argc = this.mem.u16(at + 6)
+    let name = ''
+    for (let i = 0; i < 16 && b[at + 8 + i]; i++) name += String.fromCharCode(b[at + 8 + i])
+    const args: string[] = []
+    let cursor = at + 24
+    const argEnd = at + 184
+    for (let i = 0; i < argc && cursor < argEnd; i++) {
+      let s = ''
+      while (cursor < argEnd && b[cursor]) s += String.fromCharCode(b[cursor++])
+      cursor++
+      args.push(s)
+    }
+    const envLen = Math.min(80, this.mem.u16(at + 184))
+    const envBytes = b.slice(at + 186, at + 186 + envLen)
+    const cwdDev = b[at + 266] ?? 0
+    const cwdIno = b[at + 267] ?? 0
+    const flags = b[at + 268] ?? 0
+    const fs = this.fss.get(deviceName(dev))
+    if (!fs || !fs.inodeUsed(ino)) return { err: 'ENOENT' }
+    const exe = loadExe(String.fromCharCode(...fs.readBytes(ino)))
+    if (!exe) return { err: 'ENOEXEC' }
+    const cmd = `${name} ${args.join(' ')}`.trim()
+    const created = this.exec(parent, name || '?', cmd, args, { entry: exe.entry }, exe.image)
+    if ('err' in created) return created
+    created.uid = uid
+    created.euid = euid
+    if (cwdDev) {
+      this.mem.bytes[created.base + 22] = cwdDev
+      this.mem.bytes[created.base + 23] = cwdIno
+    }
+    const argvLen = args.length ? args.join('\0').length + 1 : 0
+    if (envBytes.length && argvLen + envBytes.length <= PAGE_SIZE) {
+      const stackVpn = Math.max(1, Math.ceil(exe.image.length / PAGE_SIZE))
+      const stack = created.pageTable.find((pte) => pte.vpn === stackVpn)
+      if (stack) {
+        this.mem.bytes.set(envBytes, stack.pfn * PAGE_SIZE + argvLen)
+        this.mem.setU16(created.base + 10, stackVpn * PAGE_SIZE + argvLen)
+        for (const key of Object.keys(created.env)) delete created.env[key]
+        let i = 0
+        while (i < envBytes.length) {
+          let keyEnd = i
+          while (keyEnd < envBytes.length && envBytes[keyEnd]) keyEnd++
+          if (keyEnd === i || keyEnd >= envBytes.length) break
+          let valEnd = keyEnd + 1
+          while (valEnd < envBytes.length && envBytes[valEnd]) valEnd++
+          created.env[String.fromCharCode(...envBytes.subarray(i, keyEnd))] = String.fromCharCode(
+            ...envBytes.subarray(keyEnd + 1, valEnd),
+          )
+          i = valEnd + 1
+        }
+      }
+    }
+    if (flags & 1) {
+      created.gid = created.uid
+      created.egid = created.uid
+      this.shellPid = created.pid
+      this.fgPid = created.pid
+      this.mem.setU16(0x002c, created.pid)
+    }
+    this.log(`sched: pid ${created.pid} (${name}) forked from pid ${parent.pid}, ${created.pageTable.length} pages`)
+    return created.pid
+  }
+
+  // svc 41: drop the JS process object. The guest already cleared the PCB.
+  private hwReap(pid: number): number {
+    const child = this.procs.get(pid)
+    if (!child) return 0
     child.release()
-    this.procs.delete(child.pid)
+    this.procs.delete(pid)
+    return 0
+  }
+
+  // svc 42: the guest mount table is authoritative. Rebuild the JS mirror from it.
+  private hwMount(): number {
+    const wanted = new Map<string, string>()
+    for (let i = 0; i < KCB_MOUNT_SLOTS; i++) {
+      const at = KCB_MOUNTS + i * 4
+      const hostDev = this.mem.bytes[at]
+      const hostIno = this.mem.bytes[at + 1]
+      const dev = this.mem.bytes[at + 2]
+      if (!dev) continue
+      const name = deviceName(dev)
+      if (!name || !this.fss.has(name)) continue
+      const path = this.vfsHooks.pathOf(hostDev, hostIno)
+      if (!path || path === '/') continue
+      wanted.set(name, path)
+    }
+    for (const m of [...this.vfs.mounts]) {
+      if (m.path === '/') continue
+      const name = m.fs.dev.spec.name
+      if (wanted.get(name) === m.path) continue
+      this.vfs.umount(m.path)
+      this.mounts.delete(name)
+      const disk = this.devs.get(name)
+      if (disk && name !== 'rom' && this.persist) saveDev(disk)
+    }
+    for (const [name, path] of wanted) {
+      if (this.vfs.mounts.some((m) => m.fs.dev.spec.name === name && m.path === path)) {
+        this.mounts.set(name, path)
+        continue
+      }
+      const fs = this.fss.get(name)
+      if (!fs) continue
+      this.ensureCreds(name)
+      this.vfs.mount(path, fs)
+      this.mounts.set(name, path)
+      this.log(`${name}: mounted on ${path}, label "${fs.label()}"`)
+    }
+    this.writeMountTable()
+    return 0
+  }
+
+  // svc 44: encode one file the guest already authorized. No path walk.
+  private hwAssemble(srcDev: number, srcIno: number, dstDev: number, dstIno: number): 0 | Err {
+    const src = this.fss.get(deviceName(srcDev))
+    const dst = this.fss.get(deviceName(dstDev))
+    if (!src || !dst || deviceName(dstDev) === 'rom') return { err: 'ENOENT' }
+    const built = assemble(src.read(srcIno))
+    if (built.errors.length) {
+      this.log(`as: ${built.errors[0]}`)
+      return { err: 'EINVAL' }
+    }
+    const wr = dst.writeBytes(dstIno, built.bytes)
+    if (isErr(wr)) return wr
+    dst.setExec(dstIno, true)
+    this.dirty = true
+    return 0
   }
 
   private killSig(p: Process, sig: number) {
@@ -903,12 +1012,8 @@ export class Kernel {
 
   // ---------- 凭证 ----------
 
-  private euidOf(pid: number): number {
-    return this.procs.get(pid)?.euid ?? UID_ROOT
-  }
-
-  private isRoot(p: Process): boolean {
-    return p.euid === UID_ROOT
+  private euidOf(pid: number): number | null {
+    return this.procs.get(pid)?.euid ?? null
   }
 
   // 旧盘没有 uid 表时补一次。已标记的盘不动，避免把用户文件改回 root。
@@ -920,46 +1025,6 @@ export class Kernel {
     fs.markCreds()
     this.dirty = true
     this.log(`${name}: credential table written, login uid ${UID_USER}`)
-  }
-
-  private modeAllows(p: Process, fs: CRFS, ino: number, write: boolean): boolean {
-    if (write && fs.dev.spec.name === 'rom') return false
-    if (this.isRoot(p)) return true
-    const mode = fs.iflags(ino)
-    const own = p.euid === fs.iowner(ino)
-    return write ? (mode & (own ? M_WRITE : M_OWRITE)) !== 0 : (mode & (own ? M_READ : M_OREAD)) !== 0
-  }
-
-  private canExec(p: Process, fs: CRFS, ino: number): boolean {
-    if (this.isRoot(p)) return true
-    const mode = fs.iflags(ino)
-    return (mode & (p.euid === fs.iowner(ino) ? M_EXEC : M_OEXEC)) !== 0
-  }
-
-  // 沿路径检查每一级目录的搜索权。最后一级只解析，不额外要求权限。
-  private walk(p: Process, path: string): FNode | Err {
-    const abs = normalizePath(path, p.cwd)
-    const parts = abs.split('/').filter(Boolean)
-    let cur = '/'
-    for (const seg of parts) {
-      const dir = this.vfs.resolve(cur, '/')
-      if ('err' in dir) return dir
-      if (dir.type !== T_DIR) return { err: 'ENOTDIR' }
-      if (!this.canExec(p, this.vfs.fsOf(dir), dir.ino)) return { err: 'EACCES' }
-      cur = cur === '/' ? `/${seg}` : `${cur}/${seg}`
-    }
-    return this.vfs.resolve(abs, '/')
-  }
-
-  private parentNode(p: Process, path: string): FNode | Err {
-    const abs = normalizePath(path, p.cwd)
-    const dir = this.walk(p, dirname(abs))
-    if ('err' in dir) return dir
-    if (dir.type !== T_DIR) return { err: 'ENOTDIR' }
-    if (dir.dev.spec.name === 'rom') return { err: 'EROFS' }
-    const fs = this.vfs.fsOf(dir)
-    if (!this.canExec(p, fs, dir.ino) || !this.modeAllows(p, fs, dir.ino, true)) return { err: 'EACCES' }
-    return dir
   }
 
   // ---------- 设备与持久化 ----------
@@ -982,40 +1047,6 @@ export class Kernel {
     this.lastSyncMs = Date.now()
     if (!quiet) this.log(`sync: ${blocks} block(s) written to persistent store`)
     return blocks
-  }
-
-  private sysMount(dev: string, dir: string, cwd: string): Err | 0 {
-    const name = basename(dev)
-    if (!this.devs.has(name) || name === 'rom') return { err: 'ENODEV' }
-    if (this.mounts.has(name)) return { err: 'EBUSY' }
-    const target = this.vfs.resolve(dir, cwd)
-    if ('err' in target) return { err: target.err }
-    if (target.type !== T_DIR) return { err: 'ENOTDIR' }
-    const fs = this.fsOf(name)
-    if (!fs.valid()) return { err: 'EINVAL' }
-    this.ensureCreds(name)
-    const abs = normalizePath(dir, cwd)
-    if (abs === '/' || [...this.mounts.values()].includes(abs)) return { err: 'EBUSY' }
-    this.vfs.mount(abs, fs)
-    this.mounts.set(name, abs)
-    this.writeMountTable()
-    this.log(`${name}: mounted on ${abs}, label "${fs.label()}", ${fs.usedBlocks()} blocks in use`)
-    return 0
-  }
-
-  private sysUmount(target: string, cwd: string): Err | 0 {
-    const byName = basename(target)
-    const abs = this.mounts.has(byName) ? this.mounts.get(byName)! : normalizePath(target, cwd)
-    const name = [...this.mounts.entries()].find(([, at]) => at === abs)?.[0]
-    if (!name) return { err: 'EINVAL' }
-    for (const p of this.procs.values())
-      if (p.state !== 'zombie' && p.cwd.startsWith(abs)) return { err: 'EBUSY' }
-    this.vfs.umount(abs)
-    this.mounts.delete(name)
-    this.writeMountTable()
-    if (this.persist) saveDev(this.devs.get(name)!)
-    this.log(`${name}: unmounted from ${abs}`)
-    return 0
   }
 
   private blkInfo(): BlkInfo[] {
@@ -1130,552 +1161,75 @@ export class Kernel {
   private dispatch(p: Process, sc: Syscall) {
     if (sc.call === 'yield') return
     let result: unknown = 0
-    let blocked = false
 
     switch (sc.call) {
-      case 'write':
-        result = this.sysWrite(p, sc.fd, sc.data)
-        break
-      case 'read': {
-        const r = this.sysRead(p, sc.fd, sc.len)
-        if (r === undefined) blocked = true
-        else result = r
-        break
-      }
-      case 'open':
-        result = this.sysOpen(p, sc.path, sc.flags)
-        break
-      case 'close':
-        result = p.fds.delete(sc.fd) ? 0 : { err: 'EBADF' }
-        break
-      case 'dup':
-        result = this.sysDup(p, sc.fd, -1)
-        break
-      case 'dup2':
-        result = this.sysDup(p, sc.from, sc.to)
-        break
-      case 'stat': {
-        const node = this.walk(p, sc.path)
-        result =
-          'err' in node
-            ? { err: node.err }
-            : {
-                ino: node.ino,
-                type: TYPE_NAME[node.type] ?? 'file',
-                size: node.size,
-                exec: node.exec,
-                disk: node.dev.spec.name,
-                name: node.name,
-              }
-        break
-      }
-      case 'mkdir':
-        result = this.sysCreate(p, sc.path, T_DIR)
-        break
-      case 'unlink':
-        result = this.sysUnlink(p, sc.path)
-        break
-      case 'rename':
-        result = this.sysRename(p, sc.from, sc.to)
-        break
-      case 'chmod': {
-        const node = this.walk(p, sc.path)
-        if ('err' in node) result = { err: node.err }
-        else if (node.dev.spec.name === 'rom') result = { err: 'EROFS' }
-        else if (!this.isRoot(p) && p.euid !== node.uid) result = { err: 'EPERM' }
-        else {
-          const fs = this.vfs.fsOf(node)
-          fs.setFlags(node.ino, (fs.iflags(node.ino) | sc.set) & ~sc.clear & 0xff)
-          this.dirty = true
-          result = 0
-        }
-        break
-      }
-      case 'chdir': {
-        const node = this.walk(p, sc.path)
-        if ('err' in node) result = { err: node.err }
-        else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
-        else if (!this.canExec(p, this.vfs.fsOf(node), node.ino)) result = { err: 'EACCES' }
-        else {
-          p.cwd = normalizePath(sc.path, p.cwd)
-          result = 0
-        }
-        break
-      }
-      case 'getcwd':
-        result = p.cwd
-        break
-      case 'spawn':
-        result = this.sysSpawn(p, sc.path, sc.args)
-        break
       case 'exit':
         this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, false)
         this.doExit(p, sc.code)
         return
-      case 'wait': {
-        const kids = this.childrenOf(p.pid)
-        const zombie = kids.find((k) => k.state === 'zombie' && (sc.pid === -1 || k.pid === sc.pid))
-        if (zombie) {
-          result = { pid: zombie.pid, code: zombie.exitCode ?? 0 }
-          this.removeChild(p, zombie)
-          if (p.pid === this.shellPid) this.fgPid = p.pid
-        } else if (kids.some((k) => sc.pid === -1 || k.pid === sc.pid)) {
-          p.state = 'blocked'
-          p.waitFor = sc.pid
-          blocked = true
-        } else result = { err: 'ECHILD' }
-        break
-      }
-      case 'sleep':
-        if (sc.ticks <= 0) result = 0
-        else {
-          // Syscall 6 is handled in the CRX kernel. This branch exists only for
-          // compatibility with a host-generated request.
-          p.state = 'blocked'
-          p.sleepMode = 1
-          p.wakeAt = this.mem.u16(0x0028) + sc.ticks
-          blocked = true
-        }
-        break
-      case 'sleepSeconds':
-        if (sc.seconds <= 0) result = 0
-        else {
-          p.state = 'blocked'
-          p.sleepMode = 2
-          p.wakeAt = Math.ceil(performance.now() + sc.seconds * 1000)
-          blocked = true
-        }
-        break
       case 'kill': {
         const t = this.procs.get(sc.pid)
         if (!t) result = { err: 'ESRCH' }
-        else if (!this.isRoot(p) && (sc.pid <= 1 || (t.euid !== p.euid && t.uid !== p.euid)))
-          result = { err: 'EPERM' }
         else {
           this.killSig(t, sc.sig)
           result = 0
         }
         break
       }
-      case 'mount':
-        result = this.isRoot(p) ? this.sysMount(sc.dev, sc.dir, p.cwd) : { err: 'EPERM' }
+      case 'hwexec':
+        result = this.hwExec(p, sc.at)
         break
-      case 'umount':
-        result = this.isRoot(p) ? this.sysUmount(sc.target, p.cwd) : { err: 'EPERM' }
+      case 'hwreap':
+        result = this.hwReap(sc.pid)
         break
-      case 'sync':
-        result = this.flush(false)
+      case 'hwmount':
+        result = this.hwMount()
         break
-      case 'getpid':
-        result = p.pid
+      case 'hwassemble':
+        result = this.hwAssemble(sc.srcDev, sc.srcIno, sc.dstDev, sc.dstIno)
         break
-      case 'getenv':
-        result = p.env[sc.key] ?? ''
-        break
-      case 'tcsetpgrp': {
-        const t = this.procs.get(sc.pid)
-        if (t && !this.isRoot(p) && t.euid !== p.euid) result = { err: 'EPERM' }
-        else {
-          this.fgPid = sc.pid
-          result = 0
-        }
-        break
-      }
-      case 'view':
-        result = this.sysView(sc.kind, sc.arg, p)
-        break
-      case 'assemble':
-        result = this.sysAssemble(sc.source, sc.output, p)
-        break
-      case 'time':
-        result = { ticks: this.ticks, hz: this.hz }
+      case 'hwdisasm':
+        result = this.hwDisasm(p, sc.at)
         break
     }
 
-    if (blocked) {
-      this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, undefined, true)
-      return
-    }
     if (typeof result === 'number') p.regs.ax = result
     this.observer?.syscall?.(this.ticks, p.pid, p.name, sc, result, false)
     p.pending = result
   }
 
+  // svc 45: disassemble one inode the guest already authorized. No path walk.
+  private hwDisasm(p: Process, at: number): number | Err {
+    const dev = this.mem.bytes[at] ?? 0
+    const ino = this.mem.bytes[at + 1] ?? 0
+    const buf = this.mem.u16(at + 2)
+    const pathVa = this.mem.u16(at + 4)
+    const fs = this.fss.get(deviceName(dev))
+    if (!fs || !fs.inodeUsed(ino) || fs.itype(ino) !== T_FILE) return { err: 'ENOENT' }
+    const exe = loadExe(String.fromCharCode(...fs.readBytes(ino)))
+    if (!exe) return { err: 'ENOEXEC' }
+    const bus = this.makeBus(p)
+    let arg = ''
+    for (let i = 0; i < 64; i++) {
+      const c = bus.readUser(pathVa + i)
+      if (!c) break
+      arg += String.fromCharCode(c)
+    }
+    const text = clip(
+      `${arg}: CRX executable, text ${exe.textLen} B, data ${exe.dataLen} B, entry ${hexAddr(exe.entry)}\n\n` +
+        disassemble(exe.image, exe.textLen, 80).join('\n') +
+        '\n',
+      1190,
+    )
+    const bytes = UTF8_ENCODER.encode(text)
+    const n = Math.min(bytes.length, 1190)
+    for (let i = 0; i < n; i++) bus.writeUser(buf + i, bytes[i])
+    return n
+  }
+
   private statfs() {
     const fs = this.fsOf('sda')
     return { max: fs.inodeCount, used: fs.usedInodes(), bytes: fs.usedBlocks() * fs.dev.blockSize }
-  }
-
-  // /proc 与 /sys 风格的文本视图。格式化发生在内核虚拟文件层，命令本身只做 read/write。
-  private sysView(kind: number, arg: string, p: Process): string | Err {
-    if (kind === 1) {
-      let out = '  PID  PPID   UID STAT MEM TIME COMMAND\n'
-      for (const r of this.procInfoList())
-        out += `${String(r.pid).padStart(5)} ${String(r.ppid).padStart(5)} ${String(r.uid).padStart(5)} ${r.state
-          .slice(0, 4)
-          .toUpperCase()
-          .padEnd(5)} ${String(r.pages).padStart(3)}p ${String(r.ticks).padStart(4)} ${r.cmd}${
-          r.state === 'zombie' ? ' <defunct>' : ''
-        }\n`
-      return clip(out, 1190)
-    }
-    if (kind === 2) {
-      const m = this.mem.stats()
-      let out = '             total      used      free\n'
-      out += `Mem:  ${String(m.total).padStart(10)}${String(m.used).padStart(10)}${String(m.free).padStart(10)} bytes\n`
-      for (const r of this.procInfoList()) out += `pid ${r.pid} ${r.name.padEnd(10)} ${r.pages} pages\n`
-      return clip(out, 1190)
-    }
-    if (kind === 3) {
-      let out = 'NAME MODEL             SIZE  USED  BS  RM MOUNTPOINT\n'
-      for (const d of this.blkInfo())
-        out += `${d.name.padEnd(5)}${d.model.padEnd(17)}${String(d.size).padStart(6)}${String(d.used).padStart(6)} ${String(
-          d.blockSize,
-        ).padStart(3)}  ${d.removable ? 1 : 0} ${d.present ? (d.mountpoint ?? '-') : '(no medium)'}\n`
-      return out
-    }
-    if (kind === 4) {
-      let out = 'Filesystem Blocks Used Avail Use% Mounted on\n'
-      for (const d of this.blkInfo()) {
-        if (!d.present) continue
-        const pct = Math.round((d.usedBlocks / d.blocks) * 100)
-        out += `/dev/${d.name.padEnd(7)} ${String(d.blocks).padStart(5)} ${String(d.usedBlocks).padStart(4)} ${String(
-          d.blocks - d.usedBlocks,
-        ).padStart(5)} ${String(pct + '%').padStart(4)} ${d.mountpoint ?? '-'}\n`
-      }
-      return out
-    }
-    if (kind === 5) return clip(this.kmsgLines().join('\n') + '\n', 1190)
-    if (kind === 6 || kind === 7) {
-      const node = this.walk(p, arg)
-      if ('err' in node) return { err: node.err }
-      if (node.type !== T_FILE) return { err: 'EISDIR' }
-      if (!this.modeAllows(p, this.vfs.fsOf(node), node.ino, false)) return { err: 'EACCES' }
-      const raw = this.vfs.fsOf(node).readBytes(node.ino)
-      if (kind === 7) {
-        const exe = loadExe(String.fromCharCode(...raw))
-        if (!exe) return { err: 'ENOEXEC' }
-        return clip(
-          `${arg}: CRX executable, text ${exe.textLen} B, data ${exe.dataLen} B, entry ${hexAddr(exe.entry)}\n\n` +
-            disassemble(exe.image, exe.textLen, 80).join('\n') +
-            '\n',
-          1190,
-        )
-      }
-      let out = ''
-      const n = Math.min(raw.length, 256)
-      for (let at = 0; at < n; at += 16) {
-        const row = [...raw.subarray(at, Math.min(n, at + 16))]
-        const hx = row.map((b) => b.toString(16).padStart(2, '0')).join(' ')
-        const asc = row.map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('')
-        out += `${at.toString(16).padStart(8, '0')}  ${hx.padEnd(47)} |${asc}|\n`
-      }
-      return out
-    }
-    if (kind === 9)
-      return [
-        'crados commands (every file in /bin is CRX machine code)',
-        '',
-        'files:   ls [-l] cat head wc cp mv rm rmdir mkdir touch chmod echo',
-        'process: ps kill sleep count pid',
-        'storage: lsblk df mount umount   (writeback is automatic)',
-        'kernel:  mem dmesg hexdump objdump uname whoami',
-        'build:   as source.s -o program',
-        'shell:   cd pwd clear exit; > redirects; & runs in background',
-        'manual:  man [README|asm|storage|inspect|script]',
-        '         append .zh for Chinese, e.g. man asm.zh',
-        '',
-      ].join('\n')
-    return { err: 'EINVAL' }
-  }
-
-  // 汇编服务使用与引导 ROM 完全相同的编码器；产物仍由 CPU 执行，不存在函数入口。
-  private sysAssemble(source: string, output: string, p: Process): 0 | Err {
-    const src = this.walk(p, source)
-    if ('err' in src) return src
-    if (src.type !== T_FILE) return { err: 'EISDIR' }
-    if (!this.modeAllows(p, this.vfs.fsOf(src), src.ino, false)) return { err: 'EACCES' }
-    const text = this.vfs.fsOf(src).read(src.ino)
-    const built = assemble(text)
-    if (built.errors.length) {
-      this.log(`as: ${source}:${built.errors[0]}`)
-      return { err: 'EINVAL' }
-    }
-    let dst = this.walk(p, output)
-    if ('err' in dst) {
-      if (dst.err !== 'ENOENT') return dst
-      const c = this.sysCreate(p, output, T_FILE)
-      if (c !== 0) return c
-      dst = this.walk(p, output)
-    }
-    if ('err' in dst) return dst
-    if (dst.dev.spec.name === 'rom') return { err: 'EROFS' }
-    if (!this.modeAllows(p, this.vfs.fsOf(dst), dst.ino, true)) return { err: 'EACCES' }
-    const fs = this.vfs.fsOf(dst)
-    const wr = fs.writeBytes(dst.ino, built.bytes)
-    if (isErr(wr)) return wr
-    fs.setExec(dst.ino, true)
-    this.dirty = true
-    return 0
-  }
-
-  private sysCreate(p: Process, path: string, type: number): 0 | Err {
-    const abs = normalizePath(path, p.cwd)
-    const parent = this.parentNode(p, abs)
-    if ('err' in parent) return parent
-    const fs = this.vfs.fsOf(parent)
-    const r = fs.create(parent.ino, basename(abs), type)
-    if (typeof r !== 'number') return r
-    fs.setOwner(r, p.euid)
-    this.dirty = true
-    return 0
-  }
-
-  private sysUnlink(p: Process, path: string): 0 | Err {
-    const abs = normalizePath(path, p.cwd)
-    if (abs === '/' || this.vfs.isMountPoint(abs)) return { err: 'EBUSY' }
-    const node = this.walk(p, abs)
-    if ('err' in node) return node
-    if (node.dev.spec.name === 'rom') return { err: 'EROFS' }
-    if (node.type === T_DEV) return { err: 'EPERM' }
-    const parent = this.parentNode(p, abs)
-    if ('err' in parent) return parent
-    const fs = this.vfs.fsOf(node)
-    if (node.type === T_DIR && fs.entries(node.ino).length) return { err: 'ENOTEMPTY' }
-    if ((fs.iflags(parent.ino) & M_STICKY) !== 0 && !this.isRoot(p) && p.euid !== node.uid)
-      return { err: 'EPERM' }
-    fs.unlink(fs.iparent(node.ino), node.name)
-    fs.destroy(node.ino)
-    this.dirty = true
-    return 0
-  }
-
-  private sysRename(p: Process, from: string, to: string): 0 | Err {
-    const src = this.walk(p, from)
-    if ('err' in src) return src
-    if (src.type === T_DEV) return { err: 'EPERM' }
-    if (src.dev.spec.name === 'rom') return { err: 'EROFS' }
-    const srcParent = this.parentNode(p, normalizePath(from, p.cwd))
-    if ('err' in srcParent) return srcParent
-    const fs = this.vfs.fsOf(src)
-    if ((fs.iflags(srcParent.ino) & M_STICKY) !== 0 && !this.isRoot(p) && p.euid !== src.uid)
-      return { err: 'EPERM' }
-
-    const absTo = normalizePath(to, p.cwd)
-    const existing = this.vfs.resolve(absTo, '/')
-    let dir: FNode | Err
-    let name: string
-    if (!('err' in existing) && existing.type === T_DIR) {
-      if (existing.dev.spec.name === 'rom') return { err: 'EROFS' }
-      if (!this.canExec(p, this.vfs.fsOf(existing), existing.ino) || !this.modeAllows(p, this.vfs.fsOf(existing), existing.ino, true))
-        return { err: 'EACCES' }
-      dir = existing
-      name = src.name
-    } else {
-      dir = this.parentNode(p, absTo)
-      name = basename(absTo)
-      if (!('err' in existing)) {
-        const removed = this.sysUnlink(p, absTo)
-        if (removed !== 0) return removed
-      }
-    }
-    if ('err' in dir) return dir
-    if (dir.dev !== src.dev) return { err: 'EXDEV' } // 跨设备只能用 cp 逐块复制
-    fs.unlink(fs.iparent(src.ino), src.name)
-    const r = fs.link(dir.ino, name, src.ino)
-    if (r !== 0) return r
-    fs.reparent(src.ino, dir.ino)
-    this.dirty = true
-    return 0
-  }
-
-  private sysWrite(p: Process, fd: number, data: string | Uint8Array): number | Err {
-    const f = p.fds.get(fd)
-    if (!f) return { err: 'EBADF' }
-    if (f.kind === 'stdin' || (f.kind === 'file' && f.flags === 'r')) return { err: 'EBADF' }
-    if (f.kind === 'file') {
-      const fs = this.fss.get(f.dev)
-      if (!fs) return { err: 'EBADF' }
-      if (f.dev === 'rom') return { err: 'EROFS' }
-      if (!this.modeAllows(p, fs, f.ino, true)) return { err: 'EACCES' }
-    }
-    const raw = typeof data === 'string' ? UTF8_ENCODER.encode(data) : data
-    if (f.kind === 'stdout') {
-      const cls = f.id === 2 ? 'err' : 'out'
-      this.conWrite(this.ttyDecoders[cls].decode(raw, { stream: true }), cls)
-      return raw.length
-    }
-    if (f.kind === 'tty') {
-      this.conWrite(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
-      return raw.length
-    }
-    if (f.kind === 'null') return raw.length
-    // 直接按偏移写盘：只有受影响的块被改写，不经任何中间副本
-    const fs = this.fss.get(f.dev)!
-    const at = f.flags === 'a' ? fs.isize(f.ino) : f.pos
-    const r = fs.writeAt(f.ino, at, raw)
-    if (isErr(r)) return r
-    p.fds.seek(fd, at + raw.length) // 文件偏移回写进 PCB 的 fd 表
-    this.dirty = true
-    return raw.length
-  }
-
-  private sysRead(p: Process, fd: number, len?: number): ReadBytes | null | Err | undefined {
-    const f = p.fds.get(fd)
-    if (!f) return { err: 'EBADF' }
-    if (f.kind === 'stdout') return { err: 'EBADF' }
-    if (f.kind === 'null') return null
-    if (f.kind === 'stdin' || f.kind === 'tty') {
-      if (!this.lineQueue.length) {
-        p.state = 'blocked'
-        p.readStdin = true
-        return undefined
-      }
-      const line = this.lineQueue.shift()
-      return line === null || line === undefined ? null : { bytes: UTF8_ENCODER.encode(line) }
-    }
-    const fs = this.fss.get(f.dev)!
-    if (!this.modeAllows(p, fs, f.ino, false)) return { err: 'EACCES' }
-    const size = fs.isize(f.ino)
-    if (f.pos >= size) return { bytes: new Uint8Array(0) }
-    // 机器码程序按缓冲区大小分次读取；不给长度则读到文件末尾
-    const want = len && len > 0 ? Math.min(len, size - f.pos) : size - f.pos
-    const raw = fs.readAt(f.ino, f.pos, want)
-    p.fds.seek(fd, f.pos + want)
-    return { bytes: raw }
-  }
-
-  private lowestFd(p: Process): number {
-    let fd = 3
-    while (p.fds.has(fd)) fd++
-    return fd
-  }
-
-  private sysOpen(p: Process, path: string, flags: 'r' | 'w' | 'a'): number | Err {
-    let node = this.walk(p, path)
-    if ('err' in node) {
-      if (flags === 'r' || node.err !== 'ENOENT') return node
-      const c = this.sysCreate(p, path, T_FILE)
-      if (c !== 0) return c
-      node = this.walk(p, path)
-      if ('err' in node) return node
-    }
-    const n = node as FNode
-    if (n.type === T_DIR) return { err: 'EISDIR' }
-    if (flags === 'r') {
-      if (!this.modeAllows(p, this.vfs.fsOf(n), n.ino, false)) return { err: 'EACCES' }
-    } else if (n.dev.spec.name === 'rom') return { err: 'EROFS' }
-    else if (!this.modeAllows(p, this.vfs.fsOf(n), n.ino, true)) return { err: 'EACCES' }
-    const fd = this.lowestFd(p)
-    if (n.type === T_DEV) {
-      p.fds.set(fd, n.driver === DRV_TTY ? { kind: 'tty' } : { kind: 'null' })
-      return fd
-    }
-    const fs = this.vfs.fsOf(n)
-    if (flags === 'w') {
-      fs.truncate(n.ino) // O_TRUNC：释放全部数据块，size 归零
-      this.dirty = true
-    }
-    p.fds.set(fd, {
-      kind: 'file',
-      ino: n.ino,
-      dev: n.dev.spec.name,
-      pos: flags === 'a' ? fs.isize(n.ino) : 0,
-      flags,
-    })
-    return fd
-  }
-
-  private sysDup(p: Process, from: number, to: number): number | Err {
-    const f = p.fds.get(from)
-    if (!f) return { err: 'EBADF' }
-    const fd = to > 0 ? to : this.lowestFd(p)
-    p.fds.set(fd, f)
-    return fd
-  }
-
-  // execve：读 inode → 逐块把映像拷进物理内存 → 按格式决定如何解释
-  private sysSpawn(p: Process, path: string, args: string[]): number | Err {
-    let resolved = path
-    if (!path.includes('/')) {
-      for (const dir of (p.env.PATH || '/bin:/usr/bin').split(':')) {
-        const candidate = `${dir}/${path}`
-        if (!('err' in this.vfs.resolve(candidate, p.cwd))) {
-          resolved = candidate
-          break
-        }
-      }
-    }
-    const node = this.walk(p, resolved)
-    if ('err' in node) return node
-    if (node.type === T_DIR) return { err: 'EISDIR' }
-    if (node.type === T_DEV) return { err: 'EACCES' }
-    if (!this.canExec(p, this.vfs.fsOf(node), node.ino)) return { err: 'EACCES' }
-
-    const fs = this.vfs.fsOf(node)
-    const image = fs.readBytes(node.ino) // 真实的块读取
-    const abs = normalizePath(resolved, p.cwd)
-    const blocks = fs.blocksOf(node.ino).length
-    this.log(`execve: ${abs} read ${blocks} block(s) from ${node.dev.spec.name}, ${image.length} bytes into memory`)
-
-    const text = String.fromCharCode(...image.subarray(0, 4))
-    if (isExecutable(text)) {
-      const exe = loadExe(String.fromCharCode(...image))
-      if (!exe) return { err: 'ENOEXEC' }
-      this.log(`execve: CRX image, text ${exe.textLen} B, data ${exe.dataLen} B, entry ${hexAddr(exe.entry)}`)
-      return this.launch(p, node.name, `${node.name} ${args.join(' ')}`.trim(), args, { entry: exe.entry }, exe.image, node)
-    }
-
-    const head = String.fromCharCode(...image.subarray(0, 64)).split('\n', 1)[0]
-    if (!head.startsWith('#!')) return { err: 'ENOEXEC' }
-    const interpPath = head.slice(2).trim().split(/\s+/)[0]
-    const interp = this.walk(p, interpPath)
-    if ('err' in interp || !this.canExec(p, this.vfs.fsOf(interp), interp.ino)) return { err: 'ENOEXEC' }
-    const interpRaw = this.vfs.fsOf(interp).readBytes(interp.ino)
-    const interpExe = loadExe(String.fromCharCode(...interpRaw))
-    if (!interpExe) return { err: 'ENOEXEC' }
-    this.log(`execve: ${abs} interpreted by ${interpPath}`)
-    return this.launch(
-      p,
-      basename(abs),
-      `${basename(abs)} ${args.join(' ')}`.trim(),
-      [abs, ...args],
-      { entry: interpExe.entry },
-      interpExe.image,
-      node,
-    )
-  }
-
-  private launch(
-    p: Process,
-    name: string,
-    cmd: string,
-    args: string[],
-    spec: ExecSpec,
-    image: Uint8Array,
-    file: FNode,
-  ): number | Err {
-    const setuid = (this.vfs.fsOf(file).iflags(file.ino) & M_SETUID) !== 0 ? file.uid : undefined
-    const r = this.exec(p, name, cmd, args, spec, image, setuid)
-    if ('err' in r) {
-      this.log(`fork: pid ${p.pid} (${p.name}): ${r.err === 'ENOMEM' ? 'out of physical memory' : r.err}`)
-      return { err: r.err }
-    }
-    this.log(`sched: pid ${r.pid} (${name}) forked from pid ${p.pid}, ${r.pageTable.length} pages`)
-    return r.pid
-  }
-
-  private procInfoList(): ProcInfo[] {
-    return [...this.procs.values()].map((p) => ({
-      pid: p.pid,
-      ppid: p.ppid,
-      uid: p.euid,
-      name: p.name,
-      state: p.state,
-      cmd: p.cmd,
-      pages: p.pageTable.length,
-      ticks: p.ticksUsed,
-    }))
   }
 
   // ---------- 终端 ----------
@@ -1729,7 +1283,16 @@ export class Kernel {
     this.lineBuf = ''
     const fgPid = this.foregroundPid
     const fg = fgPid !== null ? this.procs.get(fgPid) : undefined
-    if (fg && fg.pid !== this.shellPid && fg.state !== 'zombie') this.killSig(fg, 2)
+    const shell = this.procs.get(this.shellPid)
+    // 前台组可以被改写。键盘信号不能因此打到 init，也不能打到 shell 无权发信号的进程。
+    const allowed =
+      fg !== undefined &&
+      shell !== undefined &&
+      fg.pid > 1 &&
+      fg.pid !== this.shellPid &&
+      fg.state !== 'zombie' &&
+      (shell.euid === UID_ROOT || fg.euid === shell.euid || fg.uid === shell.euid)
+    if (allowed) this.killSig(fg, 2)
     else {
       this.lineQueue.push('')
       this.ttyIrqPending = true
@@ -1777,7 +1340,62 @@ export class Kernel {
   private log(msg: string, toConsole = false) {
     this.klog.push({ tick: this.ticks, msg })
     if (this.klog.length > 400) this.klog.shift()
-    if (toConsole) this.conWrite(`[${(this.ticks / this.hz).toFixed(4).padStart(9)}] ${msg}\n`, 'sys')
+    const line = `[${(this.ticks / this.hz).toFixed(4).padStart(9)}] ${msg}\n`
+    this.appendKmsg(line)
+    if (toConsole) this.conWrite(line, 'sys')
+  }
+
+  // The guest prints dmesg from this buffer. The host only records events.
+  private appendKmsg(text: string) {
+    const base = KMSG_BASE
+    const max = KMSG_SIZE - 2
+    const extra = UTF8_ENCODER.encode(text)
+    let len = this.mem.u16(base)
+    if (len > max) len = 0
+    while (len + extra.length > max && len > 0) {
+      let i = 0
+      while (i < len && this.mem.bytes[base + 2 + i] !== 10) i++
+      const cut = i < len ? i + 1 : len
+      this.mem.bytes.copyWithin(base + 2, base + 2 + cut, base + 2 + len)
+      len -= cut
+    }
+    const n = Math.min(extra.length, Math.max(0, max - len))
+    if (n > 0) this.mem.bytes.set(extra.subarray(0, n), base + 2 + len)
+    this.mem.setU16(base, len + n)
+  }
+
+  // Hardware facts for lsblk/df. CRX formats the text; this only fills the table.
+  // Record: present, removable, name[3], bs_len, model[17], bs[4], size[6],
+  // used[6], pct, blocks u16, usedBlocks u16, mount[20].
+  private publishDevinfo() {
+    for (let pfn = RESERVED_FRAME; pfn < RESERVED_FRAME + RESERVED_FRAMES; pfn++) this.mem.hold(pfn)
+    const base = DEVINFO_BASE
+    this.mem.bytes.fill(0, base, base + DEVINFO_SLOTS * DEVINFO_STRIDE)
+    let slot = 0
+    for (const d of this.blkInfo()) {
+      if (slot >= DEVINFO_SLOTS) break
+      const at = base + slot++ * DEVINFO_STRIDE
+      const b = this.mem.bytes
+      b[at] = d.present ? 1 : 0
+      b[at + 1] = d.removable ? 1 : 0
+      for (let i = 0; i < 3; i++) b[at + 2 + i] = d.name.charCodeAt(i) || 0
+      const bs = String(d.blockSize)
+      b[at + 5] = Math.min(bs.length, 4)
+      const model = d.model.padEnd(17).slice(0, 17)
+      for (let i = 0; i < 17; i++) b[at + 6 + i] = model.charCodeAt(i)
+      for (let i = 0; i < b[at + 5]; i++) b[at + 23 + i] = bs.charCodeAt(i)
+      const size = String(d.size).padStart(6).slice(-6)
+      const used = String(d.used).padStart(6).slice(-6)
+      for (let i = 0; i < 6; i++) {
+        b[at + 27 + i] = size.charCodeAt(i)
+        b[at + 33 + i] = used.charCodeAt(i)
+      }
+      b[at + 39] = d.blocks ? Math.round((d.usedBlocks / d.blocks) * 100) : 0
+      this.mem.setU16(at + 40, d.blocks)
+      this.mem.setU16(at + 42, d.usedBlocks)
+      const mount = d.present ? (d.mountpoint ?? '-') : '(no medium)'
+      for (let i = 0; i < mount.length && i < 19; i++) b[at + 44 + i] = mount.charCodeAt(i)
+    }
   }
 
   private kmsgLines(): string[] {

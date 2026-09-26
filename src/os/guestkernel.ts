@@ -28,7 +28,9 @@
 //   0x00E0..0x00FF : k_frame_bitmap (256 frames = 32 bytes)
 //   0x0100..0x0CFF : Process Control Block Table (16 PCBs x 192 bytes)
 //   0x0D00..0x0DFF : Kernel Device Scratch Page
-//   0xDA00..0xFDFF : CRX Kernel Text (PFN 218..253, physical direct map)
+//   0xA400..0xA7FF : host kmsg (u16 length, then text). Not a user page.
+//   0xA800..0xA9FF : host device catalog, 8 x 64 B. CRX formats lsblk and df.
+//   high frames    : CRX Kernel Text (KERNEL_TEXT_PAGES, physical direct map)
 //   0xFF00..0xFFFF : MMIO，不是内存
 
 export const GUEST_KERNEL_SOURCE = `.text
@@ -41,6 +43,9 @@ halt:
 ; 中断向量 0：系统调用入口 (sys 指令触发硬件特权切换进入此处)
 syscall_entry:
     cli
+    mov r4, 0
+    stw [r4+0x0046], r4 ; 块读写设备覆盖，0 表示 sda
+    stb [r4+0x0048], r4 ; 路径指针模式，0 表示用户虚拟地址
     cmp r0, 0           ; yield(2)
     je sys_yield
     cmp r0, 1           ; write(2)
@@ -87,9 +92,30 @@ syscall_entry:
     je sys_getdents
     cmp r0, 26          ; readview(kind, arg, buf)
     je sys_view
+    cmp r0, 9           ; spawn
+    je gp_spawn
+    cmp r0, 10          ; wait
+    je gp_wait
+    cmp r0, 12          ; getcwd
+    je gp_getcwd
+    cmp r0, 13          ; unlink
+    je gp_unlink
+    cmp r0, 14          ; mkdir
+    je gp_mkdir
+    cmp r0, 16          ; rename
+    je gp_rename
+    cmp r0, 18          ; getenv
+    je gp_getenv
+    cmp r0, 20          ; mount
+    je gp_mount
+    cmp r0, 21          ; umount
+    je gp_umount
+    cmp r0, 27          ; assemble，编码器仍是宿主工具链
+    je gp_assemble
+    cmp r0, 34          ; sleep seconds
+    je gp_sleep_sec
 
-    ; 其余复杂 I/O、文件系统等系统调用经特权服务桥分发
-    svc
+    mov r0, 65535
     iret
 
 ; write(fd, buf, len): 从当前 PCB 的 fd 表读取目标类型。
@@ -122,13 +148,15 @@ sys_write:
     je write_null
     cmp r6, 6           ; regular file
     jne write_bridge
-    ldb r6, [r3+42]     ; fd.device (base + fd*6 + 42)
-    cmp r6, 1           ; native path currently supports sda
-    je write_file
+    ldb r6, [r3+42]     ; fd.device
+    cmp r6, 254         ; ROM is firmware, not a writable CRFS
+    je write_file_failed
+    mov r7, 0           ; r4 is the user buffer; do not clobber it
+    stw [r7+0x0046], r6
+    jmp write_file
 
 write_bridge:
-    mov r0, 1
-    svc
+    mov r0, 65535
     iret
 
 write_stdout:
@@ -174,132 +202,9 @@ write_emit:
 write_done:
     iret
 
-; open(path, O_RDONLY): CRX 内核直接解析 sda 的 CRFS 目录与 inode 表。
-; 创建、截断、追加和 /bin ROM 挂载路径暂由兼容桥处理。
+; open(path, flags): 路径、权限和目录项都在 gp_open。
 sys_open:
-    mov r4, 0
-    stw [r4+0x0074], r1 ; original path pointer
-    cmp r2, 0
-    jne open_bridge
-
-    ; /bin is a separate ROM mount; VFS bridge handles it for now
-    uldb r5, [r1+0]
-    cmp r5, 47          ; '/'
-    jne open_relative
-    uldb r5, [r1+1]
-    cmp r5, 98          ; b
-    jne open_absolute
-    uldb r5, [r1+2]
-    cmp r5, 105         ; i
-    jne open_absolute
-    uldb r5, [r1+3]
-    cmp r5, 110         ; n
-    jne open_absolute
-    uldb r5, [r1+4]
-    cmp r5, 47
-    je open_bridge
-
-open_absolute:
-    mov r6, 1           ; root inode
-open_skip_root_slash:
-    uldb r5, [r1+0]
-    cmp r5, 47
-    jne open_component
-    add r1, 1
-    jmp open_skip_root_slash
-
-open_relative:
-    call current_pcb
-    ldb r5, [r5+22]     ; cwd device
-    cmp r5, 1           ; native resolver handles sda
-    jne open_bridge
-    call current_pcb
-    ldb r6, [r5+23]     ; cwd inode
-
-open_component:
-    uldb r5, [r1+0]
-    cmp r5, 0
-    je open_resolved
-    mov r2, r1          ; component start
-    push r1
-    mov r1, r6          ; directory inode
-    call crfs_lookup
-    pop r1
-    cmp r0, 65535
-    je open_failed
-    mov r6, r0          ; next inode
-
-open_advance:
-    uldb r5, [r1+0]
-    cmp r5, 0
-    je open_resolved
-    add r1, 1
-    cmp r5, 47
-    jne open_advance
-open_skip_slash:
-    uldb r5, [r1+0]
-    cmp r5, 47
-    jne open_component
-    add r1, 1
-    jmp open_skip_slash
-
-open_resolved:
-    ; inode type must be regular file
-    mov r5, r6
-    mul r5, 48
-    add r5, 768
-    mov r1, r5
-    call crfs_u8
-    cmp r0, 1           ; T_FILE
-    jne open_failed
-    push r6
-    mov r1, r6
-    call may_read_ino
-    pop r6
-    cmp r0, 0
-    jne open_failed
-
-    ; find free fd 3..7
-    mov r4, 3
-open_fd_scan:
-    cmp r4, 8
-    je open_failed
-    call current_pcb
-    mov r7, r4
-    mul r7, 6
-    add r5, 41
-    add r5, r7
-    ldb r0, [r5+0]
-    cmp r0, 0
-    je open_fd_found
-    add r4, 1
-    jmp open_fd_scan
-
-open_fd_found:
-    mov r0, 6           ; FK_FILE
-    stb [r5+0], r0
-    mov r0, 1           ; device sda
-    stb [r5+1], r0
-    stb [r5+2], r6      ; inode
-    mov r0, 0
-    stb [r5+3], r0      ; O_RDONLY
-    stw [r5+4], r0      ; offset 0
-    call current_pcb
-    ldb r0, [r5+40]
-    add r0, 1
-    stb [r5+40], r0
-    mov r0, r4          ; return fd
-    iret
-
-open_failed:
-    mov r0, 65535
-    iret
-open_bridge:
-    mov r4, 0
-    ldw r1, [r4+0x0074]
-    mov r0, 4
-    svc
-    iret
+    jmp gp_open
 
 ; sda regular-file write: update CRFS bitmap, inode direct pointer, data block,
 ; inode size and PCB fd offset. One syscall writes at most to the end of the
@@ -474,8 +379,21 @@ sys_read:
     cmp r4, 6           ; regular file
     jne read_bridge
     ldb r4, [r5+1]      ; device
-    cmp r4, 1           ; only sda in native CRFS driver for now
-    jne read_bridge
+    mov r6, 0
+    stw [r6+0x0046], r4
+    cmp r4, 254         ; ROM blocks are 1 KiB
+    je gp_read_wide
+    cmp r4, 1
+    je read_native
+    push r5
+    mov r1, r4
+    call vfs_setdev
+    pop r5
+    mov r6, 0
+    ldw r4, [r6+0x0042]
+    cmp r4, 1
+    jne gp_read_wide
+read_native:
 
     ; 保存 read 上下文到 KCB scratch 0x0050..
     mov r4, 0
@@ -636,15 +554,20 @@ read_failed:
     mov r0, 65535
     iret
 read_bridge:
-    mov r0, 2
-    svc
+    mov r0, 65535
     iret
 
 ; crfs_u16: read a big-endian u16 at absolute byte offset r1 from sda
 crfs_u16:
+    cmp r1, 61440       ; 回绕后的高地址不是合法元数据偏移
+    jlt crfs_u16_span
+    jmp crfs_u16_fail
+crfs_u16_span:
     mov r2, r1
     div r1, 256         ; block
     mod r2, 256         ; offset
+    cmp r2, 255         ; 一个字不能跨出暂存页
+    je crfs_u16_fail
     push r2
     call sda_read_block
     pop r2
@@ -660,6 +583,10 @@ crfs_u16_fail:
 
 ; crfs_u8: read one byte at absolute byte offset r1 from sda
 crfs_u8:
+    cmp r1, 61440
+    jlt crfs_u8_body
+    jmp crfs_u8_fail
+crfs_u8_body:
     mov r2, r1
     div r1, 256
     mod r2, 256
@@ -679,6 +606,11 @@ crfs_u8_fail:
 ; crfs_write_u8: r1=absolute byte offset, r2=value.
 crfs_write_u8:
     push r2
+    cmp r1, 61440
+    jlt crfs_write_u8_ok
+    pop r2
+    jmp crfs_write_u8_fail
+crfs_write_u8_ok:
     mov r3, r1
     div r1, 256
     mod r3, 256
@@ -699,185 +631,15 @@ crfs_write_u8_fail:
     mov r0, 65535
     ret
 
-; Return 1 when the user path starts with /bin, otherwise 0.
-is_bin_path:
-    uldb r4, [r1+0]
-    cmp r4, 47
-    jne not_bin_path
-    uldb r4, [r1+1]
-    cmp r4, 98
-    jne not_bin_path
-    uldb r4, [r1+2]
-    cmp r4, 105
-    jne not_bin_path
-    uldb r4, [r1+3]
-    cmp r4, 110
-    jne not_bin_path
-    uldb r4, [r1+4]
-    cmp r4, 0
-    je bin_path
-    cmp r4, 47
-    jne not_bin_path
-bin_path:
-    mov r0, 1
-    ret
-not_bin_path:
-    mov r0, 0
-    ret
-
-; Resolve an absolute or cwd-relative user path on sda. Returns inode or 0xffff.
-crfs_resolve:
-    uldb r5, [r1+0]
-    cmp r5, 47
-    je resolve_absolute
-    call current_pcb
-    ldb r4, [r5+22]
-    cmp r4, 1
-    jne resolve_failed
-    ldb r6, [r5+23]
-    jmp resolve_component
-resolve_absolute:
-    mov r6, 1
-resolve_skip_slash:
-    uldb r5, [r1+0]
-    cmp r5, 47
-    jne resolve_component
-    add r1, 1
-    jmp resolve_skip_slash
-resolve_component:
-    uldb r5, [r1+0]
-    cmp r5, 0
-    je resolve_done
-    mov r2, r1
-    push r1
-    mov r1, r6
-    call crfs_lookup
-    pop r1
-    cmp r0, 65535
-    je resolve_failed
-    mov r6, r0
-resolve_advance:
-    uldb r5, [r1+0]
-    cmp r5, 0
-    je resolve_done
-    add r1, 1
-    cmp r5, 47
-    jne resolve_advance
-resolve_skip_more:
-    uldb r5, [r1+0]
-    cmp r5, 47
-    jne resolve_component
-    add r1, 1
-    jmp resolve_skip_more
-resolve_done:
-    mov r0, r6
-    ret
-resolve_failed:
-    mov r0, 65535
-    ret
-
-; crfs_lookup: r1=directory inode, r2=user pointer to one path component.
-; The component ends at NUL or '/'. Returns child inode or 0xffff.
-crfs_lookup:
-    mov r4, 0
-    stw [r4+0x0076], r2 ; component pointer
-    mov r5, r1
-    mul r5, 48
-    add r5, 768         ; directory inode global offset
-    stw [r4+0x0078], r5
-
-    mov r1, r5
-    add r1, 2
-    call crfs_u16       ; directory byte size
-    cmp r0, 65535
-    je crfs_lookup_fail
-    div r0, 16          ; number of dirents
-    mov r4, 0
-    stw [r4+0x007A], r0
-    mov r3, 0           ; entry index
-
-crfs_lookup_entry:
-    mov r4, 0
-    ldw r5, [r4+0x007A]
-    cmp r3, r5
-    je crfs_lookup_fail
-
-    ; direct pointer for dirent's data block: inode+8+(entry/16)*2
-    mov r6, r3
-    div r6, 16
-    mul r6, 2
-    ldw r1, [r4+0x0078]
-    add r1, 8
-    add r1, r6
-    push r3
-    call crfs_u16
-    pop r3
-    cmp r0, 0
-    je crfs_lookup_next
-    cmp r0, 65535
-    je crfs_lookup_fail
-    mov r1, r0
-    push r3
-    call sda_read_block
-    pop r3
-    cmp r0, 0
-    jne crfs_lookup_fail
-
-    ; dirent address = scratch + (entry % 16) * 16
-    mov r5, r3
-    mod r5, 16
-    mul r5, 16
-    add r5, 0x0D00
-    ldw r6, [r5+0]      ; child inode
-    cmp r6, 0
-    je crfs_lookup_next
-    add r5, 2           ; disk name
-    mov r4, 0
-    ldw r2, [r4+0x0076] ; user component pointer
-    mov r7, 0
-
-crfs_lookup_name:
-    cmp r7, 14
-    je crfs_lookup_name_end
-    ldb r0, [r5+0]
-    uldb r1, [r2+0]
-    cmp r1, 0
-    je crfs_lookup_user_end
-    cmp r1, 47
-    je crfs_lookup_user_end
-    cmp r0, r1
-    jne crfs_lookup_next
-    add r5, 1
-    add r2, 1
-    add r7, 1
-    jmp crfs_lookup_name
-
-crfs_lookup_user_end:
-    cmp r0, 0
-    jne crfs_lookup_next
-    mov r0, r6
-    ret
-crfs_lookup_name_end:
-    uldb r1, [r2+0]
-    cmp r1, 0
-    je crfs_lookup_match
-    cmp r1, 47
-    jne crfs_lookup_next
-crfs_lookup_match:
-    mov r0, r6
-    ret
-
-crfs_lookup_next:
-    add r3, 1
-    jmp crfs_lookup_entry
-crfs_lookup_fail:
-    mov r0, 65535
-    ret
-
 ; sda_read_block: r1=block, return 0 success or 0xffff
 sda_read_block:
+    mov r4, 0
+    ldw r5, [r4+0x0046]
+    cmp r5, 0
+    jne sda_read_dev
+    mov r5, 1
+sda_read_dev:
     mov r4, 0xFE00
-    mov r5, 1           ; device 1 = sda
     stw [r4+2], r5
     stw [r4+4], r1
     mov r5, 0x0D00
@@ -895,8 +657,13 @@ sda_read_fail:
 
 ; sda_write_block: r1=block, writes scratch 0x0D00, return 0/0xffff
 sda_write_block:
-    mov r4, 0xFE00
+    mov r4, 0
+    ldw r5, [r4+0x0046]
+    cmp r5, 0
+    jne sda_write_dev
     mov r5, 1
+sda_write_dev:
+    mov r4, 0xFE00
     stw [r4+2], r5
     stw [r4+4], r1
     mov r5, 0x0D00
@@ -915,9 +682,19 @@ sda_write_fail:
 ; crfs_write_u16: r1=absolute byte offset, r2=value
 crfs_write_u16:
     push r2
+    cmp r1, 61440
+    jlt crfs_write_u16_span
+    pop r2
+    jmp crfs_write_u16_fail
+crfs_write_u16_span:
     mov r3, r1
     div r1, 256
     mod r3, 256
+    cmp r3, 255         ; 一个字不能跨出暂存页
+    jne crfs_write_u16_ok
+    pop r2
+    jmp crfs_write_u16_fail
+crfs_write_u16_ok:
     push r3
     push r1
     call sda_read_block
@@ -1024,8 +801,9 @@ vfs_setdev_found:
 vfs_setdev_done:
     ret
 
-; vfs_sector: r1 = 扇区号，读入 0x0D00。返回 0 / 0xffff。破坏 r4 r5。
+; vfs_sector: r1 = 扇区号，读入 0x0D00。返回 0 / 0xffff。保留 r4，破坏 r5。
 vfs_sector:
+    push r4
     mov r4, 0
     ldw r5, [r4+0x0040]
     mov r4, 0xFE00
@@ -1038,14 +816,20 @@ vfs_sector:
     ldw r0, [r4+8]
     cmp r0, 1
     jne vfs_sector_fail
+    pop r4
     mov r0, 0
     ret
 vfs_sector_fail:
+    pop r4
     mov r0, 65535
     ret
 
 ; vfs_u8 / vfs_u16: r1 = 设备内绝对字节偏移。破坏 r1-r5。
 vfs_u8:
+    cmp r1, 61440
+    jlt vfs_u8_body
+    jmp vfs_u_fail
+vfs_u8_body:
     mov r2, r1
     div r1, 256
     mod r2, 256
@@ -1058,9 +842,15 @@ vfs_u8:
     ldb r0, [r2+0]
     ret
 vfs_u16:
+    cmp r1, 61440
+    jlt vfs_u16_span
+    jmp vfs_u_fail
+vfs_u16_span:
     mov r2, r1
     div r1, 256
     mod r2, 256
+    cmp r2, 255
+    je vfs_u_fail
     push r2
     call vfs_sector
     pop r2
@@ -1074,23 +864,35 @@ vfs_u_fail:
     ret
 
 ; vfs_inode: r1 = inode，r0 = inode 的绝对字节偏移。破坏 r1 r4。
+; 越界时返回 0xFF00，后续 vfs_u8/vfs_u16 会拒绝，且这里不做会回绕的乘法。
 vfs_inode:
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_inode_bad
     mov r4, 0
     ldw r0, [r4+0x0042]
     mul r0, 768         ; 3 blocks
     mul r1, 48
     add r0, r1
     ret
+vfs_inode_bad:
+    mov r0, 65280
+    ret
 
 ; vfs_count: r1 = 目录 inode，r0 = 目录项个数或 0xffff。
 vfs_count:
     call vfs_inode
+    cmp r0, 65280
+    je vfs_count_bad
     mov r1, r0
     add r1, 2
     call vfs_u16
     cmp r0, 65535
     je vfs_count_done
     div r0, 16
+    ret
+vfs_count_bad:
+    mov r0, 65535
 vfs_count_done:
     ret
 
@@ -1099,7 +901,12 @@ vfs_count_done:
 vfs_dirent:
     mov r4, 0
     stw [r4+0x00B8], r3
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_dirent_fail
     call vfs_inode
+    cmp r0, 65280
+    je vfs_dirent_fail
     mov r4, 0
     ldw r5, [r4+0x0042]
     mul r5, 16          ; entries per block
@@ -1134,6 +941,18 @@ vfs_dirent:
     add r5, 0x0D00
     ldw r0, [r5+0]
     add r5, 2
+    cmp r0, 0
+    je vfs_dirent_done
+    mov r1, r0
+    push r5
+    call ino_in_range
+    pop r5
+    cmp r0, 0
+    jne vfs_dirent_skip
+    mov r0, r1
+    jmp vfs_dirent_done
+vfs_dirent_skip:
+    mov r0, 0
 vfs_dirent_done:
     ret
 vfs_dirent_fail:
@@ -1142,6 +961,9 @@ vfs_dirent_fail:
 
 ; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
 vfs_may:
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_may_no
     mov r4, 0
     stw [r4+0x00B0], r1
     stw [r4+0x00B2], r2
@@ -1167,15 +989,27 @@ vfs_may_flags:
     push r6
     ldw r1, [r4+0x00B0]
     call vfs_inode
+    cmp r0, 65280
+    je vfs_may_inode_bad
     mov r1, r0
     add r1, 1
     call vfs_u8
     pop r6
     cmp r0, 65535
     je vfs_may_no
+    mov r2, r0
+    mov r4, 0
+    ldw r1, [r4+0x00B0]
+    push r6
+    call gp_cap_flags
+    pop r6
     and r0, r6
     cmp r0, 0
     je vfs_may_no
+    jmp vfs_may_yes
+vfs_may_inode_bad:
+    pop r6
+    jmp vfs_may_no
 vfs_may_yes:
     mov r0, 0
     ret
@@ -1210,13 +1044,25 @@ vfs_lookup_entry:
     cmp r0, 65535
     je vfs_lookup_fail
     mov r4, 0
+    stw [r4+0x00B6], r0 ; child inode survives path_load
     ldw r2, [r4+0x00BE]
     mov r7, 0
 vfs_lookup_name:
     cmp r7, 14
     je vfs_lookup_name_end
     ldb r6, [r5+0]
-    uldb r1, [r2+0]
+    push r2
+    push r5
+    push r6
+    push r7
+    mov r1, r2
+    mov r2, 0
+    call path_load
+    pop r7
+    pop r6
+    pop r5
+    pop r2
+    mov r1, r0
     cmp r1, 0
     je vfs_lookup_user_end
     cmp r1, 47
@@ -1230,14 +1076,30 @@ vfs_lookup_name:
 vfs_lookup_user_end:
     cmp r6, 0
     jne vfs_lookup_entry
-    ret
+    jmp vfs_lookup_child
 vfs_lookup_name_end:
-    uldb r1, [r2+0]
+    push r0
+    push r2
+    push r5
+    mov r1, r2
+    mov r2, 0
+    call path_load
+    mov r1, r0
+    pop r5
+    pop r2
+    pop r0
     cmp r1, 0
-    je vfs_lookup_match
+    je vfs_lookup_child
     cmp r1, 47
     jne vfs_lookup_entry
-vfs_lookup_match:
+vfs_lookup_child:
+    mov r4, 0
+    ldw r0, [r4+0x00B6]
+    mov r1, r0
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_lookup_entry
+    mov r0, r1
     ret
 vfs_lookup_fail:
     mov r0, 65535
@@ -1301,7 +1163,12 @@ vfs_up_host:
     jmp vfs_cross_up
 vfs_up_parent:
     mov r1, r7
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_up_done
     call vfs_inode
+    cmp r0, 65280
+    je vfs_up_done
     mov r1, r0
     add r1, 4           ; inode.parent
     call vfs_u16
@@ -1314,12 +1181,34 @@ vfs_up_done:
 
 ; vfs_resolve: r1 = 用户态路径 (0 表示当前目录)。r0 = inode 或 0xffff，
 ; 结果所在设备留在 v_dev / v_mult。沿途每级目录都要求搜索权。
+; path_load: r1 = base, r2 = offset. Returns the path byte in r0.
+; 0x0048 is 0 for a user pointer and 1 for a kernel pointer. Preserves r1 and r2.
+path_load:
+    push r4
+    push r1
+    add r1, r2
+    mov r4, 0
+    ldb r4, [r4+0x0048]
+    cmp r4, 0
+    jne path_load_k
+    uldb r0, [r1+0]
+    pop r1
+    pop r4
+    ret
+path_load_k:
+    ldb r0, [r1+0]
+    pop r1
+    pop r4
+    ret
+
 vfs_resolve:
     mov r4, 0
     stw [r4+0x00A0], r1
     cmp r1, 0
     je vfs_resolve_cwd
-    uldb r5, [r1+0]
+    mov r2, 0
+    call path_load
+    mov r5, r0
     cmp r5, 47
     je vfs_resolve_root
 vfs_resolve_cwd:
@@ -1329,6 +1218,10 @@ vfs_resolve_cwd:
     push r6
     call vfs_setdev
     pop r6
+    mov r1, r6
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_resolve_fail
     jmp vfs_resolve_start
 vfs_resolve_root:
     mov r1, 1
@@ -1344,7 +1237,9 @@ vfs_resolve_loop:
     mov r4, 0
     ldw r1, [r4+0x00A0]
 vfs_resolve_skip:
-    uldb r5, [r1+0]
+    mov r2, 0
+    call path_load
+    mov r5, r0
     cmp r5, 47
     jne vfs_resolve_comp
     add r1, 1
@@ -1355,21 +1250,30 @@ vfs_resolve_comp:
     je vfs_resolve_done
     cmp r5, 46          ; "." and ".."
     jne vfs_resolve_name
-    uldb r5, [r1+1]
+    mov r2, 1
+    call path_load
+    mov r5, r0
     cmp r5, 0
-    je vfs_resolve_next
+    je vfs_resolve_dot
     cmp r5, 47
-    je vfs_resolve_next
+    je vfs_resolve_dot
     cmp r5, 46
     jne vfs_resolve_name
-    uldb r5, [r1+2]
+    mov r2, 2
+    call path_load
+    mov r5, r0
     cmp r5, 0
     je vfs_resolve_up
     cmp r5, 47
     je vfs_resolve_up
 vfs_resolve_name:
     ldw r1, [r4+0x00A2]
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_resolve_fail
     call vfs_inode
+    cmp r0, 65280
+    je vfs_resolve_fail
     mov r1, r0
     call vfs_u8
     cmp r0, 2           ; only directories have children
@@ -1391,13 +1295,31 @@ vfs_resolve_name:
     stw [r4+0x00A2], r0
     call vfs_cross_down
     jmp vfs_resolve_next
+vfs_resolve_dot:
+    mov r4, 0
+    ldw r1, [r4+0x00A2]
+    mov r2, 1
+    mov r3, 128
+    call vfs_may
+    cmp r0, 0
+    jne vfs_resolve_fail
+    jmp vfs_resolve_next
 vfs_resolve_up:
+    mov r4, 0
+    ldw r1, [r4+0x00A2]
+    mov r2, 1           ; "." / ".." 同样要搜索权
+    mov r3, 128
+    call vfs_may
+    cmp r0, 0
+    jne vfs_resolve_fail
     call vfs_cross_up
 vfs_resolve_next:
     mov r4, 0
     ldw r1, [r4+0x00A0]
 vfs_resolve_adv:
-    uldb r5, [r1+0]
+    mov r2, 0
+    call path_load
+    mov r5, r0
     cmp r5, 0
     je vfs_resolve_adv_done
     cmp r5, 47
@@ -1485,6 +1407,8 @@ getdents_name_end:
     ustb [r2+0], r7
     ldw r1, [r4+0x0092]
     call vfs_inode
+    cmp r0, 65280
+    je getdents_next
     mov r4, 0
     stw [r4+0x009E], r0
     mov r1, r0
@@ -1492,6 +1416,8 @@ getdents_name_end:
     push r0
     mov r4, 0
     ldw r1, [r4+0x009E]
+    cmp r1, 65280
+    je getdents_next
     add r1, 1
     call vfs_u8         ; flags
     pop r6
@@ -1515,9 +1441,8 @@ getdents_failed:
     mov r0, 65535
     iret
 
-; readview(kind, arg, buf)。第 8 类是 ls -l 的一行：
-;   类型+rwxrwxst  属主(左对齐 5)  大小(右对齐 5)  名字[/]
-; 与 stat(2) 一样只要沿途目录的搜索权。其他类仍由兼容桥格式化。
+; readview(kind, arg, buf)。第 8 类是 ls -l 的一行，其余类在 gp_view。
+; 文件行只要沿途目录的搜索权。hexdump/objdump 另外要求读权限。
 sys_view:
     mov r4, 0
     stw [r4+0x0094], r1
@@ -1551,10 +1476,17 @@ view_type_put:
     call view_putc
     ldw r1, [r4+0x0084]
     call vfs_inode
+    cmp r0, 65280
+    je view_failed
     mov r1, r0
     add r1, 1
     call vfs_u8
     mov r6, r0          ; flags, kept in r6 by view_bit
+    mov r4, 0
+    ldw r1, [r4+0x0084]
+    mov r2, r6
+    call gp_cap_flags   ; a file cannot show bits its directory lacks
+    mov r6, r0
     mov r1, 2
     mov r2, 114         ; owner r
     call view_bit
@@ -1589,11 +1521,9 @@ view_type_put:
     call vfs_u16
     cmp r0, 0
     je view_root
-    cmp r0, 1000
-    je view_user
     mov r1, r0
     mov r2, 5
-    mov r3, 1           ; left aligned
+    mov r3, 1           ; left aligned; uid 1 prints as 1, not a name
     call view_num
     jmp view_owner_done
 view_root:
@@ -1606,15 +1536,6 @@ view_root:
     mov r0, 116
     call view_putc
     jmp view_owner_pad
-view_user:
-    mov r0, 117
-    call view_putc
-    mov r0, 115
-    call view_putc
-    mov r0, 101
-    call view_putc
-    mov r0, 114
-    call view_putc
 view_owner_pad:
     mov r0, 32
     call view_putc
@@ -1625,6 +1546,8 @@ view_owner_done:
     ; size
     ldw r1, [r4+0x0084]
     call vfs_inode
+    cmp r0, 65280
+    je view_failed
     mov r1, r0
     add r1, 2
     call vfs_u16
@@ -1666,7 +1589,12 @@ view_name_host:
 view_name_parent:
     mov r4, 0
     ldw r1, [r4+0x009E]
+    call ino_in_range
+    cmp r0, 0
+    jne view_slash
     call vfs_inode
+    cmp r0, 65280
+    je view_slash
     mov r1, r0
     add r1, 4
     call vfs_u16        ; parent inode
@@ -1728,13 +1656,7 @@ view_failed:
     mov r0, 65535
     iret
 view_bridge:
-    mov r4, 0
-    ldw r1, [r4+0x0094]
-    ldw r2, [r4+0x0090]
-    ldw r3, [r4+0x0088]
-    mov r0, 26
-    svc
-    iret
+    jmp gp_view
 
 ; view_putc: r0 = 字节，写到用户缓冲区游标处。只破坏 r3 r4 (出口 r4 = 0)。
 view_putc:
@@ -1835,11 +1757,22 @@ sys_gethz:
     ldw r0, [r4+0x0024] ; r0 = k_hz
     iret
 
-; tcsetpgrp: 设置前台进程组 PID
+; tcsetpgrp: 设置前台进程组 PID。不能指向 idle/init，非 root 只能指向自己有权发信号的进程。
 sys_tcsetpgrp:
+    cmp r1, 1
+    jlt tcset_failed
+    je tcset_failed
+    push r1
+    call may_signal_pid
+    pop r1
+    cmp r0, 0
+    jne tcset_failed
     mov r4, 0
     stw [r4+0x002C], r1 ; k_fg_pid = r1
     mov r0, 0
+    iret
+tcset_failed:
+    mov r0, 65535
     iret
 
 ; clock_gettime: 返回低位 ticks
@@ -1849,100 +1782,13 @@ sys_time:
     iret
 
 ; chmod(path, set, clear): (flags | set) & ~clear & 255。
+; 非 root 不能把 setuid 位置上。inode 必须先通过范围检查，再做 48 倍乘法。
 sys_chmod:
-    mov r4, 0
-    stw [r4+0x007C], r1 ; path
-    stw [r4+0x007E], r2 ; bits to set
-    stw [r4+0x0082], r3 ; bits to clear
-    call is_bin_path
-    cmp r0, 1
-    je chmod_bridge
-    mov r4, 0
-    ldw r1, [r4+0x007C]
-    call crfs_resolve
-    cmp r0, 65535
-    je chmod_failed
-    push r0
-    mov r1, r0
-    call may_chmod_ino
-    mov r6, r0
-    pop r0
-    cmp r6, 0
-    jne chmod_failed
-    mov r4, 0           ; crfs_resolve 会改掉 r4
-    mul r0, 48
-    add r0, 769         ; inode flags absolute offset
-    stw [r4+0x0080], r0
-    mov r1, r0
-    call crfs_u8
-    cmp r0, 65535
-    je chmod_failed
-    mov r4, 0
-    ldw r2, [r4+0x007E]
-    or r0, r2
-    ldw r2, [r4+0x0082]
-    xor r2, 65535
-    and r0, r2
-    and r0, 255
-    mov r2, r0
-    ldw r1, [r4+0x0080]
-    call crfs_write_u8
-    cmp r0, 0
-    jne chmod_failed
-    mov r0, 0
-    iret
-chmod_bridge:
-    mov r4, 0
-    ldw r1, [r4+0x007C]
-    ldw r2, [r4+0x007E]
-    ldw r3, [r4+0x0082]
-    mov r0, 15
-    svc
-    iret
-chmod_failed:
-    mov r0, 65535
-    iret
+    jmp gp_chmod
 
 ; chdir(path): resolve an sda directory and store cwd device/inode in PCB.
 sys_chdir:
-    mov r4, 0
-    stw [r4+0x007C], r1
-    call is_bin_path
-    cmp r0, 1
-    je chdir_bridge
-    mov r4, 0
-    ldw r1, [r4+0x007C]
-    call crfs_resolve
-    cmp r0, 65535
-    je chdir_failed
-    mov r6, r0          ; inode
-    mov r1, r0
-    mul r1, 48
-    add r1, 768
-    call crfs_u8
-    cmp r0, 2           ; T_DIR
-    jne chdir_failed
-    push r6
-    mov r1, r6
-    call may_search_ino
-    pop r6
-    cmp r0, 0
-    jne chdir_failed
-    call current_pcb
-    mov r4, 1           ; sda device code
-    stb [r5+22], r4
-    stb [r5+23], r6
-    mov r0, 0
-    iret
-chdir_bridge:
-    mov r4, 0
-    ldw r1, [r4+0x007C]
-    mov r0, 23
-    svc
-    iret
-chdir_failed:
-    mov r0, 65535
-    iret
+    jmp gp_chdir
 
 ; sleep(ticks): 将当前 PCB 标记为 BLOCKED，记录 32 位 tick 截止值，然后调度
 ; wake deadline 存在 PCB 155..162 的低 32 位 (159..162)
@@ -2120,32 +1966,11 @@ copy_fd_done:
 ; 权限位与 src/os/fs.ts 一致：1 exec，2 owner-read，4 owner-write，8 other-read，16 other-write。
 ; uid 表在 sda 超级块偏移 32，每个 inode 一个大端 u16。euid 在 PCB+178。
 ; r1 = inode。返回 0 允许，0xffff 拒绝。会破坏 r1-r7。
-may_read_ino:
-    push r1
-    call current_euid
-    cmp r0, 0
-    je may_pop_yes
-    mov r6, r0
-    pop r1
-    push r1
-    push r6
-    mul r1, 2
-    add r1, 32
-    call crfs_u16
-    pop r6
-    pop r1
-    cmp r0, 65535
-    je may_no
-    cmp r0, r6
-    jne may_read_other
-    mov r5, 2
-    jmp may_flag
-may_read_other:
-    mov r5, 8
-    jmp may_flag
-
 may_write_ino:
     push r1
+    call ino_in_range
+    cmp r0, 0
+    jne may_pop_no
     call current_euid
     cmp r0, 0
     je may_pop_yes
@@ -2168,54 +1993,40 @@ may_write_other:
     mov r5, 16
     jmp may_flag
 
-may_search_ino:
-    push r1
-    call current_euid
-    cmp r0, 0
-    je may_pop_yes
-    mov r6, r0
-    pop r1
-    push r1
-    push r6
-    mul r1, 2
-    add r1, 32
-    call crfs_u16
-    pop r6
-    pop r1
-    cmp r0, 65535
-    je may_no
-    cmp r0, r6
-    jne may_search_other
-    mov r5, 1
-    jmp may_flag
-may_search_other:
-    mov r5, 128
-    jmp may_flag
-
-may_chmod_ino:
-    push r1
-    call current_euid
-    cmp r0, 0
-    je may_pop_yes
-    mov r6, r0
-    pop r1
-    push r1
-    push r6
-    mul r1, 2
-    add r1, 32
-    call crfs_u16
-    pop r6
-    pop r1
-    cmp r0, r6
-    je may_yes
-    jmp may_no
-
 may_flag:
     push r5
+    push r1
+    mul r1, 48
+    add r1, 768
+    mov r6, r1
+    call crfs_u8
+    mov r7, r0
+    mov r1, r6
+    add r1, 1
+    call crfs_u8
+    mov r3, r0
+    cmp r7, 1
+    jne may_flag_test
+    push r3
+    mov r1, r6
+    add r1, 4
+    call crfs_u16
+    pop r3
+    cmp r0, 0
+    je may_flag_test
+    cmp r0, 65535
+    je may_flag_test
+    push r3
+    mov r1, r0
     mul r1, 48
     add r1, 769
     call crfs_u8
+    pop r3
+    and r3, r0
+may_flag_test:
+    pop r1
     pop r5
+    mov r0, r3
     cmp r0, 65535
     je may_no
     and r0, r5
@@ -2228,8 +2039,63 @@ may_pop_yes:
     pop r1
     mov r0, 0
     ret
+may_pop_no:
+    pop r1
+    jmp may_no
 may_no:
     mov r0, 65535
+    ret
+
+; r1 = inode。0 表示 1 <= inode < 64，否则 0xffff。只改 r0。
+ino_in_range:
+    cmp r1, 0
+    je ino_range_no
+    cmp r1, 64
+    jlt ino_range_yes
+ino_range_no:
+    mov r0, 65535
+    ret
+ino_range_yes:
+    mov r0, 0
+    ret
+
+; r1 = target pid。0 允许，0xffff 拒绝。root 放行；否则目标 euid 或 uid 必须等于调用者 euid。
+; 会破坏 r0、r4-r7，保留 r1。
+may_signal_pid:
+    push r1
+    call current_euid
+    pop r1
+    cmp r0, 0
+    je may_signal_yes
+    mov r7, r0
+    mov r4, 0
+may_signal_scan:
+    cmp r4, 16
+    je may_signal_no
+    mov r5, r4
+    mul r5, 192
+    add r5, 0x0100
+    ldb r6, [r5+0]
+    cmp r6, 1
+    jne may_signal_next
+    ldw r6, [r5+2]
+    cmp r6, r1
+    je may_signal_hit
+may_signal_next:
+    add r4, 1
+    jmp may_signal_scan
+may_signal_hit:
+    ldw r6, [r5+178]
+    cmp r6, r7
+    je may_signal_yes
+    ldw r6, [r5+176]
+    cmp r6, r7
+    je may_signal_yes
+may_signal_no:
+    mov r0, 65535
+    ret
+may_signal_yes:
+    mov r0, 0
     ret
 
 current_euid:
@@ -2454,6 +2320,13 @@ page_free_failed:
 ;   0xFE00 cmd (1=read, 2=write), 0xFE02 device, 0xFE04 block,
 ;   0xFE06 buffer virtual address, 0xFE08 status
 sys_block_read:
+    push r1
+    call current_euid
+    pop r1
+    cmp r0, 0
+    jne block_failed
+    cmp r1, 254         ; rom 不能由系统调用整块读出
+    je block_failed
     mov r4, 0xFE00
     stw [r4+2], r1
     stw [r4+4], r2
@@ -2494,18 +2367,23 @@ block_failed:
 sys_kill:
     cmp r1, 0
     je kill_failed
+    cmp r1, 1
+    je kill_init_gate
+    push r1
+    push r2
+    call may_signal_pid
+    pop r2
+    pop r1
+    cmp r0, 0
+    jne kill_failed
+    jmp kill_scan
+kill_init_gate:
     push r1
     call current_euid
     pop r1
     cmp r0, 0
-    je kill_as_root
-    cmp r1, 1           ; 非 root 不能信号 init
-    je kill_failed
-    jmp kill_scan
-kill_as_root:
-    cmp r1, 1
-    jne kill_scan
-    mov r0, 22          ; current_euid 覆盖了系统调用号
+    jne kill_failed
+    mov r0, 22
     jmp kill_init
 kill_scan:
     mov r4, 0           ; r4 = slot (0..31)
@@ -2526,16 +2404,7 @@ kill_next:
     jmp kill_loop
 
 kill_target:
-    push r1
-    push r5
-    call current_euid
-    pop r5
-    pop r1
-    cmp r0, 0
-    je kill_apply
-    ldw r6, [r5+178]    ; target euid
-    cmp r6, r0
-    jne kill_failed
+    jmp kill_apply
 kill_apply:
     mov r6, 5           ; PState.ZOMBIE
     stb [r5+1], r6      ; PCB.state = ZOMBIE
@@ -2564,7 +2433,9 @@ sys_exit:
     mov r6, 5           ; ZOMBIE
     stb [r5+1], r6      ; state = ZOMBIE
     stw [r5+12], r1     ; exit code = r1
-    svc                 ; 释放映射页并回收
+    call gp_exit_book
+    mov r0, 3
+    svc                 ; 宿主只释放生成器和物理页
     iret
 
 ; 中断向量 1：时钟中断入口 (硬件定时器 IRQ 触发进入此处)

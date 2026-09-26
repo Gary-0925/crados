@@ -3,7 +3,7 @@
 //
 // 布局
 //   0    inuse        1    state        2..3  pid        4..5  ppid
-//   6..7 pc           8..9 sp           10-11 reserved   12-13 exit status
+//   6..7 pc           8..9 sp           10-11 env VA     12-13 exit status
 //   14-17 reserved                      18-19 wait for   20    stdin wait
 //   21   npages       22   cwd device   23    cwd inode  24-39 page table
 //   40   nfds         41-88 fd table (8 entries x 6 B)
@@ -78,7 +78,9 @@ export const deviceCode = (name: string): number => {
 
 export const deviceName = (code: number): string => {
   if (code === 0xfe) return 'rom'
-  return code >= 1 && code <= 26 ? `sd${String.fromCharCode(96 + code)}` : 'sda'
+  // 未知设备号不能落成 sda，否则原始块读写会读到根盘。
+  if (code >= 1 && code <= 26) return `sd${String.fromCharCode(96 + code)}`
+  return ''
 }
 
 const FK_EMPTY = 0
