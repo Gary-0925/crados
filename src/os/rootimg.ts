@@ -1,7 +1,8 @@
 // Builds the initial sda byte image from a declarative file table.
 
 import { BlockDev, SPECS } from './blockdev'
-import { applyLoginPolicy, basename, CRFS, dirname, DRV_NULL, DRV_TTY, T_DEV, T_DIR, T_FILE } from './fs'
+import { applySystemPolicy, basename, CRFS, dirname, DRV_NULL, DRV_TTY, MODE_DIR, T_DEV, T_DIR, T_FILE, UID_ROOT } from './fs'
+import { serializePasswd, factoryAccounts } from './accounts'
 import { MAN_FILES } from '../man'
 import {
   COUNT_S,
@@ -12,14 +13,16 @@ import {
 
 const LABEL = 'crados-root'
 
-const DIRS = ['/bin', '/dev', '/usr', '/usr/bin', '/usr/man', '/mnt', '/tmp', '/home', '/home/user']
+// 出厂目录树。账户系统默认只有 root，密码为空；/home 留给 useradd。
+const DIRS = ['/bin', '/dev', '/etc', '/usr', '/usr/bin', '/usr/man', '/mnt', '/tmp', '/home', '/root']
 
 const FILES: [string, string][] = [
   ...MAN_FILES,
-  ['/home/user/hello.s', HELLO_S],
-  ['/home/user/count.s', COUNT_S],
-  ['/home/user/page.s', PAGE_S],
-  ['/home/user/block.s', BLOCK_S],
+  ['/etc/passwd', serializePasswd(factoryAccounts())],
+  ['/root/hello.s', HELLO_S],
+  ['/root/count.s', COUNT_S],
+  ['/root/page.s', PAGE_S],
+  ['/root/block.s', BLOCK_S],
 ]
 
 const DEVICES: [string, number][] = [
@@ -37,6 +40,10 @@ export function buildRootImage(): RootImage {
   const fs = new CRFS(dev)
   const errors: string[] = []
   fs.format(LABEL)
+  // 系统盘的根目录是 0755：只有 root 能在 / 下建删条目。
+  // （可移动盘 format 保持 1777+sticky，当公共暂存区用。）
+  fs.setFlags(1, MODE_DIR)
+  fs.setOwner(1, UID_ROOT)
 
   const mkdirp = (path: string): number => {
     let ino = 1
@@ -81,6 +88,7 @@ export function buildRootImage(): RootImage {
     fs.setDriver(ino, driver)
   }
 
-  applyLoginPolicy(fs)
+  applySystemPolicy(fs)
+  fs.markAccounts()
   return { bytes: dev.bytes, errors }
 }

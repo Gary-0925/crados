@@ -16,7 +16,22 @@ import {
   saveDev,
   SPECS,
 } from './blockdev'
-import { applyLoginPolicy, CRFS, M_OEXEC, T_DIR, T_FILE, UID_ROOT, UID_USER, VFS } from './fs'
+import { factoryAccounts, parsePasswd, serializePasswd } from './accounts'
+import type { Account } from './accounts'
+import {
+  applySystemPolicy,
+  CRFS,
+  lookupAbs,
+  M_OEXEC,
+  M_SETUID,
+  MODE_DIR,
+  MODE_FILE,
+  MODE_TMP,
+  T_DIR,
+  T_FILE,
+  UID_ROOT,
+  VFS,
+} from './fs'
 import {
   DEVINFO_BASE,
   DEVINFO_SLOTS,
@@ -57,6 +72,7 @@ const MMIO_TTY_OUT = 0xff00
 const MMIO_TTY_ERR = 0xff01
 const MMIO_TTY_STATUS = 0xff10
 const MMIO_TTY_DATA = 0xff11
+const MMIO_TTY_MODE = 0xff12 // 0 = 关闭回显（密码输入），非 0 = 恢复
 const MMIO_BLOCK = 0xfe00
 const SECTOR_SIZE = 256
 // 挂载表：8 项 x 4 字节，CRX 内核的只读 VFS 靠它跨越挂载点
@@ -112,6 +128,8 @@ export class Kernel {
   private inputPacket: Uint8Array | null | undefined
   private inputOffset = 0
   private ttyIrqPending = false
+  // canonical tty 回显开关：密码输入时 CRX 内核通过 MMIO 0xFF12 关掉它
+  private ttyEcho = true
   // TTY 是字节设备，UTF-8 只在驱动边界解码；stream 模式能跨 write 调用保留半个字符。
   private readonly ttyDecoders = {
     out: new TextDecoder('utf-8', { fatal: false }),
@@ -270,7 +288,9 @@ export class Kernel {
       if (typeof ino !== 'number') continue
       fs.writeBytes(ino, r.bytes)
       fs.setExec(ino, true)
-      fs.setFlags(ino, fs.iflags(ino) | M_OEXEC)
+      // login/passwd 需要以 root 的有效身份写 /etc/passwd、启动登录会话
+      const setuid = name === 'login' || name === 'passwd' ? M_SETUID : 0
+      fs.setFlags(ino, fs.iflags(ino) | M_OEXEC | setuid)
       compiled++
     }
     return compiled
@@ -455,7 +475,13 @@ export class Kernel {
       }
 
       let cur = this.procs.get(this.currentPid) ?? null
-      if (!cur || cur.state !== 'running') {
+      // 客户内核的阻塞序列是「先把自己标 BLOCKED，再 do_schedule 更新
+      // kCurrentPid」。时间片边界可能正好切进这个窗口：此时 kCurrentPid
+      // 仍指向已标 BLOCKED 的当前进程。必须让它继续跑完这段原子序列
+      // （生成器会在 do_schedule 之后的 sched 处正常让出），绝不能此刻
+      // 换人——否则该生成器永远冻结在半途，readStdin/waitFor 都不会生效。
+      const midSwitch = !!cur && cur.state === 'blocked' && kCurrentPid === cur.pid
+      if ((!cur || cur.state !== 'running') && !midSwitch) {
         const next = this.pick()
         if (next) {
           for (const p of this.procs.values()) {
@@ -470,7 +496,20 @@ export class Kernel {
         }
       }
 
-      if (!cur || cur.state !== 'running') break
+      if (!cur) break
+      if (cur.state !== 'running' && !midSwitch) break
+      // 丢失唤醒补偿：输入可能在读端「查完 STATUS 为空、尚未置 readStdin」
+      // 的间隙到达，那一拍的中断会被正在内核态的读端自己收走（永远不响应），
+      // 或在扫描时读端还没挂上而被丢弃。只要还有输入且有进程阻塞在 stdin，
+      // 就重新拉起 TTY 中断，让空闲进程再扫一次并唤醒它。
+      if (!this.ttyIrqPending && (this.lineQueue.length > 0 || this.inputPacket !== undefined)) {
+        for (const p of this.procs.values()) {
+          if (p.state === 'blocked' && p.readStdin) {
+            this.ttyIrqPending = true
+            break
+          }
+        }
+      }
       if (cur.cpu && cur.cpu.pendingIrq === NO_IRQ) {
         if (this.ttyIrqPending) {
           cur.cpu.pendingIrq = VECTOR_TTY
@@ -568,7 +607,10 @@ export class Kernel {
       loadInputPacket()
       if (this.inputPacket === undefined) return 0
       if (this.inputPacket === null) return 2
-      return this.inputPacket.length === 0 ? 3 : 1
+      if (this.inputPacket.length === 0) return 3
+      // 4 = 本行只剩最后一个字节。读端凭它在行边界停住，一次 read 只拿一行，
+      // 否则排队里的多行会被拼成一条超长命令。
+      return this.inputOffset === this.inputPacket.length - 1 ? 4 : 1
     }
     const ttyData = () => {
       loadInputPacket()
@@ -693,6 +735,8 @@ export class Kernel {
       this.conWrite(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
     } else if (port === MMIO_TTY_ERR) {
       this.conWrite(this.ttyDecoders.err.decode(raw, { stream: true }), 'err')
+    } else if (port === MMIO_TTY_MODE) {
+      this.ttyEcho = (byte & 0xff) !== 0
     }
   }
 
@@ -1011,7 +1055,7 @@ export class Kernel {
     this.emit()
   }
 
-  // ---------- 凭证 ----------
+  // ---------- 凭证与账户 ----------
 
   private euidOf(pid: number): number | null {
     return this.procs.get(pid)?.euid ?? null
@@ -1020,12 +1064,100 @@ export class Kernel {
   // 旧盘没有 uid 表时补一次。已标记的盘不动，避免把用户文件改回 root。
   private ensureCreds(name: string) {
     const fs = this.fss.get(name)
-    if (!fs || !fs.valid() || fs.credsReady()) return
-    fs.seedModes()
-    applyLoginPolicy(fs)
-    fs.markCreds()
+    if (!fs || !fs.valid()) return
+    if (!fs.credsReady()) {
+      fs.seedModes()
+      applySystemPolicy(fs)
+      fs.markCreds()
+      this.dirty = true
+      this.log(`${name}: credential table written`)
+    }
+    this.ensureAccounts(name)
+  }
+
+  // 账户表只住在根盘。新盘写回出厂账户（只有 root，空密码）；
+  // 老盘把 /home/user 的属主保留为 user 账户，免得旧文件变成无主孤儿。
+  private ensureAccounts(name: string) {
+    if (name !== 'sda') return
+    const fs = this.fss.get(name)
+    if (!fs || !fs.valid() || fs.accountsReady()) return
+    if (fs.iflags(1) === MODE_TMP) fs.setFlags(1, MODE_DIR) // 根目录不该是 1777
+    for (const dir of ['home', 'root', 'etc', 'tmp']) {
+      if (lookupAbs(fs, `/${dir}`)) continue
+      const made = fs.create(1, dir, T_DIR)
+      if (typeof made !== 'number') this.log(`accounts: cannot create /${dir}: ${made.err}`)
+    }
+    const accounts = factoryAccounts()
+    const home = lookupAbs(fs, '/home')
+    if (home && fs.itype(home) === T_DIR && typeof fs.lookup(home, 'user') === 'number') {
+      // 旧盘迁移：遗留的 user 账户保持原有普通权限，不获得管理权限 a
+      accounts.push({ name: 'user', uid: 1, hash: '-', perms: 'lmbk' })
+    }
+    let ino = lookupAbs(fs, '/etc/passwd')
+    if (!ino) {
+      const etc = lookupAbs(fs, '/etc')
+      if (!etc) return
+      const made = fs.create(etc, 'passwd', T_FILE)
+      if (typeof made !== 'number') {
+        this.log(`accounts: cannot create /etc/passwd: ${made.err}`)
+        return
+      }
+      ino = made
+    }
+    fs.write(ino, serializePasswd(accounts))
+    fs.setFlags(ino, MODE_FILE) // 0644：哈希很弱，这是教学系统
+    fs.markAccounts()
     this.dirty = true
-    this.log(`${name}: credential table written, login uid ${UID_USER}`)
+    this.log(`accounts: ${accounts.length} account${accounts.length > 1 ? 's' : ''} in /etc/passwd (${accounts.map((a) => a.name).join(', ')})`)
+  }
+
+  // sda 上 /etc/passwd 的解析结果。表不存在时返回空表。
+  private accountsOf(): Account[] {
+    const fs = this.fss.get('sda')
+    if (!fs || !fs.valid()) return []
+    const ino = lookupAbs(fs, '/etc/passwd')
+    if (!ino || fs.itype(ino) !== T_FILE) return []
+    return parsePasswd(fs.read(ino))
+  }
+
+  // svc 43：账户服务，CRX 内核的权限判定统一走这里。
+  //   op 1  权限检查，arg = 字母（l/m/b/k），查当前进程 euid 对应的账户
+  //   op 2  账户查询，arg = uid → 1 普通 / 2 管理（带 a），锁定或不存在按失败
+  //   op 3  填 spawn_req 的登录环境与 home 目录（arg = spawn_req 物理地址）
+  private hwAcct(p: Process, op: number, arg: number): number | Err {
+    if (op === 1) {
+      if (p.euid === UID_ROOT) return 0
+      const letter = String.fromCharCode(arg & 0xff)
+      const acct = this.accountsOf().find((a) => a.uid === p.euid)
+      return acct && acct.perms.includes(letter) ? 0 : { err: 'EPERM' }
+    }
+    if (op === 2) {
+      const acct = this.accountsOf().find((a) => a.uid === arg)
+      if (!acct) return { err: 'ENOENT' }
+      if (acct.uid !== UID_ROOT && !acct.perms.includes('l')) return { err: 'EACCES' }
+      return acct.perms.includes('a') ? 2 : 1
+    }
+    if (op === 3) return this.fillLoginEnv(arg)
+    return { err: 'EINVAL' }
+  }
+
+  private fillLoginEnv(at: number): number | Err {
+    const uid = this.mem.u16(at + 2)
+    const acct = this.accountsOf().find((a) => a.uid === uid)
+    if (!acct) return { err: 'ENOENT' }
+    const home = acct.uid === UID_ROOT ? '/root' : `/home/${acct.name}`
+    const env = `USER\0${acct.name}\0HOME\0${home}\0PATH\0/bin:/usr/bin\0SHELL\0/bin/sh\0`
+    const bytes = UTF8_ENCODER.encode(env)
+    if (bytes.length > 80) return { err: 'E2BIG' }
+    this.mem.bytes.set(bytes, at + 186)
+    this.mem.setU16(at + 184, bytes.length)
+    const fs = this.fss.get('sda')
+    const ino = fs ? lookupAbs(fs, home) : 0
+    if (fs && ino && fs.itype(ino) === T_DIR) {
+      this.mem.bytes[at + 266] = 1
+      this.mem.bytes[at + 267] = ino
+    }
+    return 0
   }
 
   // ---------- 设备与持久化 ----------
@@ -1186,6 +1318,9 @@ export class Kernel {
       case 'hwmount':
         result = this.hwMount()
         break
+      case 'hwacct':
+        result = this.hwAcct(p, sc.op, sc.arg)
+        break
       case 'hwassemble':
         result = this.hwAssemble(sc.srcDev, sc.srcIno, sc.dstDev, sc.dstIno)
         break
@@ -1241,7 +1376,7 @@ export class Kernel {
     // 这样宿主浏览器产生的 DC1..DC4 等控制字节不会污染 argv 或文件。
     if (!ch || (ch.charCodeAt(0) < 0x20 && ch !== '\t')) return
     if (this.lineBuf.length < 256) this.lineBuf += ch
-    this.conWrite(ch, 'echo')
+    if (this.ttyEcho) this.conWrite(ch, 'echo')
     this.emit()
   }
 
@@ -1249,7 +1384,7 @@ export class Kernel {
     if (this.panic) return
     this.lineQueue.push(this.lineBuf)
     this.lineBuf = ''
-    this.conWrite('\n', 'echo')
+    if (this.ttyEcho) this.conWrite('\n', 'echo')
     this.ttyIrqPending = true
     this.emit()
   }
@@ -1257,11 +1392,13 @@ export class Kernel {
   pressBackspace() {
     if (this.panic || !this.lineBuf) return
     this.lineBuf = this.lineBuf.slice(0, -1)
-    const line = this.lines[this.lines.length - 1]
-    const seg = line?.segs[line.segs.length - 1]
-    if (seg) {
-      seg.t = seg.t.slice(0, -1)
-      if (!seg.t) line.segs.pop()
+    if (this.ttyEcho) {
+      const line = this.lines[this.lines.length - 1]
+      const seg = line?.segs[line.segs.length - 1]
+      if (seg) {
+        seg.t = seg.t.slice(0, -1)
+        if (!seg.t) line.segs.pop()
+      }
     }
     this.emit()
   }
@@ -1273,18 +1410,17 @@ export class Kernel {
       this.lineBuf = ''
     }
     this.lineQueue.push(null)
-    this.conWrite('\n', 'echo')
+    if (this.ttyEcho) this.conWrite('\n', 'echo')
     this.ttyIrqPending = true
     this.emit()
   }
 
   private maySignalFg(fg: Process, shell: Process): boolean {
-    return (
-      fg.pid > 1 &&
-      fg.pid !== this.shellPid &&
-      fg.state !== 'zombie' &&
-      (shell.euid === UID_ROOT || fg.euid === shell.euid || fg.uid === shell.euid)
-    )
+    if (!(fg.pid > 1 && fg.pid !== this.shellPid && fg.state !== 'zombie')) return false
+    if (shell.euid === UID_ROOT || fg.euid === shell.euid || fg.uid === shell.euid) return true
+    // gp_may_signal 的镜像：带 k 权限的账户可以向别的账户的进程发信号
+    const acct = this.accountsOf().find((a) => a.uid === shell.euid)
+    return !!acct && acct.perms.includes('k')
   }
 
   pressCtrlC() {

@@ -100,7 +100,7 @@ err:
 `
 
 export const BLOCK_S = `; block.s — read the sda superblock through the CRX MMIO driver
-; block_read requires euid 0, so the login shell (uid 1) is refused.
+; block_read needs the 'b' permission letter (all factory accounts have it).
 ; build: as block.s -o block      run: ./block
 .text
 _start:

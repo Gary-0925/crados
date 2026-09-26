@@ -3,7 +3,7 @@
 // 运行在 supervisor 特权模式下。
 // 内存布局 (Physical Memory Layout):
 //   0x0000..0x003F : Kernel Control Block (KCB)
-//     0x0000..0x001D : 引导标语 "crados 3.3\n"
+//     0x0000..0x001D : 引导标语 "crados 3.4\n"
 //     0x001E : k_text_pfn (u16)，用户帧扫描上界
 //     0x0020 : k_current_pid (u16)
 //     0x0022 : k_current_slot (u16)
@@ -28,13 +28,14 @@
 //   0x00E0..0x00FF : k_frame_bitmap (256 frames = 32 bytes)
 //   0x0100..0x0CFF : Process Control Block Table (16 PCBs x 192 bytes)
 //   0x0D00..0x0DFF : Kernel Device Scratch Page
-//   0xA400..0xA7FF : host kmsg (u16 length, then text). Not a user page.
-//   0xA800..0xA9FF : host device catalog, 8 x 64 B. CRX formats lsblk and df.
+//   0x0E00..0x11FF : host kmsg (u16 length, then text). Not a user page.
+//   0x1200..0x13FF : host device catalog, 8 x 64 B. CRX formats lsblk and df.
 //   high frames    : CRX Kernel Text (KERNEL_TEXT_PAGES, physical direct map)
 //   0xFF00..0xFFFF : MMIO，不是内存
 
 import { SDA_INODES } from './blockdev'
-import { M_EXEC, M_OEXEC, M_OREAD, M_READ, M_SETUID, SB_UID, UID_ROOT, UID_ROOT_NAME, UID_USER, UID_USER_NAME } from './fs'
+import { M_EXEC, M_OEXEC, M_OREAD, M_READ, M_SETUID, SB_UID, UID_ROOT, UID_ROOT_NAME } from './fs'
+import { PCB_EUID, PCB_UID } from './process'
 
 export const GUEST_KERNEL_SOURCE = `.text
 _start:
@@ -117,6 +118,14 @@ syscall_entry:
     je gp_assemble
     cmp r0, 34          ; sleep seconds
     je gp_sleep_sec
+    cmp r0, 35          ; getuid → r0 真实 uid, r1 有效 uid
+    je sys_getuid
+    cmp r0, 36          ; ttyecho(r1)：r1=0 关闭回显（密码输入），否则恢复
+    je sys_ttyecho
+    cmp r0, 38          ; spawnas(path, uid)：以账户身份启动登录 shell
+    je gp_spawnas
+    cmp r0, 39          ; chown(path, uid)
+    je gp_chown
 
     mov r0, 65535
     iret
@@ -511,6 +520,8 @@ read_tty_loop:
     cmp r0, r5
     je read_tty_done
     ldb r6, [r7+0]
+    cmp r6, 4           ; 行尾最后一字节：收下就停，别跨进下一行
+    je read_tty_last
     cmp r6, 1
     jne read_tty_done
     ldb r6, [r7+1]
@@ -518,6 +529,11 @@ read_tty_loop:
     add r4, 1
     add r0, 1
     jmp read_tty_loop
+read_tty_last:
+    ldb r6, [r7+1]
+    ustb [r4+0], r6
+    add r4, 1
+    add r0, 1
 read_tty_done:
     ; 短行必须补 NUL，否则行缓冲里上一条更长的命令会粘在后面。
     cmp r0, r5
@@ -1466,11 +1482,9 @@ view_type_put:
     call vfs_u16
     cmp r0, ${UID_ROOT}
     je view_root
-    cmp r0, ${UID_USER}
-    je view_user
     mov r1, r0
     mov r2, 5
-    mov r3, 1           ; left aligned; other uids print as numbers
+    mov r3, 1           ; left aligned; account uids print as numbers
     call view_num
     jmp view_owner_done
 view_root:
@@ -1482,18 +1496,6 @@ view_root:
     call view_putc
     mov r0, ${UID_ROOT_NAME.charCodeAt(3)}
     call view_putc
-    jmp view_owner_pad
-view_user:
-    mov r0, ${UID_USER_NAME.charCodeAt(0)}
-    call view_putc
-    mov r0, ${UID_USER_NAME.charCodeAt(1)}
-    call view_putc
-    mov r0, ${UID_USER_NAME.charCodeAt(2)}
-    call view_putc
-    mov r0, ${UID_USER_NAME.charCodeAt(3)}
-    call view_putc
-    jmp view_owner_pad
-view_owner_pad:
     mov r0, 32
     call view_putc
 view_owner_done:
@@ -1706,6 +1708,20 @@ sys_getpid:
     mul r5, 192
     add r5, 0x0100      ; r5 = PCB 物理基址
     ldw r0, [r5+2]      ; r0 = PCB.pid
+    iret
+
+; getuid: r0 = 真实 uid，r1 = 有效 uid。账户工具据此区分普通用户与管理行为。
+sys_getuid:
+    call current_pcb
+    ldw r0, [r5+${PCB_UID}]
+    ldw r1, [r5+${PCB_EUID}]
+    iret
+
+; ttyecho: r1 = 0 关闭 canonical tty 回显，其余值恢复。宿主 MMIO 0xFF12。
+sys_ttyecho:
+    mov r4, 0xFF12
+    stb [r4+0], r1
+    mov r0, 0
     iret
 
 ; gethz: 从 KCB (0x0024) 读取时钟中断频率
@@ -2155,7 +2171,8 @@ page_free_failed:
 ;   0xFE06 buffer virtual address, 0xFE08 status
 sys_block_read:
     push r1
-    call current_euid
+    mov r1, 98
+    call gp_perm_ok
     pop r1
     cmp r0, 0
     jne block_failed
@@ -2175,7 +2192,8 @@ sys_block_read:
 
 sys_block_write:
     push r1
-    call current_euid
+    mov r1, 98
+    call gp_perm_ok
     pop r1
     cmp r0, 0
     jne block_failed

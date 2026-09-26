@@ -7,16 +7,17 @@ export const FRAME_COUNT = 256
 export const FRAME_BITMAP = 0x00e0
 // 0xFF00..0xFFFF 是 MMIO，内核文本不能伸进这扇窗口。
 export const MMIO_BASE = 0xff00
-export const KERNEL_TEXT_PAGES = 84
+export const KERNEL_TEXT_PAGES = 90
 // Low physical memory stores KCB/PCBs/device scratch. The CRX kernel lives at
 // the top of RAM, outside every 16-page user virtual address space.
 //   frame 0: KCB and the 32-byte frame bitmap; frame 1..12: 16 PCBs; frame 13: scratch
-//   frame 14..168: user pages; frame 169..252: CRX kernel; frame 254..255: MMIO gap
-export const USER_FRAME_START = 14
-// Frames 164..169 are host-published tables the CRX kernel reads directly:
-// kmsg at 0xA400 (4 pages) and the device catalog at 0xA800 (2 pages).
-export const RESERVED_FRAME = 164
+//   frame 14..19: host-published tables (kmsg + device catalog)
+//   frame 20..163: user pages; frame 164..253: CRX kernel; frame 254..255: MMIO gap
+// Frames 14..19 are host-published tables the CRX kernel reads directly:
+// kmsg at 0x0E00 (4 pages) and the device catalog at 0x1200 (2 pages).
+export const RESERVED_FRAME = 14
 export const RESERVED_FRAMES = 6
+export const USER_FRAME_START = RESERVED_FRAME + RESERVED_FRAMES
 export const KMSG_BASE = RESERVED_FRAME * PAGE_SIZE
 export const KMSG_SIZE = 4 * PAGE_SIZE
 export const DEVINFO_BASE = KMSG_BASE + KMSG_SIZE

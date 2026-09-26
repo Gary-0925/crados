@@ -35,6 +35,7 @@ export type Syscall =
   | { call: 'hwexec'; at: number }
   | { call: 'hwreap'; pid: number }
   | { call: 'hwmount' }
+  | { call: 'hwacct'; op: number; arg: number }
   | { call: 'hwassemble'; srcDev: number; srcIno: number; dstDev: number; dstIno: number }
   | { call: 'hwdisasm'; at: number }
   | { call: 'mount'; dev: string; dir: string }

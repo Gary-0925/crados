@@ -20,12 +20,15 @@ holds the root tree and every program that ships with the OS.
 
     /bin        system programs, installed on sda at power-on
     /usr/man    these manuals
-    /home/user  your files, and the example sources
+    /root       root's home, and the example sources
+    /home       home directories created by useradd
     /mnt        mount point for /dev/sdb
     /tmp        scratch
     /usr/bin    where your own programs go
 
 ## First steps
+
+Log in as `root` (empty password by default), then:
 
     ls -l /bin
     cat count.s
@@ -42,9 +45,42 @@ holds the root tree and every program that ships with the OS.
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Permissions. The login shell is uid 1. 'kill 1' returns
-   EPERM. Only euid 0 may signal init, and that still panics.
-6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
+5. Accounts. The factory has one account: root, empty password.
+   Run 'useradd alice', then 'passwd alice' to set her password,
+   'exit', and log in as alice. 'users' prints the account table;
+   'chperm alice lk' changes her permission letters (drop 'l' to
+   lock the account). Only root may useradd, passwd other accounts,
+   chperm or chown.
+6. Permissions. A non-root shell cannot kill root's processes:
+   start 'sleep 60 &' as root, then try 'kill <pid>' as alice —
+   EPERM until she is granted the 'k' letter.
+7. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
+
+## Accounts and permission letters
+
+The account table lives in /etc/passwd, one line per account:
+
+    root:0:-:lmbka        name:uid:password-hash:perms
+
+The hash is the password's djb2 value in decimal; '-' means no
+password. The factory ships exactly one account: root, empty password.
+useradd creates accounts (default perms 'lmbk'), userdel removes them,
+passwd sets passwords, users prints the table.
+
+Each account carries a set of permission letters:
+
+    l   login    the account may start a console session
+    m   mount    may mount and unmount block devices
+    b   block    may read and write raw block devices
+    k   kill     may signal processes it does not own
+    a   admin    its login session runs with effective uid 0
+
+uid 0 (root) implicitly holds every letter. Dropping 'l' from any other
+account locks it out: the console refuses to start its shell. 'chperm
+<name> <letters>' rewrites the letter set, e.g. 'chperm alice lmbka'
+makes alice an admin. Only root may useradd, userdel, chperm, chown, or
+change another account's password. 'su <name>' switches user inside a
+session; root needs no password, everyone else types the target's.
 
 ## Manuals
 
