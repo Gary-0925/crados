@@ -13,7 +13,7 @@ export function Header({ kernel, ips, onReboot }: { kernel: Kernel; ips?: number
         href="https://github.com/Gary-0925/crados/blob/main/README.md"
         target="_blank"
         rel="noreferrer"
-        aria-label="View README on GitHub"
+        aria-label="view README"
         className="inline-flex items-center gap-1.5 rounded-full border border-[#30363d] bg-[#0d1117] px-2.5 py-1 text-[10px] font-medium text-[#c9d1d9] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-colors hover:border-[#8b949e] hover:text-[#f0f6fc]"
       >
         <svg viewBox="0 0 16 16" aria-hidden="true" className="h-3.5 w-3.5 fill-current">
