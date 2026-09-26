@@ -2402,6 +2402,7 @@ gp_assemble:
     mov r4, 0
     stw [r4+0x0050], r1
     stw [r4+0x0052], r2
+    stw [r4+0x007A], r2
     call vfs_resolve
     cmp r0, 65535
     je gp_fail
@@ -2433,7 +2434,8 @@ gp_assemble:
     call gp_create
     cmp r0, 0
     jne gp_fail
-    ldw r1, [r4+0x0052]
+    mov r4, 0
+    ldw r1, [r4+0x007A]
     call vfs_resolve
     cmp r0, 65535
     je gp_fail
