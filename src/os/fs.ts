@@ -141,6 +141,7 @@ export class CRFS {
     for (let b = 0; b < this.dataStart; b++) this.setBlockBit(b, true) // 元数据区预占
     const root = this.allocInode(T_DIR, 0)
     if (root !== 1) throw new Error('mkfs: root inode must be 1')
+    this.setFlags(root, MODE_TMP)
     this.markCreds()
   }
 
@@ -267,6 +268,7 @@ export class CRFS {
       if (!this.inodeUsed(ino)) continue
       const type = this.itype(ino)
       let mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
+      if (ino === 1) mode = MODE_TMP
       if (this.iexec(ino)) mode |= M_EXEC | M_OEXEC
       this.setFlags(ino, mode)
       this.setOwner(ino, UID_ROOT)

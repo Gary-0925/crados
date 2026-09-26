@@ -143,32 +143,11 @@ may_write_ino:
     pop r1
     push r1
     mul r1, ${INODE_SIZE}
-    add r1, ${ITABLE_BYTE}
-    mov r6, r1
-    call crfs_u8
-    mov r7, r0
-    mov r1, r6
-    add r1, ${I_FLAGS}
-    call crfs_u8
-    mov r3, r0
-    cmp r7, 1
-    jne may_flag_have
-    push r3
-    mov r1, r6
-    add r1, ${I_PARENT}
-    call crfs_u16
-    pop r3
-    cmp r0, 0
-    je may_flag_have
-    cmp r0, 65535
-    je may_flag_have
-    push r3
-    mov r1, r0
-    mul r1, ${INODE_SIZE}
     add r1, ${ITABLE_BYTE + I_FLAGS}
     call crfs_u8
-    pop r3
-    and r3, r0
+    mov r2, r0
+    call gp_cap_flags_sda
+    mov r3, r0
 may_flag_have:
     mov r4, 0
     pop r1
@@ -681,41 +660,84 @@ gp_dir_commit:
 
 ; r1 = inode, r2 = flags. A regular file is capped to its parent directory's flags.
 ; Directories and devices are unchanged. Returns the flags to store or test.
+; gp_cap_flags: r1 = inode, r2 = 自身 flags，返回有效 flags = 自身沿整条祖先链
+; 逐级 AND（含根目录）。任何祖先没有的位，后代就不可能有。parent 号在本
+; 文件系统里恒小于 child 号，链条一旦不单调立即视为终止，天然防环。
 gp_cap_flags:
     mov r4, 0
     stw [r4+0x0076], r1
     stw [r4+0x0078], r2
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_raw
-    mov r1, r0
-    call vfs_u8
-    cmp r0, 1
-    jne gp_cap_raw
+gp_cap_step:
     mov r4, 0
     ldw r1, [r4+0x0076]
     call vfs_inode
     cmp r0, 65280
-    je gp_cap_raw
-    add r0, 4
-    mov r1, r0
-    call vfs_u16
-    cmp r0, 0
-    je gp_cap_raw
-    cmp r0, 65535
-    je gp_cap_raw
-    mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_raw
-    add r0, 1
+    je gp_cap_done
+    add r0, ${I_FLAGS}
     mov r1, r0
     call vfs_u8
+    cmp r0, 65280
+    je gp_cap_done
     mov r4, 0
-    ldw r1, [r4+0x0078]
-    and r0, r1
+    ldw r5, [r4+0x0078]
+    and r5, r0
+    stw [r4+0x0078], r5
+    ldw r1, [r4+0x0076]
+    cmp r1, 1
+    je gp_cap_done
+    call vfs_inode
+    cmp r0, 65280
+    je gp_cap_done
+    add r0, ${I_PARENT}
+    mov r1, r0
+    call vfs_u16
+    cmp r0, 65280
+    je gp_cap_done
+    mov r4, 0
+    ldw r5, [r4+0x0076]
+    cmp r0, r5
+    je gp_cap_done
+    jgt gp_cap_done
+    stw [r4+0x0076], r0
+    jmp gp_cap_step
+gp_cap_done:
+    mov r4, 0
+    ldw r0, [r4+0x0078]
     ret
-gp_cap_raw:
+
+; gp_cap_flags_sda: 同 gp_cap_flags，但走 sda 直读视图（写路径用）。
+gp_cap_flags_sda:
+    mov r4, 0
+    stw [r4+0x0076], r1
+    stw [r4+0x0078], r2
+gp_cap_sda_step:
+    mov r4, 0
+    ldw r1, [r4+0x0076]
+    mul r1, ${INODE_SIZE}
+    add r1, ${ITABLE_BYTE + I_FLAGS}
+    call crfs_u8
+    cmp r0, 65535
+    je gp_cap_sda_done
+    mov r4, 0
+    ldw r5, [r4+0x0078]
+    and r5, r0
+    stw [r4+0x0078], r5
+    ldw r1, [r4+0x0076]
+    cmp r1, 1
+    je gp_cap_sda_done
+    mul r1, ${INODE_SIZE}
+    add r1, ${ITABLE_BYTE + I_PARENT}
+    call crfs_u16
+    cmp r0, 65535
+    je gp_cap_sda_done
+    mov r4, 0
+    ldw r5, [r4+0x0076]
+    cmp r0, r5
+    je gp_cap_sda_done
+    jgt gp_cap_sda_done
+    stw [r4+0x0076], r0
+    jmp gp_cap_sda_step
+gp_cap_sda_done:
     mov r4, 0
     ldw r0, [r4+0x0078]
     ret
