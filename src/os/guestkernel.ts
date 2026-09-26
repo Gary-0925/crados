@@ -21,10 +21,14 @@
 //     0x003A : k_pcb_size (u16 = 192)
 //     0x003C : k_quantum (u16 = 5)
 //     0x003E : k_first_user_pfn (u16 = 14)
+//   0x0040 : v_dev (u16)，只读 VFS 当前设备号
+//   0x0042 : v_mult (u16)，该设备每块的 256 B 扇区数
+//   0x0050..0x00BF : 各系统调用的暂存字
+//   0x00C0..0x00DF : 挂载表，8 项 x 4 字节 (宿主设备, 宿主 inode, 被挂设备, v_mult)
 //   0x00E0..0x00FF : k_frame_bitmap (256 frames = 32 bytes)
 //   0x0100..0x0CFF : Process Control Block Table (16 PCBs x 192 bytes)
 //   0x0D00..0x0DFF : Kernel Device Scratch Page
-//   0xE600..0xFDFF : CRX Kernel Text (PFN 230..253, physical direct map)
+//   0xDA00..0xFDFF : CRX Kernel Text (PFN 218..253, physical direct map)
 //   0xFF00..0xFFFF : MMIO，不是内存
 
 export const GUEST_KERNEL_SOURCE = `.text
@@ -79,6 +83,10 @@ syscall_entry:
     je sys_block_read
     cmp r0, 33          ; block_write(dev, block, buffer)
     je sys_block_write
+    cmp r0, 11          ; getdents(path, buf, max)
+    je sys_getdents
+    cmp r0, 26          ; readview(kind, arg, buf)
+    je sys_view
 
     ; 其余复杂 I/O、文件系统等系统调用经特权服务桥分发
     svc
@@ -983,6 +991,820 @@ crfs_alloc_commit:
     ret
 crfs_alloc_fail:
     mov r0, 65535
+    ret
+
+; ---------------------------------------------------------------------------
+; 只读 VFS：ls 用到的 getdents(2) 与 readview(8) 全部在这里用机器码完成。
+; 与上面只认 sda 的 crfs_* 不同，它按设备工作：
+;   0x0040 v_dev   当前设备号 (1 = sda, 2 = sdb…, 0xfe = rom)
+;   0x0042 v_mult  该设备一块有几个 256 B 扇区 (sda 1, rom 4)
+;   0x00C0..0x00DF 挂载表，8 项 x 4 字节：宿主设备、宿主 inode、被挂设备、v_mult
+; 块控制器命令 6 按 256 B 扇区搬运，所以 1 KiB 块的 ROM 也能读进一页暂存区。
+; inode 表总在第 3 块，每个 inode 48 字节；目录项 16 字节；uid 表在超级块偏移 32。
+
+; vfs_setdev: r1 = 设备号。v_mult 取自挂载表，找不到按 1。破坏 r4 r5。
+vfs_setdev:
+    mov r4, 0
+    stw [r4+0x0040], r1
+    mov r5, 1
+    stw [r4+0x0042], r5
+    mov r4, 0x00C0
+vfs_setdev_scan:
+    cmp r4, 0x00E0
+    je vfs_setdev_done
+    ldb r5, [r4+2]
+    cmp r5, r1
+    je vfs_setdev_found
+    add r4, 4
+    jmp vfs_setdev_scan
+vfs_setdev_found:
+    ldb r5, [r4+3]
+    mov r4, 0
+    stw [r4+0x0042], r5
+vfs_setdev_done:
+    ret
+
+; vfs_sector: r1 = 扇区号，读入 0x0D00。返回 0 / 0xffff。破坏 r4 r5。
+vfs_sector:
+    mov r4, 0
+    ldw r5, [r4+0x0040]
+    mov r4, 0xFE00
+    stw [r4+2], r5
+    stw [r4+4], r1
+    mov r5, 0x0D00
+    stw [r4+6], r5
+    mov r5, 6           ; command 6 = READ one 256-byte sector
+    stw [r4+0], r5
+    ldw r0, [r4+8]
+    cmp r0, 1
+    jne vfs_sector_fail
+    mov r0, 0
+    ret
+vfs_sector_fail:
+    mov r0, 65535
+    ret
+
+; vfs_u8 / vfs_u16: r1 = 设备内绝对字节偏移。破坏 r1-r5。
+vfs_u8:
+    mov r2, r1
+    div r1, 256
+    mod r2, 256
+    push r2
+    call vfs_sector
+    pop r2
+    cmp r0, 0
+    jne vfs_u_fail
+    add r2, 0x0D00
+    ldb r0, [r2+0]
+    ret
+vfs_u16:
+    mov r2, r1
+    div r1, 256
+    mod r2, 256
+    push r2
+    call vfs_sector
+    pop r2
+    cmp r0, 0
+    jne vfs_u_fail
+    add r2, 0x0D00
+    ldw r0, [r2+0]
+    ret
+vfs_u_fail:
+    mov r0, 65535
+    ret
+
+; vfs_inode: r1 = inode，r0 = inode 的绝对字节偏移。破坏 r1 r4。
+vfs_inode:
+    mov r4, 0
+    ldw r0, [r4+0x0042]
+    mul r0, 768         ; 3 blocks
+    mul r1, 48
+    add r0, r1
+    ret
+
+; vfs_count: r1 = 目录 inode，r0 = 目录项个数或 0xffff。
+vfs_count:
+    call vfs_inode
+    mov r1, r0
+    add r1, 2
+    call vfs_u16
+    cmp r0, 65535
+    je vfs_count_done
+    div r0, 16
+vfs_count_done:
+    ret
+
+; vfs_dirent: r1 = 目录 inode，r3 = 项序号。
+; r0 = 子 inode (0 空槽，0xffff 出错)，r5 指向暂存区里 14 字节的名字。
+vfs_dirent:
+    mov r4, 0
+    stw [r4+0x00B8], r3
+    call vfs_inode
+    mov r4, 0
+    ldw r5, [r4+0x0042]
+    mul r5, 16          ; entries per block
+    stw [r4+0x00BA], r5
+    ldw r3, [r4+0x00B8]
+    div r3, r5
+    mul r3, 2
+    mov r1, r0
+    add r1, 8           ; ptr[entry / per_block]
+    add r1, r3
+    call vfs_u16
+    cmp r0, 0
+    je vfs_dirent_done
+    cmp r0, 65535
+    je vfs_dirent_done
+    mov r4, 0
+    ldw r5, [r4+0x0042]
+    mul r0, r5          ; first sector of that block
+    ldw r3, [r4+0x00B8]
+    ldw r5, [r4+0x00BA]
+    mod r3, r5
+    div r3, 16          ; sector inside the block
+    add r0, r3
+    mov r1, r0
+    call vfs_sector
+    cmp r0, 0
+    jne vfs_dirent_fail
+    mov r4, 0
+    ldw r5, [r4+0x00B8]
+    mod r5, 16
+    mul r5, 16
+    add r5, 0x0D00
+    ldw r0, [r5+0]
+    add r5, 2
+vfs_dirent_done:
+    ret
+vfs_dirent_fail:
+    mov r0, 65535
+    ret
+
+; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
+vfs_may:
+    mov r4, 0
+    stw [r4+0x00B0], r1
+    stw [r4+0x00B2], r2
+    stw [r4+0x00B4], r3
+    call current_euid
+    cmp r0, 0
+    je vfs_may_yes
+    mov r4, 0
+    stw [r4+0x00B6], r0
+    ldw r1, [r4+0x00B0]
+    mul r1, 2
+    add r1, 32
+    call vfs_u16        ; owner uid
+    cmp r0, 65535
+    je vfs_may_no
+    mov r4, 0
+    ldw r6, [r4+0x00B4]
+    ldw r5, [r4+0x00B6]
+    cmp r0, r5
+    jne vfs_may_flags
+    ldw r6, [r4+0x00B2]
+vfs_may_flags:
+    push r6
+    ldw r1, [r4+0x00B0]
+    call vfs_inode
+    mov r1, r0
+    add r1, 1
+    call vfs_u8
+    pop r6
+    cmp r0, 65535
+    je vfs_may_no
+    and r0, r6
+    cmp r0, 0
+    je vfs_may_no
+vfs_may_yes:
+    mov r0, 0
+    ret
+vfs_may_no:
+    mov r0, 65535
+    ret
+
+; vfs_lookup: r1 = 目录 inode，r2 = 用户态路径分量 (以 NUL 或 / 结束)。
+vfs_lookup:
+    mov r4, 0
+    stw [r4+0x00BC], r1
+    stw [r4+0x00BE], r2
+    call vfs_count
+    cmp r0, 65535
+    je vfs_lookup_fail
+    mov r4, 0
+    stw [r4+0x00AA], r0
+    stw [r4+0x00A8], r4
+vfs_lookup_entry:
+    mov r4, 0
+    ldw r3, [r4+0x00A8]
+    ldw r5, [r4+0x00AA]
+    cmp r3, r5
+    je vfs_lookup_fail
+    add r3, 1
+    stw [r4+0x00A8], r3
+    sub r3, 1
+    ldw r1, [r4+0x00BC]
+    call vfs_dirent
+    cmp r0, 0
+    je vfs_lookup_entry
+    cmp r0, 65535
+    je vfs_lookup_fail
+    mov r4, 0
+    ldw r2, [r4+0x00BE]
+    mov r7, 0
+vfs_lookup_name:
+    cmp r7, 14
+    je vfs_lookup_name_end
+    ldb r6, [r5+0]
+    uldb r1, [r2+0]
+    cmp r1, 0
+    je vfs_lookup_user_end
+    cmp r1, 47
+    je vfs_lookup_user_end
+    cmp r6, r1
+    jne vfs_lookup_entry
+    add r5, 1
+    add r2, 1
+    add r7, 1
+    jmp vfs_lookup_name
+vfs_lookup_user_end:
+    cmp r6, 0
+    jne vfs_lookup_entry
+    ret
+vfs_lookup_name_end:
+    uldb r1, [r2+0]
+    cmp r1, 0
+    je vfs_lookup_match
+    cmp r1, 47
+    jne vfs_lookup_entry
+vfs_lookup_match:
+    ret
+vfs_lookup_fail:
+    mov r0, 65535
+    ret
+
+; vfs_cross_down: 当前 (v_dev, 0x00A2) 若是挂载点，换到被挂设备的根。
+vfs_cross_down:
+    mov r4, 0
+    ldw r6, [r4+0x0040]
+    ldw r7, [r4+0x00A2]
+    mov r4, 0x00C0
+vfs_down_scan:
+    cmp r4, 0x00E0
+    je vfs_down_done
+    ldb r5, [r4+2]
+    cmp r5, 0
+    je vfs_down_next
+    ldb r5, [r4+0]
+    cmp r5, r6
+    jne vfs_down_next
+    ldb r5, [r4+1]
+    cmp r5, r7
+    jne vfs_down_next
+    ldb r5, [r4+2]
+    ldb r6, [r4+3]
+    mov r4, 0
+    stw [r4+0x0040], r5
+    stw [r4+0x0042], r6
+    mov r5, 1
+    stw [r4+0x00A2], r5
+vfs_down_done:
+    ret
+vfs_down_next:
+    add r4, 4
+    jmp vfs_down_scan
+
+; vfs_cross_up: 0x00A2 换成父目录。被挂设备的根向上回到宿主挂载点的父目录。
+vfs_cross_up:
+    mov r4, 0
+    ldw r7, [r4+0x00A2]
+    cmp r7, 1
+    jne vfs_up_parent
+    ldw r6, [r4+0x0040]
+    mov r4, 0x00C0
+vfs_up_scan:
+    cmp r4, 0x00E0
+    je vfs_up_done      ; 根盘的根：.. 还是自己
+    ldb r5, [r4+2]
+    cmp r5, r6
+    je vfs_up_host
+    add r4, 4
+    jmp vfs_up_scan
+vfs_up_host:
+    ldb r1, [r4+0]
+    ldb r7, [r4+1]
+    push r7
+    call vfs_setdev
+    pop r7
+    mov r4, 0
+    stw [r4+0x00A2], r7
+    jmp vfs_cross_up
+vfs_up_parent:
+    mov r1, r7
+    call vfs_inode
+    mov r1, r0
+    add r1, 4           ; inode.parent
+    call vfs_u16
+    cmp r0, 65535
+    je vfs_up_done
+    mov r4, 0
+    stw [r4+0x00A2], r0
+vfs_up_done:
+    ret
+
+; vfs_resolve: r1 = 用户态路径 (0 表示当前目录)。r0 = inode 或 0xffff，
+; 结果所在设备留在 v_dev / v_mult。沿途每级目录都要求搜索权。
+vfs_resolve:
+    mov r4, 0
+    stw [r4+0x00A0], r1
+    cmp r1, 0
+    je vfs_resolve_cwd
+    uldb r5, [r1+0]
+    cmp r5, 47
+    je vfs_resolve_root
+vfs_resolve_cwd:
+    call current_pcb
+    ldb r1, [r5+22]     ; cwd device
+    ldb r6, [r5+23]     ; cwd inode
+    push r6
+    call vfs_setdev
+    pop r6
+    jmp vfs_resolve_start
+vfs_resolve_root:
+    mov r1, 1
+    call vfs_setdev
+    mov r6, 1
+vfs_resolve_start:
+    mov r4, 0
+    stw [r4+0x00A2], r6
+    ldw r1, [r4+0x00A0]
+    cmp r1, 0
+    je vfs_resolve_done
+vfs_resolve_loop:
+    mov r4, 0
+    ldw r1, [r4+0x00A0]
+vfs_resolve_skip:
+    uldb r5, [r1+0]
+    cmp r5, 47
+    jne vfs_resolve_comp
+    add r1, 1
+    jmp vfs_resolve_skip
+vfs_resolve_comp:
+    stw [r4+0x00A0], r1
+    cmp r5, 0
+    je vfs_resolve_done
+    cmp r5, 46          ; "." and ".."
+    jne vfs_resolve_name
+    uldb r5, [r1+1]
+    cmp r5, 0
+    je vfs_resolve_next
+    cmp r5, 47
+    je vfs_resolve_next
+    cmp r5, 46
+    jne vfs_resolve_name
+    uldb r5, [r1+2]
+    cmp r5, 0
+    je vfs_resolve_up
+    cmp r5, 47
+    je vfs_resolve_up
+vfs_resolve_name:
+    ldw r1, [r4+0x00A2]
+    call vfs_inode
+    mov r1, r0
+    call vfs_u8
+    cmp r0, 2           ; only directories have children
+    jne vfs_resolve_fail
+    mov r4, 0
+    ldw r1, [r4+0x00A2]
+    mov r2, 1           ; owner exec
+    mov r3, 128         ; other exec
+    call vfs_may
+    cmp r0, 0
+    jne vfs_resolve_fail
+    mov r4, 0
+    ldw r1, [r4+0x00A2]
+    ldw r2, [r4+0x00A0]
+    call vfs_lookup
+    cmp r0, 65535
+    je vfs_resolve_fail
+    mov r4, 0
+    stw [r4+0x00A2], r0
+    call vfs_cross_down
+    jmp vfs_resolve_next
+vfs_resolve_up:
+    call vfs_cross_up
+vfs_resolve_next:
+    mov r4, 0
+    ldw r1, [r4+0x00A0]
+vfs_resolve_adv:
+    uldb r5, [r1+0]
+    cmp r5, 0
+    je vfs_resolve_adv_done
+    cmp r5, 47
+    je vfs_resolve_adv_done
+    add r1, 1
+    jmp vfs_resolve_adv
+vfs_resolve_adv_done:
+    stw [r4+0x00A0], r1
+    jmp vfs_resolve_loop
+vfs_resolve_done:
+    mov r4, 0
+    ldw r0, [r4+0x00A2]
+    ret
+vfs_resolve_fail:
+    mov r0, 65535
+    ret
+
+; getdents(path, buf, max): 每项 16 字节，15 字节 NUL 补齐的名字 + 1 字节类型。
+; 类型字节低两位 1 文件 2 目录 3 设备，bit2 是属主执行位。需要目录的读权限。
+sys_getdents:
+    mov r4, 0
+    stw [r4+0x0086], r2 ; user cursor
+    stw [r4+0x0088], r3 ; max records
+    call vfs_resolve
+    cmp r0, 65535
+    je getdents_failed
+    mov r4, 0
+    stw [r4+0x0084], r0
+    mov r1, r0
+    call vfs_inode
+    mov r1, r0
+    call vfs_u8
+    cmp r0, 2
+    jne getdents_failed
+    mov r4, 0
+    ldw r1, [r4+0x0084]
+    mov r2, 2           ; owner read
+    mov r3, 8           ; other read
+    call vfs_may
+    cmp r0, 0
+    jne getdents_failed
+    mov r4, 0
+    ldw r1, [r4+0x0084]
+    call vfs_count
+    cmp r0, 65535
+    je getdents_failed
+    mov r4, 0
+    stw [r4+0x008C], r0 ; entries in the directory
+    stw [r4+0x008A], r4 ; next entry
+    stw [r4+0x008E], r4 ; records emitted
+getdents_next:
+    mov r4, 0
+    ldw r5, [r4+0x008E]
+    ldw r6, [r4+0x0088]
+    cmp r5, r6
+    je getdents_done
+    ldw r3, [r4+0x008A]
+    ldw r5, [r4+0x008C]
+    cmp r3, r5
+    je getdents_done
+    add r3, 1
+    stw [r4+0x008A], r3
+    sub r3, 1
+    ldw r1, [r4+0x0084]
+    call vfs_dirent
+    cmp r0, 0
+    je getdents_next
+    cmp r0, 65535
+    je getdents_failed
+    mov r4, 0
+    stw [r4+0x0092], r0 ; child inode
+    ldw r2, [r4+0x0086]
+    mov r6, 0
+getdents_name:
+    cmp r6, 14
+    je getdents_name_end
+    ldb r7, [r5+0]
+    ustb [r2+0], r7
+    add r5, 1
+    add r2, 1
+    add r6, 1
+    jmp getdents_name
+getdents_name_end:
+    mov r7, 0
+    ustb [r2+0], r7
+    ldw r1, [r4+0x0092]
+    call vfs_inode
+    mov r4, 0
+    stw [r4+0x009E], r0
+    mov r1, r0
+    call vfs_u8         ; type
+    push r0
+    mov r4, 0
+    ldw r1, [r4+0x009E]
+    add r1, 1
+    call vfs_u8         ; flags
+    pop r6
+    and r0, 1
+    mul r0, 4
+    or r6, r0
+    mov r4, 0
+    ldw r2, [r4+0x0086]
+    ustb [r2+15], r6
+    add r2, 16
+    stw [r4+0x0086], r2
+    ldw r5, [r4+0x008E]
+    add r5, 1
+    stw [r4+0x008E], r5
+    jmp getdents_next
+getdents_done:
+    mov r4, 0
+    ldw r0, [r4+0x008E]
+    iret
+getdents_failed:
+    mov r0, 65535
+    iret
+
+; readview(kind, arg, buf)。第 8 类是 ls -l 的一行：
+;   类型+rwxrwxst  属主(左对齐 5)  大小(右对齐 5)  名字[/]
+; 与 stat(2) 一样只要沿途目录的搜索权。其他类仍由兼容桥格式化。
+sys_view:
+    mov r4, 0
+    stw [r4+0x0094], r1
+    stw [r4+0x0090], r2
+    stw [r4+0x0086], r3 ; user cursor
+    stw [r4+0x0088], r3 ; user buffer start
+    cmp r1, 8
+    jne view_bridge
+    mov r1, r2
+    call vfs_resolve
+    cmp r0, 65535
+    je view_failed
+    mov r4, 0
+    stw [r4+0x0084], r0
+    mov r1, r0
+    call vfs_inode
+    mov r1, r0
+    call vfs_u8
+    mov r4, 0
+    stw [r4+0x0092], r0 ; type, needed for the trailing /
+    mov r6, r0
+    mov r0, 45          ; -
+    cmp r6, 2
+    jne view_type_dev
+    mov r0, 100         ; d
+view_type_dev:
+    cmp r6, 3
+    jne view_type_put
+    mov r0, 99          ; c
+view_type_put:
+    call view_putc
+    ldw r1, [r4+0x0084]
+    call vfs_inode
+    mov r1, r0
+    add r1, 1
+    call vfs_u8
+    mov r6, r0          ; flags, kept in r6 by view_bit
+    mov r1, 2
+    mov r2, 114         ; owner r
+    call view_bit
+    mov r1, 4
+    mov r2, 119         ; owner w
+    call view_bit
+    mov r1, 1
+    mov r2, 120         ; owner x
+    call view_bit
+    mov r1, 8
+    mov r2, 114         ; other r
+    call view_bit
+    mov r1, 16
+    mov r2, 119         ; other w
+    call view_bit
+    mov r1, 128
+    mov r2, 120         ; other x
+    call view_bit
+    mov r1, 32
+    mov r2, 115         ; setuid
+    call view_bit
+    mov r1, 64
+    mov r2, 116         ; sticky
+    call view_bit
+    mov r0, 32
+    call view_putc
+
+    ; owner: uid table in the superblock of the same device
+    ldw r1, [r4+0x0084]
+    mul r1, 2
+    add r1, 32
+    call vfs_u16
+    cmp r0, 0
+    je view_root
+    cmp r0, 1000
+    je view_user
+    mov r1, r0
+    mov r2, 5
+    mov r3, 1           ; left aligned
+    call view_num
+    jmp view_owner_done
+view_root:
+    mov r0, 114
+    call view_putc
+    mov r0, 111
+    call view_putc
+    mov r0, 111
+    call view_putc
+    mov r0, 116
+    call view_putc
+    jmp view_owner_pad
+view_user:
+    mov r0, 117
+    call view_putc
+    mov r0, 115
+    call view_putc
+    mov r0, 101
+    call view_putc
+    mov r0, 114
+    call view_putc
+view_owner_pad:
+    mov r0, 32
+    call view_putc
+view_owner_done:
+    mov r0, 32
+    call view_putc
+
+    ; size
+    ldw r1, [r4+0x0084]
+    call vfs_inode
+    mov r1, r0
+    add r1, 2
+    call vfs_u16
+    mov r1, r0
+    mov r2, 5
+    mov r3, 0           ; right aligned
+    call view_num
+    mov r0, 32
+    call view_putc
+
+    ; name: find this inode in its parent directory. A mounted root takes
+    ; the name of its mount point; the root of sda is "/".
+    ldw r7, [r4+0x0084]
+    stw [r4+0x009E], r7
+    cmp r7, 1
+    jne view_name_parent
+    ldw r6, [r4+0x0040]
+    mov r4, 0x00C0
+view_name_mnt:
+    cmp r4, 0x00E0
+    je view_name_root
+    ldb r5, [r4+2]
+    cmp r5, r6
+    je view_name_host
+    add r4, 4
+    jmp view_name_mnt
+view_name_root:
+    mov r0, 47
+    call view_putc
+    jmp view_end
+view_name_host:
+    ldb r1, [r4+0]
+    ldb r7, [r4+1]
+    push r7
+    call vfs_setdev
+    pop r7
+    mov r4, 0
+    stw [r4+0x009E], r7
+view_name_parent:
+    mov r4, 0
+    ldw r1, [r4+0x009E]
+    call vfs_inode
+    mov r1, r0
+    add r1, 4
+    call vfs_u16        ; parent inode
+    cmp r0, 65535
+    je view_slash
+    mov r4, 0
+    stw [r4+0x0084], r0
+    mov r1, r0
+    call vfs_count
+    cmp r0, 65535
+    je view_slash
+    mov r4, 0
+    stw [r4+0x008C], r0
+    stw [r4+0x008A], r4
+view_name_entry:
+    mov r4, 0
+    ldw r3, [r4+0x008A]
+    ldw r5, [r4+0x008C]
+    cmp r3, r5
+    je view_slash
+    add r3, 1
+    stw [r4+0x008A], r3
+    sub r3, 1
+    ldw r1, [r4+0x0084]
+    call vfs_dirent
+    mov r4, 0
+    ldw r7, [r4+0x009E]
+    cmp r0, r7
+    jne view_name_entry
+    mov r6, 0
+view_name_copy:
+    cmp r6, 14
+    je view_slash
+    ldb r0, [r5+0]
+    cmp r0, 0
+    je view_slash
+    call view_putc
+    add r5, 1
+    add r6, 1
+    jmp view_name_copy
+view_slash:
+    mov r4, 0
+    ldw r6, [r4+0x0092]
+    cmp r6, 2
+    jne view_end
+    mov r0, 47
+    call view_putc
+view_end:
+    mov r0, 10
+    call view_putc
+    ldw r3, [r4+0x0086]
+    mov r0, 0
+    ustb [r3+0], r0     ; NUL after the line, not counted
+    ldw r0, [r4+0x0088]
+    sub r3, r0
+    mov r0, r3
+    iret
+view_failed:
+    mov r0, 65535
+    iret
+view_bridge:
+    mov r4, 0
+    ldw r1, [r4+0x0094]
+    ldw r2, [r4+0x0090]
+    ldw r3, [r4+0x0088]
+    mov r0, 26
+    svc
+    iret
+
+; view_putc: r0 = 字节，写到用户缓冲区游标处。只破坏 r3 r4 (出口 r4 = 0)。
+view_putc:
+    mov r4, 0
+    ldw r3, [r4+0x0086]
+    ustb [r3+0], r0
+    add r3, 1
+    stw [r4+0x0086], r3
+    ret
+
+; view_bit: r6 = flags，r1 = 掩码，r2 = 置位时的字符，否则 '-'
+view_bit:
+    mov r0, r6
+    and r0, r1
+    cmp r0, 0
+    je view_bit_dash
+    mov r0, r2
+    jmp view_putc
+view_bit_dash:
+    mov r0, 45
+    jmp view_putc
+
+; view_num: r1 = 值，r2 = 宽度，r3 = 0 右对齐 / 1 左对齐
+view_num:
+    mov r4, 0
+    stw [r4+0x009C], r3
+    mov r7, 0x0096
+    mov r6, 0
+view_num_digit:
+    mov r5, r1
+    mod r5, 10
+    add r5, 48
+    stb [r7+0], r5
+    add r7, 1
+    add r6, 1
+    div r1, 10
+    cmp r1, 0
+    jne view_num_digit
+    sub r2, r6
+    mov r4, 0
+    ldw r3, [r4+0x009C]
+    cmp r3, 0
+    jne view_num_out
+    call view_pad
+view_num_out:
+    cmp r6, 0
+    je view_num_tail
+    sub r7, 1
+    ldb r0, [r7+0]
+    call view_putc
+    sub r6, 1
+    jmp view_num_out
+view_num_tail:
+    mov r4, 0
+    ldw r3, [r4+0x009C]
+    cmp r3, 0
+    je view_num_done
+    call view_pad
+view_num_done:
+    ret
+
+; view_pad: 输出 r2 个空格
+view_pad:
+    cmp r2, 0
+    je view_pad_done
+    mov r0, 32
+    call view_putc
+    sub r2, 1
+    jmp view_pad
+view_pad_done:
     ret
 
 ; yield: 让出当前时间片，触发轮转调度

@@ -640,20 +640,37 @@ err:
     .asciz "cat: cannot open file\\n"
 `,
 
-  ls: `; ls — list a directory through getdents(2)
+  ls: `; ls — list a directory through getdents(2), syscall 11
+; -l asks readview(2) kind 8 (syscall 26) for mode, owner, size and name per entry.
+; Both are served by the CRX kernel (sys_getdents, sys_view); nothing reaches TypeScript.
 .text
 _start:
     mov r4, dot
-    cmp r1, 0
-    je fetch
-    mov r5, r2          ; skip option words, take the first real argument
+    mov r3, 0           ; set once a path argument has been taken
+    mov r5, r2
     mov r6, r1
 scan:
     cmp r6, 0
     je fetch
     ldb r7, [r5+0]
     cmp r7, 45
-    jne take
+    je optword
+    cmp r3, 0
+    jne skipword
+    mov r4, r5          ; the first non-option word is the path
+    mov r3, 1
+    jmp skipword
+optword:
+    add r5, 1
+    ldb r7, [r5+0]
+    cmp r7, 0
+    je skipped
+    cmp r7, 108         ; 'l'
+    jne optword
+    mov r0, lflag
+    mov r7, 1
+    stb [r0+0], r7
+    jmp optword
 skipword:
     ldb r7, [r5+0]
     cmp r7, 0
@@ -664,19 +681,21 @@ skipped:
     add r5, 1
     sub r6, 1
     jmp scan
-take:
-    mov r4, r5
 fetch:
     mov r0, 11
     mov r1, r4
     mov r2, buf
-    mov r3, 24
+    mov r3, 48
     sys
     cmp r0, 65535
-    je failed
+    je notdir
     mov r5, r0
     mov r6, 0
     mov r7, buf
+    mov r0, lflag
+    ldb r0, [r0+0]
+    cmp r0, 0
+    jne longlist
 each:
     cmp r6, r5
     je done
@@ -701,6 +720,86 @@ done:
     sys
     mov r1, 0
     hlt
+
+; ls -l: build "dir/name" for every record and ask the kernel for its line
+longlist:
+    cmp r6, r5
+    je lldone
+    mov r1, pbuf
+    mov r2, r4
+    mov r3, 0           ; last byte copied
+cpdir:
+    ldb r0, [r2+0]
+    cmp r0, 0
+    je dirend
+    stb [r1+0], r0
+    mov r3, r0
+    add r1, 1
+    add r2, 1
+    jmp cpdir
+dirend:
+    cmp r3, 47          ; already ends in '/'
+    je cpname
+    mov r0, 47
+    stb [r1+0], r0
+    add r1, 1
+cpname:
+    mov r2, r7
+cpnext:
+    ldb r0, [r2+0]
+    stb [r1+0], r0
+    cmp r0, 0
+    je built
+    add r1, 1
+    add r2, 1
+    jmp cpnext
+built:
+    mov r1, pbuf
+    call statline
+    add r7, 16
+    add r6, 1
+    jmp longlist
+lldone:
+    mov r1, 0
+    hlt
+
+; not a directory: plain ls fails, ls -l describes the file itself
+notdir:
+    mov r0, lflag
+    ldb r0, [r0+0]
+    cmp r0, 0
+    je failed
+    mov r1, r4
+    call statline
+    mov r1, r0
+    hlt
+
+; statline(r1 = path): readview kind 8 prints mode, owner, size, name.
+; Returns r0 = 0 on success, 1 on failure.
+statline:
+    mov r2, r1
+    mov r0, 26
+    mov r1, 8
+    mov r3, line
+    sys
+    cmp r0, 65535
+    je statfail
+    mov r3, r0
+    mov r0, 1
+    mov r1, 1
+    mov r2, line
+    sys
+    mov r0, 0
+    ret
+statfail:
+    mov r0, 1
+    mov r1, 2
+    mov r2, serr
+    mov r3, 0
+    sys
+    mov r0, 1
+    ret
+
 failed:
     mov r0, 1
     mov r1, 2
@@ -712,7 +811,13 @@ failed:
 
 .data
 buf:
-    .space 384
+    .space 768
+pbuf:
+    .space 96
+line:
+    .space 64
+lflag:
+    .byte 0
 dot:
     .asciz "."
 gap:
@@ -721,6 +826,8 @@ nl:
     .ascii "\\n"
 err:
     .asciz "ls: cannot read directory\\n"
+serr:
+    .asciz "ls: cannot access file\\n"
 `,
 
   pwd: `; pwd — print the working directory

@@ -71,6 +71,10 @@ const MMIO_TTY_ERR = 0xff01
 const MMIO_TTY_STATUS = 0xff10
 const MMIO_TTY_DATA = 0xff11
 const MMIO_BLOCK = 0xfe00
+const SECTOR_SIZE = 256
+// 挂载表：8 项 x 4 字节，CRX 内核的只读 VFS 靠它跨越挂载点
+const KCB_MOUNTS = 0x00c0
+const KCB_MOUNT_SLOTS = 8
 const UTF8_ENCODER = new TextEncoder()
 
 
@@ -609,6 +613,18 @@ export class Kernel {
       const dev = this.devs.get(name)
       const block = reg16(4)
       const buffer = reg16(6)
+      // 命令 6：按 256 B 扇区读到内核物理缓冲区。块大小不同的设备（ROM 是 1 KiB）
+      // 也能逐扇区读进内核那一页暂存区；怎么解析这些字节由 CRX 内核决定。
+      if (command === 6) {
+        const at = block * SECTOR_SIZE
+        if (!dev || at + SECTOR_SIZE > dev.size) {
+          setReg16(8, 0xffff)
+          return
+        }
+        for (let i = 0; i < SECTOR_SIZE; i++) writeMem(buffer + i, dev.bytes[at + i], false)
+        setReg16(8, 1)
+        return
+      }
       if (!dev || block >= dev.blockCount) {
         setReg16(8, 0xffff)
         return
@@ -802,6 +818,32 @@ export class Kernel {
     this.mem.setU16(0x003c, QUANTUM)
     this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
     this.mem.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
+    this.writeMountTable()
+  }
+
+  // 把 VFS 挂载关系写成 CRX 内核能读的表：每项是宿主设备、挂载点在宿主上的
+  // inode、被挂设备、被挂设备每块的扇区数。TypeScript 只登记，不替内核走路径。
+  private writeMountTable() {
+    this.mem.bytes.fill(0, KCB_MOUNTS, KCB_MOUNTS + KCB_MOUNT_SLOTS * 4)
+    let slot = 0
+    for (const m of this.vfs.mounts) {
+      if (m.path === '/' || slot >= KCB_MOUNT_SLOTS) continue
+      const host = this.vfs.mounts
+        .filter((h) => h !== m && (h.path === '/' || m.path.startsWith(h.path + '/')))
+        .sort((a, b) => b.path.length - a.path.length)[0]
+      if (!host) continue
+      let ino = 1
+      for (const seg of m.path.slice(host.path === '/' ? 0 : host.path.length).split('/').filter(Boolean)) {
+        ino = host.fs.lookup(ino, seg) ?? 0
+        if (!ino) break
+      }
+      if (!ino) continue
+      const at = KCB_MOUNTS + slot++ * 4
+      this.mem.bytes[at] = deviceCode(host.fs.dev.spec.name)
+      this.mem.bytes[at + 1] = ino
+      this.mem.bytes[at + 2] = deviceCode(m.fs.dev.spec.name)
+      this.mem.bytes[at + 3] = m.fs.dev.blockSize / SECTOR_SIZE
+    }
   }
 
   private doExit(p: Process, code: number) {
@@ -956,6 +998,7 @@ export class Kernel {
     if (abs === '/' || [...this.mounts.values()].includes(abs)) return { err: 'EBUSY' }
     this.vfs.mount(abs, fs)
     this.mounts.set(name, abs)
+    this.writeMountTable()
     this.log(`${name}: mounted on ${abs}, label "${fs.label()}", ${fs.usedBlocks()} blocks in use`)
     return 0
   }
@@ -969,6 +1012,7 @@ export class Kernel {
       if (p.state !== 'zombie' && p.cwd.startsWith(abs)) return { err: 'EBUSY' }
     this.vfs.umount(abs)
     this.mounts.delete(name)
+    this.writeMountTable()
     if (this.persist) saveDev(this.devs.get(name)!)
     this.log(`${name}: unmounted from ${abs}`)
     return 0
@@ -1110,24 +1154,6 @@ export class Kernel {
       case 'dup2':
         result = this.sysDup(p, sc.from, sc.to)
         break
-      case 'readdir': {
-        const node = this.walk(p, sc.path)
-        if ('err' in node) result = { err: node.err }
-        else if (node.type !== T_DIR) result = { err: 'ENOTDIR' }
-        else if (!this.modeAllows(p, this.vfs.fsOf(node), node.ino, false)) result = { err: 'EACCES' }
-        else {
-          const fs = this.vfs.fsOf(node)
-          result = fs.entries(node.ino).map((e) => ({
-            name: e.name,
-            ino: e.ino,
-            type: TYPE_NAME[fs.itype(e.ino)] ?? 'file',
-            size: fs.isize(e.ino),
-            exec: fs.iexec(e.ino),
-            disk: node.dev.spec.name,
-          }))
-        }
-        break
-      }
       case 'stat': {
         const node = this.walk(p, sc.path)
         result =
@@ -1350,7 +1376,7 @@ export class Kernel {
       return [
         'crados commands (every file in /bin is CRX machine code)',
         '',
-        'files:   ls cat head wc cp mv rm rmdir mkdir touch chmod echo',
+        'files:   ls [-l] cat head wc cp mv rm rmdir mkdir touch chmod echo',
         'process: ps kill sleep count pid',
         'storage: lsblk df mount umount   (writeback is automatic)',
         'kernel:  mem dmesg hexdump objdump uname whoami',

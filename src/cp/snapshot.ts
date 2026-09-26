@@ -104,7 +104,6 @@ function formatCall(sc: Syscall): string {
     case 'close': return `close(${sc.fd})`
     case 'dup': return `dup(${sc.fd})`
     case 'dup2': return `dup2(${sc.from}, ${sc.to})`
-    case 'readdir': return `getdents("${sc.path}")`
     case 'stat': return `stat("${sc.path}")`
     case 'mkdir': return `mkdir("${sc.path}")`
     case 'unlink': return `unlink("${sc.path}")`
