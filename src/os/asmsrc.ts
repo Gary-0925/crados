@@ -553,7 +553,7 @@ bg:     .byte 0
 scriptmode: .byte 0
 scriptfd: .word 0
 selfpid: .word 0
-banner: .asciz "crados 3.0\\nType help for commands.\\n"
+banner: .asciz "crados 3.1\\nType help for commands.\\n"
 pre:    .asciz "1@crados:"
 post:   .asciz "$ "
 home:   .asciz "/home/user"
@@ -1503,7 +1503,7 @@ long:
 short_s:
     .asciz "crados\\n"
 long_s:
-    .asciz "crados 3.0 browser js single-core\\n"
+    .asciz "crados 3.1 browser js single-core\\n"
 `,
 
   clear: `; clear — emit the erase-display control sequence

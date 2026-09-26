@@ -147,7 +147,7 @@ export class Kernel {
       this.ticks++
       this.log(msg, true)
     }
-    stamp('crados 3.0 booting on browser/js')
+    stamp('crados 3.1 booting on browser/js')
     stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
     stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${RAM_SIZE / 1024} KiB`)
 
@@ -782,7 +782,7 @@ export class Kernel {
 
   // Frame 0 is the KCB; frames 1..12 hold PCBs.
   private writeKernelTables() {
-    const banner = 'crados 3.0\n'
+    const banner = 'crados 3.1\n'
     for (let i = 0; i < 32; i++) {
       this.mem.bytes[i] = i < banner.length ? banner.charCodeAt(i) : 0
     }
