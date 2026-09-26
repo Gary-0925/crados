@@ -64,4 +64,4 @@ jgt 测试。地址空间从 0 开始：先 .text，再 .data，栈在最高一�
 
 ## 示例
 
-本目录下的 hello.s 与 count.s。
+/home/user 下的 hello.s 与 count.s。

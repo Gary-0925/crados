@@ -83,7 +83,7 @@ free name; each one is a separate device.
     lsblk                    list block devices
     df                       usage per filesystem
     mount /dev/sdb /mnt      attach the device to a directory
-    cp README.md /mnt/       copy a file onto it
+    cp /usr/man/README.md /mnt/   copy a file onto it
     umount /mnt              detach it
 
 Any device can be mounted anywhere, and several can be mounted at once

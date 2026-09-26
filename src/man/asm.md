@@ -67,4 +67,4 @@ plus one type byte. That is why these calls take a buffer and a length.
 
 ## Sources
 
-See hello.s and count.s in this directory.
+See hello.s and count.s in /home/user.

@@ -32,6 +32,6 @@ export const MAN_PAGES: ManPage[] = [
 ]
 
 export const MAN_FILES: [string, string][] = MAN_PAGES.map(({ name, body }) => [
-  `/home/user/${name}.md`,
+  `/usr/man/${name}.md`,
   body,
 ])

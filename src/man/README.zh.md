@@ -19,7 +19,8 @@ sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有�
 发行的程序都在这块盘上。
 
     /bin        系统程序，每次上电安装到 sda
-    /home/user  本目录下的文档
+    /usr/man    本手册
+    /home/user  你自己的文件和示例源码
     /mnt        /dev/sdb 的挂载点
     /tmp        临时目录
     /usr/bin    存放你自己编译的程序

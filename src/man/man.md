@@ -1,7 +1,7 @@
 # man
 
-Every page is a plain text file stored in /home/user, the same place as
-your own documents. `man page` opens page.md; `man page.zh` opens
+Every page is a plain text file stored in /usr/man, one folder for the
+manuals and nothing else. `man page` opens page.md; `man page.zh` opens
 page.zh.md. With no argument man prints this catalog.
 
 ## Pages
@@ -17,5 +17,4 @@ page.zh.md. With no argument man prints this catalog.
 
 The pages are ordinary files, so everything works on them: cat, cp onto
 a removable disk, hexdump. The host keeps the sources in one folder and
-installs them into /home/user at power-on, which is the same route your
-own programs take through /usr/bin.
+installs them into /usr/man at power-on.

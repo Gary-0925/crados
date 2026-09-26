@@ -1888,7 +1888,7 @@ copydone:
 .data
 path:    .space 64
 buf:     .space 200
-dir:     .asciz "/home/user/"
+dir:     .asciz "/usr/man/"
 ext:     .asciz ".md"
 err:     .asciz "man: no such page, try man man\\n"
 manlist: .asciz "README        what this system is\\nasm           instruction set, assembler, syscalls\\nstorage       disks and the on-disk format\\ninspect       memory, the process table, registers\\nscript        shell scripts and the #! mechanism\\nman           this catalog\\n\\nChinese: append .zh, for example man README.zh\\n"

@@ -71,7 +71,7 @@ objdump 自己检查路径，再请宿主解码指令。
     lsblk                    列出块设备
     df                       各文件系统用量
     mount /dev/sdb /mnt      把设备接入目录树
-    cp README.md /mnt/       复制文件到该设备
+    cp /usr/man/README.md /mnt/   复制文件到该设备
     umount /mnt              摘除
 
 任何设备都可以挂到任意目录，也可以同时挂载多个。把第二个设备挂到

@@ -12,8 +12,7 @@ import {
 
 const LABEL = 'crados-root'
 
-// /bin 是 ROM 的挂载点，/mnt 是建议的可移动盘挂载点；根盘上都只是空目录
-const DIRS = ['/bin', '/dev', '/usr', '/usr/bin', '/mnt', '/tmp', '/home', '/home/user']
+const DIRS = ['/bin', '/dev', '/usr', '/usr/bin', '/usr/man', '/mnt', '/tmp', '/home', '/home/user']
 
 const FILES: [string, string][] = [
   ...MAN_FILES,

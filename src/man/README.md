@@ -19,7 +19,8 @@ sda is the system disk, in the way C: is the system disk on Windows. It
 holds the root tree and every program that ships with the OS.
 
     /bin        system programs, installed on sda at power-on
-    /home/user  these documents
+    /usr/man    these manuals
+    /home/user  your files, and the example sources
     /mnt        mount point for /dev/sdb
     /tmp        scratch
     /usr/bin    where your own programs go
