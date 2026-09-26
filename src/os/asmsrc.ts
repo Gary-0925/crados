@@ -1808,8 +1808,8 @@ use: .asciz "usage: wc file\\n"
   dmesg: viewProgram('dmesg', 5),
   hexdump: viewProgram('hexdump', 6, true),
   objdump: viewProgram('objdump', 7, true),
-  // man 直接流式读取 /home/user/<页>.md，因此不受内核视图缓冲区大小限制
-  man: `; man — stream a manual page out of /home/user, or list pages with no argument
+  // man 直接流式读取 /usr/man/<页>，因此不受内核视图缓冲区大小限制
+  man: `; man — stream a manual page out of /usr/man, or list pages with no argument
 .text
 _start:
     cmp r1, 0
@@ -1818,9 +1818,6 @@ _start:
     mov r5, dir
     call copystr
     mov r5, r2          ; argv[0] is the page name
-    call copystr
-    call copystr
-    mov r5, ext
     call copystr
     mov r7, 0
     stb [r4+0], r7
@@ -1889,7 +1886,6 @@ copydone:
 path:    .space 64
 buf:     .space 200
 dir:     .asciz "/usr/man/"
-ext:     .asciz ".md"
 err:     .asciz "man: no such page, try man man\\n"
 manlist: .asciz "README        what this system is\\nasm           instruction set, assembler, syscalls\\nstorage       disks and the on-disk format\\ninspect       memory, the process table, registers\\nscript        shell scripts and the #! mechanism\\nman           this catalog\\n\\nChinese: append .zh, for example man README.zh\\n"
 `,

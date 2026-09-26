@@ -1,15 +1,15 @@
-import readmeEn from './README.md?raw'
-import readmeZh from './README.zh.md?raw'
-import asmEn from './asm.md?raw'
-import asmZh from './asm.zh.md?raw'
-import storageEn from './storage.md?raw'
-import storageZh from './storage.zh.md?raw'
-import inspectEn from './inspect.md?raw'
-import inspectZh from './inspect.zh.md?raw'
-import scriptEn from './script.md?raw'
-import scriptZh from './script.zh.md?raw'
-import manEn from './man.md?raw'
-import manZh from './man.zh.md?raw'
+import readmeEn from './README?raw'
+import readmeZh from './README.zh?raw'
+import asmEn from './asm?raw'
+import asmZh from './asm.zh?raw'
+import storageEn from './storage?raw'
+import storageZh from './storage.zh?raw'
+import inspectEn from './inspect?raw'
+import inspectZh from './inspect.zh?raw'
+import scriptEn from './script?raw'
+import scriptZh from './script.zh?raw'
+import manEn from './man?raw'
+import manZh from './man.zh?raw'
 
 export interface ManPage {
   name: string
@@ -32,6 +32,6 @@ export const MAN_PAGES: ManPage[] = [
 ]
 
 export const MAN_FILES: [string, string][] = MAN_PAGES.map(({ name, body }) => [
-  `/usr/man/${name}.md`,
+  `/usr/man/${name}`,
   body,
 ])
