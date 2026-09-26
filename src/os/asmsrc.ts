@@ -9,6 +9,9 @@
 //   12 getcwd(buf)        13 unlink(path)       14 mkdir(path)
 //   15 chmod(path,set,clr) 16 rename(a,b)        17 sync()       18 getenv(key,buf)
 //   20 mount(dev,dir)     21 umount(target)     22 kill(pid,sig)
+import { UID_USER_NAME } from './fs'
+import { OS_VERSION } from '../utils/config'
+
 
 // 取 argv 中第 n 个参数的地址：入口 r5 = argv 基址, r6 = n，出口 r5 指向该参数
 const ARGN = `
@@ -222,6 +225,41 @@ _start:
     mov r1, r0
     mov r0, 28
     sys
+    mov r0, 18          ; prompt prefix = getenv("USER") + "@crados:"
+    mov r1, userkey
+    mov r2, prebuf
+    sys
+    cmp r0, 0
+    jgt pre_scan
+    mov r1, defuser
+    mov r2, prebuf
+pre_def:
+    ldb r7, [r1+0]
+    stb [r2+0], r7
+    cmp r7, 0
+    je pre_scan
+    add r1, 1
+    add r2, 1
+    jmp pre_def
+pre_scan:
+    mov r6, prebuf
+pre_scan_loop:
+    ldb r7, [r6+0]
+    cmp r7, 0
+    je pre_fill
+    add r6, 1
+    jmp pre_scan_loop
+pre_fill:
+    mov r1, pretail
+pre_fill_loop:
+    ldb r7, [r1+0]
+    stb [r6+0], r7
+    cmp r7, 0
+    je pre_built
+    add r6, 1
+    add r1, 1
+    jmp pre_fill_loop
+pre_built:
     cmp r4, 0
     jgt script_start
     mov r0, 1
@@ -249,7 +287,7 @@ prompt:
     jne script_read
     mov r0, 1
     mov r1, 1
-    mov r2, pre
+    mov r2, prebuf
     mov r3, 0
     sys
     mov r0, 12
@@ -553,8 +591,11 @@ bg:     .byte 0
 scriptmode: .byte 0
 scriptfd: .word 0
 selfpid: .word 0
-banner: .asciz "crados 3.1\\nType help for commands.\\n"
-pre:    .asciz "1@crados:"
+banner: .asciz "crados ${OS_VERSION}\\nType help for commands.\\n"
+prebuf: .space 32
+userkey: .asciz "USER"
+pretail: .asciz "@crados:"
+defuser: .asciz "${UID_USER_NAME}"
 post:   .asciz "$ "
 home:   .asciz "/home/user"
 bgmsg:  .asciz "[background]\\n"
@@ -1503,7 +1544,7 @@ long:
 short_s:
     .asciz "crados\\n"
 long_s:
-    .asciz "crados 3.1 browser js single-core\\n"
+    .asciz "crados ${OS_VERSION} browser js single-core\\n"
 `,
 
   clear: `; clear — emit the erase-display control sequence
@@ -1768,25 +1809,33 @@ use: .asciz "usage: wc file\\n"
   hexdump: viewProgram('hexdump', 6, true),
   objdump: viewProgram('objdump', 7, true),
   // man 直接流式读取 /home/user/<页>.md，因此不受内核视图缓冲区大小限制
-  man: `; man — stream a document out of /home/user
+  man: `; man — stream a manual page out of /home/user, or list pages with no argument
 .text
 _start:
+    cmp r1, 0
+    je catalog
     mov r4, path        ; dest cursor, shared by copystr
     mov r5, dir
     call copystr
-    cmp r1, 0
-    je usedefault
     mov r5, r2          ; argv[0] is the page name
-    jmp copyname
-usedefault:
-    mov r5, defname
-copyname:
+    call copystr
     call copystr
     mov r5, ext
     call copystr
     mov r7, 0
     stb [r4+0], r7
+    jmp open
 
+catalog:
+    mov r0, 1
+    mov r1, 1
+    mov r2, manlist
+    mov r3, 0
+    sys
+    mov r1, 0
+    hlt
+
+open:
     mov r0, 4           ; open(path, O_RDONLY)
     mov r1, path
     mov r2, 0
@@ -1840,9 +1889,9 @@ copydone:
 path:    .space 64
 buf:     .space 200
 dir:     .asciz "/home/user/"
-defname: .asciz "README"
 ext:     .asciz ".md"
-err:     .asciz "man: no such page; try man README\\n"
+err:     .asciz "man: no such page, try man man\\n"
+manlist: .asciz "README        what this system is\\nasm           instruction set, assembler, syscalls\\nstorage       disks and the on-disk format\\ninspect       memory, the process table, registers\\nscript        shell scripts and the #! mechanism\\nman           this catalog\\n\\nChinese: append .zh, for example man README.zh\\n"
 `,
   help: viewProgram('help', 9),
 

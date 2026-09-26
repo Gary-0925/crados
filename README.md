@@ -24,7 +24,10 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 
 ## Filesystem
 
-    /bin        programs, mounted from /dev/rom
+sda is the system disk, in the way C: is the system disk on Windows. It
+holds the root tree and every program that ships with the OS.
+
+    /bin        system programs, installed on sda at power-on
     /home/user  these documents
     /mnt        mount point for /dev/sdb
     /tmp        scratch
@@ -47,12 +50,13 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Permissions. The login shell is uid 1000. 'kill 1' returns
+5. Permissions. The login shell is uid 1. 'kill 1' returns
    EPERM. Only euid 0 may signal init, and that still panics.
 6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
 
 ## Manuals
 
+    man man        this catalog, and how the pages are stored
     man asm        instruction set, assembler, syscalls
     man storage    disks and the on-disk format
     man inspect    memory, the process table, registers
@@ -81,7 +85,10 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 
 ## 文件系统
 
-    /bin        程序，由 /dev/rom 挂载
+sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有随系统
+发行的程序都在这块盘上。
+
+    /bin        系统程序，每次上电安装到 sda
     /home/user  本目录下的文档
     /mnt        /dev/sdb 的挂载点
     /tmp        临时目录
@@ -103,12 +110,13 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 权限。登录 shell 是 uid 1000。运行 'kill 1' 得到 EPERM。
+5. 权限。登录 shell 是 uid 1。运行 'kill 1' 得到 EPERM。
    只有 euid 0 可以信号 init，那样才会恐慌。
 6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
 
 ## 手册
 
+    man man        本目录，以及手册页是怎么存放的
     man asm        指令集、汇编器、系统调用
     man storage    磁盘与盘上格式
     man inspect    内存、进程表、寄存器

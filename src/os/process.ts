@@ -13,7 +13,7 @@
 //   163 sleeping    164 mode   165 irq-enable   166-167 pending irq
 //   168-169 cause   170-171 ivt base            172-173 kernel sp
 //   174-175 user sp
-//   176-177 uid      178-179 euid     180-181 gid      182-183 egid
+//   176-177 uid      178-179 euid     180-183 reserved
 //   184-185 pfn bit6  186-187 pfn bit7  188-191 reserved
 //   页表字节只有 6 位帧号。bit6/bit7 各是一个 u16 掩码，第 n 位对应虚拟页 n。
 
@@ -27,6 +27,9 @@ export const PCB_BASE = PAGE_SIZE
 export const MAX_PROCS = 16
 export const MAX_PAGES = 16
 export const MAX_FDS = 8
+
+export const PCB_UID = 176
+export const PCB_EUID = 178
 
 const O_STATE = 1
 const O_PID = 2
@@ -57,10 +60,8 @@ const O_CAUSE = 168
 const O_IVT = 170
 const O_KSP = 172
 const O_USP = 174
-const O_UID = 176
-const O_EUID = 178
-const O_GID = 180
-const O_EGID = 182
+const O_UID = PCB_UID
+const O_EUID = PCB_EUID
 const O_PFN6 = 184
 const O_PFN7 = 186
 const NAME_CAP = 16
@@ -424,19 +425,6 @@ export class Process {
   set euid(v: number) {
     this.setU16(O_EUID, v)
   }
-  get gid(): number {
-    return this.u16(O_GID)
-  }
-  set gid(v: number) {
-    this.setU16(O_GID, v)
-  }
-  get egid(): number {
-    return this.u16(O_EGID)
-  }
-  set egid(v: number) {
-    this.setU16(O_EGID, v)
-  }
-
   get readStdin(): boolean {
     return this.u8(O_STDIN) !== 0
   }

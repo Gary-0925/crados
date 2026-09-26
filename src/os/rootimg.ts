@@ -2,19 +2,10 @@
 
 import { BlockDev, SPECS } from './blockdev'
 import { applyLoginPolicy, basename, CRFS, dirname, DRV_NULL, DRV_TTY, T_DEV, T_DIR, T_FILE } from './fs'
+import { MAN_FILES } from '../man'
 import {
   COUNT_S,
   BLOCK_S,
-  DOC_ASM,
-  DOC_ASM_ZH,
-  DOC_INSPECT,
-  DOC_INSPECT_ZH,
-  DOC_README,
-  DOC_README_ZH,
-  DOC_SCRIPT,
-  DOC_SCRIPT_ZH,
-  DOC_STORAGE,
-  DOC_STORAGE_ZH,
   HELLO_S,
   PAGE_S,
 } from './rootfs'
@@ -25,16 +16,7 @@ const LABEL = 'crados-root'
 const DIRS = ['/bin', '/dev', '/usr', '/usr/bin', '/mnt', '/tmp', '/home', '/home/user']
 
 const FILES: [string, string][] = [
-  ['/home/user/README.md', DOC_README],
-  ['/home/user/README.zh.md', DOC_README_ZH],
-  ['/home/user/asm.md', DOC_ASM],
-  ['/home/user/asm.zh.md', DOC_ASM_ZH],
-  ['/home/user/storage.md', DOC_STORAGE],
-  ['/home/user/storage.zh.md', DOC_STORAGE_ZH],
-  ['/home/user/inspect.md', DOC_INSPECT],
-  ['/home/user/inspect.zh.md', DOC_INSPECT_ZH],
-  ['/home/user/script.md', DOC_SCRIPT],
-  ['/home/user/script.zh.md', DOC_SCRIPT_ZH],
+  ...MAN_FILES,
   ['/home/user/hello.s', HELLO_S],
   ['/home/user/count.s', COUNT_S],
   ['/home/user/page.s', PAGE_S],
