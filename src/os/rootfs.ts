@@ -285,6 +285,21 @@ requires euid 0. A file created by a process is owned by that euid.
 PATH searches /bin before /usr/bin, so a program in /usr/bin cannot
 shadow ls.
 
+ls -l shows the mode, the owner, the size and the name of each entry.
+The owner is read from that uid table: root is uid 0, user is uid 1000,
+any other uid is printed as a number. The line comes from readview
+kind 8, so ls only needs search permission on the directories, not read
+permission on the file.
+
+Both calls ls makes, getdents and readview kind 8, run entirely in the
+CRX kernel. Its read-only VFS walks inodes and directory blocks on any
+device, crossing mount points through a table at 0x00C0 in the KCB.
+The ROM has 1 KiB blocks, so the kernel reads it 256 B at a time with
+block controller command 6, one sector into its scratch page.
+
+    -rwxr-x-- root    464 cat
+    drwxrwx-t root      0 tmp/
+
 ## Where a file starts and ends
 
 The block pointers say which blocks hold the file; they need not be
@@ -374,6 +389,18 @@ uid 1000。uid 0 跳过检查。/bin 是固件，系统调用写它返回 EROFS�
 block_write 需要 euid 0。进程创建的文件属主就是它的 euid。/home/user
 和 /usr/bin 带 sticky，用户删不掉 root 的文件。PATH 先搜 /bin 再搜
 /usr/bin，所以 /usr/bin 里的程序不能盖住 ls。
+
+ls -l 显示每一项的模式、属主、大小和名字。属主就取自这张 uid 表：uid 0
+显示为 root，uid 1000 显示为 user，其他 uid 直接显示数字。这一行由
+readview 第 8 类给出，所以 ls 只需要沿途目录的搜索权，不需要文件的读权限。
+
+ls 用到的两个调用 getdents 和 readview 第 8 类，全部由 CRX 内核完成。它的
+只读 VFS 能在任意设备上解析 inode 和目录块，经 KCB 0x00C0 的挂载表跨越
+挂载点。ROM 的块是 1 KiB，内核用块控制器的命令 6 每次读 256 B 扇区，
+正好放进它的一页暂存区。
+
+    -rwxr-x-- root    464 cat
+    drwxrwx-t root      0 tmp/
 
 ## 文件的起止是怎么标记的
 

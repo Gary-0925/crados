@@ -115,8 +115,6 @@ function trap(cpu: CpuState, bus: Bus): Syscall | null {
       return sys.spawn(cstr(bus, a1), a2 && a3 ? argv(bus, a2, a3) : [])
     case 10:
       return sys.wait(a1 === 0xffff ? -1 : a1)
-    case 11:
-      return sys.readdir(a1 ? cstr(bus, a1) : '.')
     case 12:
       return sys.getcwd()
     case 13:
@@ -154,22 +152,6 @@ function trap(cpu: CpuState, bus: Bus): Syscall | null {
     default:
       return null
   }
-}
-
-export const DIRENT_SIZE = 16
-const DIRENT_NAME = 15
-
-// 目录项写入用户缓冲区：15 字节名字（NUL 补齐）+ 1 字节类型与权限位
-function putDirents(bus: Bus, at: number, max: number, list: any[]): number {
-  const n = Math.min(list.length, max)
-  for (let i = 0; i < n; i++) {
-    const base = at + i * DIRENT_SIZE
-    const name = String(list[i].name).slice(0, DIRENT_NAME - 1)
-    for (let k = 0; k < DIRENT_NAME; k++) bus.writeUser(base + k, k < name.length ? name.charCodeAt(k) : 0)
-    const type = list[i].type === 'dir' ? 2 : list[i].type === 'dev' ? 3 : 1
-    bus.writeUser(base + DIRENT_NAME, type | (list[i].exec ? 4 : 0))
-  }
-  return n
 }
 
 export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => void): Gen {
@@ -235,8 +217,6 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
     } else if (call.call === 'getcwd' || call.call === 'getenv') {
       const buf = call.call === 'getcwd' ? cpu.regs[1] : cpu.regs[2]
       cpu.regs[0] = isErrVal(ret) ? 0xffff : putStr(bus, buf, String(ret), 0)
-    } else if (call.call === 'readdir') {
-      cpu.regs[0] = Array.isArray(ret) ? putDirents(bus, cpu.regs[2], cpu.regs[3], ret) : 0xffff
     } else if (call.call === 'time') {
       cpu.regs[0] = ret && typeof ret === 'object' ? wrap((ret as any).hz) : 20
     } else if (call.call === 'view') {

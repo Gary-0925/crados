@@ -14,7 +14,6 @@ export type Syscall =
   | { call: 'close'; fd: number }
   | { call: 'dup'; fd: number }
   | { call: 'dup2'; from: number; to: number }
-  | { call: 'readdir'; path: string }
   | { call: 'stat'; path: string }
   | { call: 'mkdir'; path: string }
   | { call: 'unlink'; path: string }
@@ -82,7 +81,6 @@ export const sys = {
   close: (fd: number): Syscall => ({ call: 'close', fd }),
   dup: (fd: number): Syscall => ({ call: 'dup', fd }),
   dup2: (from: number, to: number): Syscall => ({ call: 'dup2', from, to }),
-  readdir: (path: string): Syscall => ({ call: 'readdir', path }),
   stat: (path: string): Syscall => ({ call: 'stat', path }),
   mkdir: (path: string): Syscall => ({ call: 'mkdir', path }),
   unlink: (path: string): Syscall => ({ call: 'unlink', path }),

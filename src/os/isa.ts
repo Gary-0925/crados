@@ -174,9 +174,10 @@ export function assemble(source: string): AsmResult {
       if (!body) return
     }
 
-    const [head, ...restParts] = body.split(/\s+/)
+    const head = body.split(/\s+/)[0]
     const mnemonic = head.toLowerCase()
-    const rest = restParts.join(' ')
+    // 保留操作数原文：.ascii "  " 里的连续空格不能被折叠
+    const rest = body.slice(head.length).trim()
     const ops = splitOperands(rest)
 
     if (mnemonic === '.text' || mnemonic === '.data') {
