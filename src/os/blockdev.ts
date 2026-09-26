@@ -10,10 +10,12 @@ export interface DevSpec {
   removable: boolean
 }
 
+export const SDA_INODES = 256
+
 export const SPECS: Record<string, DevSpec> = {
   rom: { name: 'rom', model: 'CRADOS-FIRMWARE', blockSize: 1024, blockCount: 256, inodeCount: 64, removable: false },
   // 一个 256 B 的块位图可寻址 2048 个块，因此 512 KiB 是当前 CRFS v1 的自然上限。
-  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 256, blockCount: 2048, inodeCount: 64, removable: false },
+  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 256, blockCount: 2048, inodeCount: SDA_INODES, removable: false },
 }
 
 // 导入的镜像按 sdb、sdc、sdd… 顺序占位，容量与根盘一致，便于整盘互换

@@ -33,6 +33,9 @@
 //   high frames    : CRX Kernel Text (KERNEL_TEXT_PAGES, physical direct map)
 //   0xFF00..0xFFFF : MMIO，不是内存
 
+import { SDA_INODES } from './blockdev'
+import { M_EXEC, M_OEXEC, M_OREAD, M_READ, M_SETUID, SB_UID, UID_ROOT, UID_ROOT_NAME, UID_USER, UID_USER_NAME } from './fs'
+
 export const GUEST_KERNEL_SOURCE = `.text
 _start:
     cli
@@ -959,64 +962,6 @@ vfs_dirent_fail:
     mov r0, 65535
     ret
 
-; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
-vfs_may:
-    call ino_in_range
-    cmp r0, 0
-    jne vfs_may_no
-    mov r4, 0
-    stw [r4+0x00B0], r1
-    stw [r4+0x00B2], r2
-    stw [r4+0x00B4], r3
-    call current_euid
-    cmp r0, 0
-    je vfs_may_yes
-    mov r4, 0
-    stw [r4+0x00B6], r0
-    ldw r1, [r4+0x00B0]
-    mul r1, 2
-    add r1, 32
-    call vfs_u16        ; owner uid
-    cmp r0, 65535
-    je vfs_may_no
-    mov r4, 0
-    ldw r6, [r4+0x00B4]
-    ldw r5, [r4+0x00B6]
-    cmp r0, r5
-    jne vfs_may_flags
-    ldw r6, [r4+0x00B2]
-vfs_may_flags:
-    push r6
-    ldw r1, [r4+0x00B0]
-    call vfs_inode
-    cmp r0, 65280
-    je vfs_may_inode_bad
-    mov r1, r0
-    add r1, 1
-    call vfs_u8
-    pop r6
-    cmp r0, 65535
-    je vfs_may_no
-    mov r2, r0
-    mov r4, 0
-    ldw r1, [r4+0x00B0]
-    push r6
-    call gp_cap_flags
-    pop r6
-    and r0, r6
-    cmp r0, 0
-    je vfs_may_no
-    jmp vfs_may_yes
-vfs_may_inode_bad:
-    pop r6
-    jmp vfs_may_no
-vfs_may_yes:
-    mov r0, 0
-    ret
-vfs_may_no:
-    mov r0, 65535
-    ret
-
 ; vfs_lookup: r1 = 目录 inode，r2 = 用户态路径分量 (以 NUL 或 / 结束)。
 vfs_lookup:
     mov r4, 0
@@ -1280,8 +1225,8 @@ vfs_resolve_name:
     jne vfs_resolve_fail
     mov r4, 0
     ldw r1, [r4+0x00A2]
-    mov r2, 1           ; owner exec
-    mov r3, 128         ; other exec
+    mov r2, ${M_EXEC}           ; owner exec
+    mov r3, ${M_OEXEC}         ; other exec
     call vfs_may
     cmp r0, 0
     jne vfs_resolve_fail
@@ -1298,8 +1243,8 @@ vfs_resolve_name:
 vfs_resolve_dot:
     mov r4, 0
     ldw r1, [r4+0x00A2]
-    mov r2, 1
-    mov r3, 128
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
     call vfs_may
     cmp r0, 0
     jne vfs_resolve_fail
@@ -1307,8 +1252,8 @@ vfs_resolve_dot:
 vfs_resolve_up:
     mov r4, 0
     ldw r1, [r4+0x00A2]
-    mov r2, 1           ; "." / ".." 同样要搜索权
-    mov r3, 128
+    mov r2, ${M_EXEC}           ; "." / ".." 同样要搜索权
+    mov r3, ${M_OEXEC}
     call vfs_may
     cmp r0, 0
     jne vfs_resolve_fail
@@ -1356,8 +1301,8 @@ sys_getdents:
     jne getdents_failed
     mov r4, 0
     ldw r1, [r4+0x0084]
-    mov r2, 2           ; owner read
-    mov r3, 8           ; other read
+    mov r2, ${M_READ}           ; owner read
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne getdents_failed
@@ -1505,7 +1450,7 @@ view_type_put:
     mov r1, 128
     mov r2, 120         ; other x
     call view_bit
-    mov r1, 32
+    mov r1, ${M_SETUID}
     mov r2, 115         ; setuid
     call view_bit
     mov r1, 64
@@ -1517,23 +1462,35 @@ view_type_put:
     ; owner: uid table in the superblock of the same device
     ldw r1, [r4+0x0084]
     mul r1, 2
-    add r1, 32
+    add r1, ${SB_UID}
     call vfs_u16
-    cmp r0, 0
+    cmp r0, ${UID_ROOT}
     je view_root
+    cmp r0, ${UID_USER}
+    je view_user
     mov r1, r0
     mov r2, 5
-    mov r3, 1           ; left aligned; uid 1 prints as 1, not a name
+    mov r3, 1           ; left aligned; other uids print as numbers
     call view_num
     jmp view_owner_done
 view_root:
-    mov r0, 114
+    mov r0, ${UID_ROOT_NAME.charCodeAt(0)}
     call view_putc
-    mov r0, 111
+    mov r0, ${UID_ROOT_NAME.charCodeAt(1)}
     call view_putc
-    mov r0, 111
+    mov r0, ${UID_ROOT_NAME.charCodeAt(2)}
     call view_putc
-    mov r0, 116
+    mov r0, ${UID_ROOT_NAME.charCodeAt(3)}
+    call view_putc
+    jmp view_owner_pad
+view_user:
+    mov r0, ${UID_USER_NAME.charCodeAt(0)}
+    call view_putc
+    mov r0, ${UID_USER_NAME.charCodeAt(1)}
+    call view_putc
+    mov r0, ${UID_USER_NAME.charCodeAt(2)}
+    call view_putc
+    mov r0, ${UID_USER_NAME.charCodeAt(3)}
     call view_putc
     jmp view_owner_pad
 view_owner_pad:
@@ -1763,7 +1720,7 @@ sys_tcsetpgrp:
     jlt tcset_failed
     je tcset_failed
     push r1
-    call may_signal_pid
+    call gp_may_signal
     pop r1
     cmp r0, 0
     jne tcset_failed
@@ -1963,94 +1920,13 @@ copy_fd_loop:
 copy_fd_done:
     ret
 
-; 权限位与 src/os/fs.ts 一致：1 exec，2 owner-read，4 owner-write，8 other-read，16 other-write。
-; uid 表在 sda 超级块偏移 32，每个 inode 一个大端 u16。euid 在 PCB+178。
-; r1 = inode。返回 0 允许，0xffff 拒绝。会破坏 r1-r7。
-may_write_ino:
-    push r1
-    call ino_in_range
-    cmp r0, 0
-    jne may_pop_no
-    call current_euid
-    cmp r0, 0
-    je may_pop_yes
-    mov r6, r0
-    pop r1
-    push r1
-    push r6
-    mul r1, 2
-    add r1, 32
-    call crfs_u16
-    pop r6
-    pop r1
-    cmp r0, 65535
-    je may_no
-    cmp r0, r6
-    jne may_write_other
-    mov r5, 4
-    jmp may_flag
-may_write_other:
-    mov r5, 16
-    jmp may_flag
-
-may_flag:
-    push r5
-    push r1
-    mul r1, 48
-    add r1, 768
-    mov r6, r1
-    call crfs_u8
-    mov r7, r0
-    mov r1, r6
-    add r1, 1
-    call crfs_u8
-    mov r3, r0
-    cmp r7, 1
-    jne may_flag_test
-    push r3
-    mov r1, r6
-    add r1, 4
-    call crfs_u16
-    pop r3
-    cmp r0, 0
-    je may_flag_test
-    cmp r0, 65535
-    je may_flag_test
-    push r3
-    mov r1, r0
-    mul r1, 48
-    add r1, 769
-    call crfs_u8
-    pop r3
-    and r3, r0
-may_flag_test:
-    pop r1
-    pop r5
-    mov r0, r3
-    cmp r0, 65535
-    je may_no
-    and r0, r5
-    cmp r0, 0
-    je may_no
-may_yes:
-    mov r0, 0
-    ret
-may_pop_yes:
-    pop r1
-    mov r0, 0
-    ret
-may_pop_no:
-    pop r1
-    jmp may_no
-may_no:
-    mov r0, 65535
-    ret
+; may_write_ino / may_signal_pid / current_euid 已归入 guestpolicy.ts。
 
 ; r1 = inode。0 表示 1 <= inode < 64，否则 0xffff。只改 r0。
 ino_in_range:
     cmp r1, 0
     je ino_range_no
-    cmp r1, 64
+    cmp r1, ${SDA_INODES}
     jlt ino_range_yes
 ino_range_no:
     mov r0, 65535
@@ -2059,49 +1935,7 @@ ino_range_yes:
     mov r0, 0
     ret
 
-; r1 = target pid。0 允许，0xffff 拒绝。root 放行；否则目标 euid 或 uid 必须等于调用者 euid。
-; 会破坏 r0、r4-r7，保留 r1。
-may_signal_pid:
-    push r1
-    call current_euid
-    pop r1
-    cmp r0, 0
-    je may_signal_yes
-    mov r7, r0
-    mov r4, 0
-may_signal_scan:
-    cmp r4, 16
-    je may_signal_no
-    mov r5, r4
-    mul r5, 192
-    add r5, 0x0100
-    ldb r6, [r5+0]
-    cmp r6, 1
-    jne may_signal_next
-    ldw r6, [r5+2]
-    cmp r6, r1
-    je may_signal_hit
-may_signal_next:
-    add r4, 1
-    jmp may_signal_scan
-may_signal_hit:
-    ldw r6, [r5+178]
-    cmp r6, r7
-    je may_signal_yes
-    ldw r6, [r5+176]
-    cmp r6, r7
-    je may_signal_yes
-may_signal_no:
-    mov r0, 65535
-    ret
-may_signal_yes:
-    mov r0, 0
-    ret
-
-current_euid:
-    call current_pcb
-    ldw r0, [r5+178]
-    ret
+; 信号判定在 guestpolicy.ts 的 gp_may_signal。
 
 ; current_pcb: returns current PCB physical address in r5
 current_pcb:
@@ -2371,7 +2205,7 @@ sys_kill:
     je kill_init_gate
     push r1
     push r2
-    call may_signal_pid
+    call gp_may_signal
     pop r2
     pop r1
     cmp r0, 0

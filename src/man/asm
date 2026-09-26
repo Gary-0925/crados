@@ -1,0 +1,70 @@
+# asm
+
+A program in /bin is not special. It is a file whose first four bytes are
+the magic number \x7fCRX, with the execute bit set. Assemble one and it is
+loaded, paged and scheduled exactly like the system utilities.
+
+## Build and run
+
+    as hello.s -o hello    assemble; the execute bit is set for you
+    ./hello                run it from the current directory
+    cp hello /usr/bin/     install it
+    hello                  now found on PATH, like ls or ps
+    objdump hello          disassemble the text section
+
+## Machine
+
+Eight 16-bit registers r0-r7. Fixed four-byte instructions. Flags are set
+by cmp and tested by je, jne, jlt, jgt. The address space starts at 0:
+.text first, then .data, with the stack on the top page. Every fetch and
+load goes through the page table; a bad address raises a page fault and
+the kernel kills the process, just as SIGSEGV would.
+
+## Instructions
+
+    mov add sub mul div mod cmp   rD, rS or rD, imm
+    jmp je jne jlt jgt call ret   control flow
+    ldb rD, [rB+off]              load byte
+    stb [rB+off], rS              store byte
+    ldw rD, [rB+off]              load 16-bit word
+    stw [rB+off], rS              store 16-bit word
+    push rS | push imm | pop rD   stack
+    sys                           trap into the kernel
+    hlt                           stop; r1 is the exit status
+
+## Directives
+
+    .text  .data  .asciz "s"  .ascii "s"  .byte n  .word n  .space n
+
+_start is the entry point if defined, otherwise address 0.
+
+## Calling convention
+
+On entry r1 holds argc and r2 points at the argv block, where arguments
+are separated by NUL bytes. For a syscall, r0 holds the call number and
+r1-r3 the arguments; r0 receives the result. 0xffff means failure.
+
+## System calls
+
+     1 write(fd,buf,len)    len 0 means up to the NUL terminator
+     2 read(fd,buf,max)     returns length, 0xffff at end of file
+     3 exit(status)         4 open(path,mode)   mode 0 r, 1 w, 2 a
+     5 close(fd)            6 sleep(ticks)      7 getpid()
+     8 gethz()              9 spawn(path,argv,argc)
+    10 wait(pid)           11 getdents(path,buf,max)
+    12 getcwd(buf)         13 unlink(path)     14 mkdir(path)
+    15 chmod(path,set,clr)       16 rename(from,to)  17 sync()
+    18 getenv(key,buf)     20 mount(dev,dir)   21 umount(target)
+    22 kill(pid,sig)       23 chdir(path)      24 dup(fd)
+    25 dup2(old,new)       26 readview(kind,arg,buf)
+    27 assemble(src,out)   28 tcsetpgrp(pid)
+    29 page_alloc(vpn)     30 clock_gettime()   31 page_free(vpn)
+    32 block_read(dev,blk,buf)   33 block_write(dev,blk,buf)
+    34 sleep_seconds(seconds)
+
+getdents fills a buffer with 16-byte records: 15 bytes of NUL-padded name
+plus one type byte. That is why these calls take a buffer and a length.
+
+## Sources
+
+See hello.s and count.s in /home/user.

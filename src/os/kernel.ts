@@ -16,7 +16,7 @@ import {
   saveDev,
   SPECS,
 } from './blockdev'
-import { applyLoginPolicy, CRFS, M_OEXEC, T_FILE, UID_ROOT, UID_USER, VFS } from './fs'
+import { applyLoginPolicy, CRFS, M_OEXEC, T_DIR, T_FILE, UID_ROOT, UID_USER, VFS } from './fs'
 import {
   DEVINFO_BASE,
   DEVINFO_SLOTS,
@@ -37,6 +37,7 @@ import { assemble, disassemble, loadExe } from './isa'
 import { ASM_PROGRAMS } from './asmsrc'
 import { GUEST_IDLE_SOURCE, GUEST_KERNEL_SOURCE } from './guestkernel'
 import { GUEST_POLICY_SOURCE } from './guestpolicy'
+import { OS_VERSION } from '../utils/config'
 import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from './vm'
 import type { Bus } from './vm'
 import { deviceCode, deviceName, MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
@@ -92,7 +93,7 @@ export class Kernel {
   private readonly devs = new Map<string, BlockDev>()
   private readonly fss = new Map<string, CRFS>()
   private readonly procs = new Map<number, Process>()
-  private readonly romErrors: string[] = []
+  private readonly binErrors: string[] = []
   private kernelIvt = 0
   private nextPid = 0
 
@@ -147,7 +148,7 @@ export class Kernel {
       this.ticks++
       this.log(msg, true)
     }
-    stamp('crados 3.1 booting on browser/js')
+    stamp(`crados ${OS_VERSION} booting on browser/js`)
     stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
     stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${RAM_SIZE / 1024} KiB`)
 
@@ -156,36 +157,27 @@ export class Kernel {
       return
     }
 
-    // ROM：固件镜像，每次上电重新烧写
-    const rom = this.makeDev('rom')
-    const romfs = this.fss.get('rom')!
-    romfs.format('firmware')
-    this.vfs.mount('/', romfs) // 临时根，便于写入 ROM 内容
-    const compiled = this.installFirmware(romfs)
-    stamp(
-      `rom: ${rom.blockCount} blocks of ${rom.blockSize} B, ${romfs.usedInodes()} objects, ${compiled} as native CRX code`,
-    )
-
-    // sda：根盘，优先从持久化存储恢复整盘字节
+    // sda：根盘（相当于 Windows 的 C 盘），优先从持久化存储恢复整盘字节。
+    // 系统程序 /bin/* 也装在这块盘上，每次上电重新写入以保证与当前固件一致。
     const sda = this.makeDev('sda')
     const sdafs = this.fss.get('sda')!
     const restored = loadDev(sda) && sdafs.valid()
     if (!restored) {
-      // 首次上电：把随系统分发的根盘镜像整体写入设备，与从主机导入 .img 等价
       const image = buildRootImage()
       sda.load(image.bytes)
       for (const e of image.errors) this.log(`rootfs image: ${e}`)
     }
     this.vfs.umount('/')
     this.vfs.mount('/', sdafs)
-    this.vfs.mount('/bin', romfs)
+    const compiled = this.installPrograms(sdafs)
+    stamp(`bin: ${compiled} programs installed on /dev/sda`)
     this.ensureCreds('sda')
     stamp(
       restored
         ? `sda: superblock valid, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`
         : `sda: root image written, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`,
     )
-    stamp('vfs: mounted /dev/sda on /, /dev/rom on /bin')
+    stamp('vfs: mounted /dev/sda on /')
 
     for (const name of listStoredDisks()) {
       const dev = this.makeDev(name, diskSpec(name))
@@ -202,8 +194,8 @@ export class Kernel {
     this.storageOk = this.persist ? saveDev(sda) : false
     stamp('tty0: console ready, canonical mode with echo')
 
-    if (this.romErrors.length) {
-      this.panic = `ROM build failed: ${this.romErrors.join('; ')}`
+    if (this.binErrors.length) {
+      this.panic = `program install failed: ${this.binErrors.join('; ')}`
       this.log(`Kernel panic - not syncing: ${this.panic}`, true)
       this.emit()
       return
@@ -251,17 +243,30 @@ export class Kernel {
   }
 
   // 烧写 ROM：/bin 里只接受汇编后的 CRX 映像
-  private installFirmware(fs: CRFS): number {
+  private installPrograms(fs: CRFS): number {
     let compiled = 0
+    let bin = fs.lookup(1, 'bin')
+    if (typeof bin !== 'number') {
+      const made = fs.create(1, 'bin', T_DIR)
+      if (typeof made !== 'number') {
+        this.binErrors.push(`cannot create /bin: ${made.err}`)
+        return 0
+      }
+      bin = made
+    }
+    for (const e of fs.entries(bin)) {
+      fs.unlink(bin, e.name)
+      fs.destroy(e.ino)
+    }
     for (const [name, source] of Object.entries(ASM_PROGRAMS)) {
       const r = assemble(source)
       if (r.errors.length) {
         const error = `${name}: ${r.errors[0]}`
-        this.romErrors.push(error)
-        this.log(`rom: failed to assemble ${error}`)
+        this.binErrors.push(error)
+        this.log(`bin: failed to assemble ${error}`)
         continue
       }
-      const ino = fs.create(1, name, T_FILE)
+      const ino = fs.create(bin, name, T_FILE)
       if (typeof ino !== 'number') continue
       fs.writeBytes(ino, r.bytes)
       fs.setExec(ino, true)
@@ -736,8 +741,6 @@ export class Kernel {
     if (parent) {
       p.uid = parent.uid
       p.euid = parent.euid
-      p.gid = parent.gid
-      p.egid = parent.egid
     }
     if (setuid !== undefined) p.euid = setuid
     p.pageTable = [
@@ -782,7 +785,7 @@ export class Kernel {
 
   // Frame 0 is the KCB; frames 1..12 hold PCBs.
   private writeKernelTables() {
-    const banner = 'crados 3.1\n'
+    const banner = `crados ${OS_VERSION}\n`
     for (let i = 0; i < 32; i++) {
       this.mem.bytes[i] = i < banner.length ? banner.charCodeAt(i) : 0
     }
@@ -917,8 +920,6 @@ export class Kernel {
       }
     }
     if (flags & 1) {
-      created.gid = created.uid
-      created.egid = created.uid
       this.shellPid = created.pid
       this.fgPid = created.pid
       this.mem.setU16(0x002c, created.pid)
@@ -1277,6 +1278,15 @@ export class Kernel {
     this.emit()
   }
 
+  private maySignalFg(fg: Process, shell: Process): boolean {
+    return (
+      fg.pid > 1 &&
+      fg.pid !== this.shellPid &&
+      fg.state !== 'zombie' &&
+      (shell.euid === UID_ROOT || fg.euid === shell.euid || fg.uid === shell.euid)
+    )
+  }
+
   pressCtrlC() {
     if (this.panic) return
     this.conWrite('^C\n', 'err')
@@ -1284,14 +1294,7 @@ export class Kernel {
     const fgPid = this.foregroundPid
     const fg = fgPid !== null ? this.procs.get(fgPid) : undefined
     const shell = this.procs.get(this.shellPid)
-    // 前台组可以被改写。键盘信号不能因此打到 init，也不能打到 shell 无权发信号的进程。
-    const allowed =
-      fg !== undefined &&
-      shell !== undefined &&
-      fg.pid > 1 &&
-      fg.pid !== this.shellPid &&
-      fg.state !== 'zombie' &&
-      (shell.euid === UID_ROOT || fg.euid === shell.euid || fg.uid === shell.euid)
+    const allowed = fg !== undefined && shell !== undefined && this.maySignalFg(fg, shell)
     if (allowed) this.killSig(fg, 2)
     else {
       this.lineQueue.push('')

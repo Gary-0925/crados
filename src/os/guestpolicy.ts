@@ -6,6 +6,24 @@
 //   8 name[16]  24 argv[160]  184 envLen  186 env[80]
 //   266 cwdDev  267 cwdIno  268 flags（bit0 = 登录会话）
 
+import {
+  I_FLAGS,
+  I_PARENT,
+  INODE_SIZE,
+  ITABLE_BYTE,
+  M_EXEC,
+  M_OEXEC,
+  M_OREAD,
+  M_OWRITE,
+  M_READ,
+  M_SETUID,
+  M_WRITE,
+  SB_UID,
+  UID_ROOT,
+  UID_USER_NAME,
+} from './fs'
+import { PCB_EUID, PCB_UID } from './process'
+
 export const GUEST_POLICY_SOURCE = `
 .text
 
@@ -22,6 +40,178 @@ gp_use_vdev:
     ldw r5, [r4+0x0040]
     stw [r4+0x0046], r5
     ret
+
+; ---- credentials and permission decisions live here and only here ----
+
+current_euid:
+    call current_pcb
+    ldw r0, [r5+${PCB_EUID}]
+    ret
+
+gp_bit_decide:
+    cmp r1, ${UID_ROOT}
+    je gp_bd_yes
+    cmp r2, r1
+    jne gp_bd_other
+    mov r0, r3
+    jmp gp_bd_test
+gp_bd_other:
+    mov r0, r7
+gp_bd_test:
+    and r0, r6
+    cmp r0, 0
+    je gp_bd_no
+gp_bd_yes:
+    mov r0, 0
+    ret
+gp_bd_no:
+    mov r0, 65535
+    ret
+
+; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
+; 有效 flags = inode flags ∩ 父目录 flags，判定统一走 gp_bit_decide（r7 = 其他人位）。
+vfs_may:
+    call ino_in_range
+    cmp r0, 0
+    jne vfs_may_no
+    mov r4, 0
+    stw [r4+0x00B0], r1
+    stw [r4+0x00B2], r2
+    stw [r4+0x00B4], r3
+    call current_euid
+    cmp r0, ${UID_ROOT}
+    je vfs_may_yes
+    mov r4, 0
+    stw [r4+0x00B6], r0
+    ldw r1, [r4+0x00B0]
+    mul r1, 2
+    add r1, ${SB_UID}
+    call vfs_u16
+    cmp r0, 65535
+    je vfs_may_no
+    mov r4, 0
+    stw [r4+0x00AC], r0
+    ldw r1, [r4+0x00B0]
+    call vfs_inode
+    cmp r0, 65280
+    je vfs_may_no
+    mov r1, r0
+    add r1, ${I_FLAGS}
+    call vfs_u8
+    cmp r0, 65535
+    je vfs_may_no
+    mov r4, 0
+    mov r2, r0
+    ldw r1, [r4+0x00B0]
+    call gp_cap_flags
+    mov r4, 0
+    mov r6, r0
+    ldw r1, [r4+0x00B6]
+    ldw r2, [r4+0x00AC]
+    ldw r3, [r4+0x00B2]
+    ldw r7, [r4+0x00B4]
+    call gp_bit_decide
+    cmp r0, 0
+    jne vfs_may_no
+vfs_may_yes:
+    mov r0, 0
+    ret
+vfs_may_no:
+    mov r0, 65535
+    ret
+
+; may_write_ino: 写许可，走 sda 直读视图（crfs_*）。
+may_write_ino:
+    push r1
+    call ino_in_range
+    cmp r0, 0
+    jne may_pop_no
+    call current_euid
+    cmp r0, ${UID_ROOT}
+    je may_pop_yes
+    mov r4, 0
+    stw [r4+0x00B6], r0
+    pop r1
+    push r1
+    mul r1, 2
+    add r1, ${SB_UID}
+    call crfs_u16
+    cmp r0, 65535
+    je may_no
+    mov r4, 0
+    stw [r4+0x00BA], r0
+    pop r1
+    push r1
+    mul r1, ${INODE_SIZE}
+    add r1, ${ITABLE_BYTE + I_FLAGS}
+    call crfs_u8
+    mov r2, r0
+    call gp_cap_flags_sda
+    mov r3, r0
+may_flag_have:
+    mov r4, 0
+    pop r1
+    mov r6, r3
+    ldw r1, [r4+0x00B6]
+    ldw r2, [r4+0x00BA]
+    mov r3, ${M_WRITE}
+    mov r7, ${M_OWRITE}
+    call gp_bit_decide
+    cmp r0, 0
+    jne may_no
+    jmp may_yes
+may_pop_yes:
+    pop r1
+    mov r0, 0
+    ret
+may_pop_no:
+    pop r1
+    jmp may_no
+may_no:
+    mov r0, 65535
+    ret
+may_yes:
+    mov r0, 0
+    ret
+
+; gp_may_signal: r1 = 目标 pid。0 允许，0xffff 拒绝。kernel.ts 的 maySignalFg 是它的宿主镜像。
+gp_may_signal:
+    push r1
+    call current_euid
+    pop r1
+    cmp r0, ${UID_ROOT}
+    je gp_ms_yes
+    mov r7, r0
+    mov r4, 0
+gp_ms_scan:
+    cmp r4, 16
+    je gp_ms_no
+    mov r5, r4
+    mul r5, 192
+    add r5, 0x0100
+    ldb r6, [r5+0]
+    cmp r6, 1
+    jne gp_ms_next
+    ldw r6, [r5+2]
+    cmp r6, r1
+    je gp_ms_hit
+gp_ms_next:
+    add r4, 1
+    jmp gp_ms_scan
+gp_ms_hit:
+    ldw r6, [r5+${PCB_EUID}]
+    cmp r6, r7
+    je gp_ms_yes
+    ldw r6, [r5+${PCB_UID}]
+    cmp r6, r7
+    je gp_ms_yes
+gp_ms_no:
+    mov r0, 65535
+    ret
+gp_ms_yes:
+    mov r0, 0
+    ret
+
 
 ; r1 = user path. r0 = address of the last slash, or 0.
 gp_last_slash:
@@ -122,13 +312,24 @@ gp_name_len_done:
 
 ; Allocate an inode on the device selected by 0x0046. Returns inode or 65535.
 gp_alloc_ino:
+    mov r1, 0
+    call sda_read_block
+    cmp r0, 0
+    jne gp_ret_fail
+    mov r4, 0
+    mov r1, 0x0D00
+    ldw r0, [r1+8]
+    mov r4, 0
+    stw [r4+0x00AC], r0
     mov r1, 2
     call sda_read_block
     cmp r0, 0
     jne gp_ret_fail
     mov r4, 1
 gp_ino_scan:
-    cmp r4, 64
+    mov r5, 0
+    ldw r7, [r5+0x00AC]
+    cmp r4, r7
     je gp_ret_fail
     mov r5, r4
     div r5, 8
@@ -459,41 +660,84 @@ gp_dir_commit:
 
 ; r1 = inode, r2 = flags. A regular file is capped to its parent directory's flags.
 ; Directories and devices are unchanged. Returns the flags to store or test.
+; gp_cap_flags: r1 = inode, r2 = 自身 flags，返回有效 flags = 自身沿整条祖先链
+; 逐级 AND（含根目录）。任何祖先没有的位，后代就不可能有。parent 号在本
+; 文件系统里恒小于 child 号，链条一旦不单调立即视为终止，天然防环。
 gp_cap_flags:
     mov r4, 0
     stw [r4+0x0076], r1
     stw [r4+0x0078], r2
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_raw
-    mov r1, r0
-    call vfs_u8
-    cmp r0, 1
-    jne gp_cap_raw
+gp_cap_step:
     mov r4, 0
     ldw r1, [r4+0x0076]
     call vfs_inode
     cmp r0, 65280
-    je gp_cap_raw
-    add r0, 4
-    mov r1, r0
-    call vfs_u16
-    cmp r0, 0
-    je gp_cap_raw
-    cmp r0, 65535
-    je gp_cap_raw
-    mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_raw
-    add r0, 1
+    je gp_cap_done
+    add r0, ${I_FLAGS}
     mov r1, r0
     call vfs_u8
+    cmp r0, 65280
+    je gp_cap_done
     mov r4, 0
-    ldw r1, [r4+0x0078]
-    and r0, r1
+    ldw r5, [r4+0x0078]
+    and r5, r0
+    stw [r4+0x0078], r5
+    ldw r1, [r4+0x0076]
+    cmp r1, 1
+    je gp_cap_done
+    call vfs_inode
+    cmp r0, 65280
+    je gp_cap_done
+    add r0, ${I_PARENT}
+    mov r1, r0
+    call vfs_u16
+    cmp r0, 65280
+    je gp_cap_done
+    mov r4, 0
+    ldw r5, [r4+0x0076]
+    cmp r0, r5
+    je gp_cap_done
+    jgt gp_cap_done
+    stw [r4+0x0076], r0
+    jmp gp_cap_step
+gp_cap_done:
+    mov r4, 0
+    ldw r0, [r4+0x0078]
     ret
-gp_cap_raw:
+
+; gp_cap_flags_sda: 同 gp_cap_flags，但走 sda 直读视图（写路径用）。
+gp_cap_flags_sda:
+    mov r4, 0
+    stw [r4+0x0076], r1
+    stw [r4+0x0078], r2
+gp_cap_sda_step:
+    mov r4, 0
+    ldw r1, [r4+0x0076]
+    mul r1, ${INODE_SIZE}
+    add r1, ${ITABLE_BYTE + I_FLAGS}
+    call crfs_u8
+    cmp r0, 65535
+    je gp_cap_sda_done
+    mov r4, 0
+    ldw r5, [r4+0x0078]
+    and r5, r0
+    stw [r4+0x0078], r5
+    ldw r1, [r4+0x0076]
+    cmp r1, 1
+    je gp_cap_sda_done
+    mul r1, ${INODE_SIZE}
+    add r1, ${ITABLE_BYTE + I_PARENT}
+    call crfs_u16
+    cmp r0, 65535
+    je gp_cap_sda_done
+    mov r4, 0
+    ldw r5, [r4+0x0076]
+    cmp r0, r5
+    je gp_cap_sda_done
+    jgt gp_cap_sda_done
+    stw [r4+0x0076], r0
+    jmp gp_cap_sda_step
+gp_cap_sda_done:
     mov r4, 0
     ldw r0, [r4+0x0078]
     ret
@@ -523,8 +767,8 @@ gp_create:
     jne gp_ret_fail
     mov r4, 0
     ldw r1, [r4+0x0062]
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_ret_fail
@@ -592,7 +836,7 @@ gp_create_store:
     mov r4, 0
     ldw r1, [r4+0x0064]
     mul r1, 2
-    add r1, 32
+    add r1, ${SB_UID}
     call crfs_write_u16
     mov r4, 0
     ldw r1, [r4+0x0062]
@@ -640,8 +884,8 @@ gp_open_found:
     cmp r2, 0
     jne gp_open_write
     ldw r1, [r4+0x0056]
-    mov r2, 2
-    mov r3, 8
+    mov r2, ${M_READ}
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -657,8 +901,8 @@ gp_open_write:
     cmp r5, 1
     jne gp_fail
     ldw r1, [r4+0x0056]
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -695,8 +939,8 @@ gp_open_dev:
     cmp r2, 0
     jne gp_open_dev_w
     ldw r1, [r4+0x0056]
-    mov r2, 2
-    mov r3, 8
+    mov r2, ${M_READ}
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -707,8 +951,8 @@ gp_open_dev_w:
     cmp r5, 254
     je gp_fail
     ldw r1, [r4+0x0056]
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -782,12 +1026,12 @@ gp_chmod:
     cmp r5, 1
     jne gp_fail
     call current_euid
-    cmp r0, 0
+    cmp r0, ${UID_ROOT}
     je gp_chmod_apply
     stw [r4+0x0058], r0
     ldw r1, [r4+0x0056]
     mul r1, 2
-    add r1, 32
+    add r1, ${SB_UID}
     call vfs_u16
     mov r4, 0
     ldw r5, [r4+0x0058]
@@ -812,7 +1056,7 @@ gp_chmod_apply:
     ldw r2, [r4+0x0052]
     cmp r0, 0
     je gp_chmod_or
-    mov r3, 32
+    mov r3, ${M_SETUID}
     xor r3, 65535
     and r2, r3
 gp_chmod_or:
@@ -850,8 +1094,8 @@ gp_chdir:
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0056]
-    mov r2, 1
-    mov r3, 128
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -979,13 +1223,13 @@ gp_unlink_parent:
     cmp r0, 0
     je gp_unlink_do
     call current_euid
-    cmp r0, 0
+    cmp r0, ${UID_ROOT}
     je gp_unlink_do
     mov r4, 0
     stw [r4+0x0058], r0
     ldw r1, [r4+0x0056]
     mul r1, 2
-    add r1, 32
+    add r1, ${SB_UID}
     call vfs_u16
     mov r4, 0
     ldw r5, [r4+0x0058]
@@ -1244,15 +1488,15 @@ gp_rename:
     cmp r5, r6
     jne gp_fail
     ldw r1, [r4+0x0062]
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0060]
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -1729,8 +1973,8 @@ gp_spawn_check:
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0056]
-    mov r2, 1
-    mov r3, 128
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -1867,8 +2111,8 @@ gp_join_done:
 ; Applies setuid of the inode in 0x0056 / current v_dev onto 0x005C (euid).
 gp_setuid_from:
     call current_pcb
-    ldw r6, [r5+176]
-    ldw r7, [r5+178]
+    ldw r6, [r5+${PCB_UID}]
+    ldw r7, [r5+${PCB_EUID}]
     mov r4, 0
     stw [r4+0x005A], r6
     stw [r4+0x005C], r7
@@ -1879,13 +2123,13 @@ gp_setuid_from:
     mov r1, r0
     add r1, 1
     call vfs_u8
-    and r0, 32
+    and r0, ${M_SETUID}
     cmp r0, 0
     je gp_setuid_done
     mov r4, 0
     ldw r1, [r4+0x0056]
     mul r1, 2
-    add r1, 32
+    add r1, ${SB_UID}
     call vfs_u16
     mov r4, 0
     stw [r4+0x005C], r0
@@ -1979,8 +2223,8 @@ gp_bang_end:
     ldw r5, [r4+0x0040]
     stw [r4+0x0058], r5
     mov r1, r0
-    mov r2, 1
-    mov r3, 128
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
     call vfs_may
     cmp r0, 0
     jne gp_ret_fail
@@ -2175,8 +2419,8 @@ gp_assemble:
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0056]
-    mov r2, 2
-    mov r3, 8
+    mov r2, ${M_READ}
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -2201,8 +2445,8 @@ gp_as_dest:
     je gp_fail
     stw [r4+0x0062], r5
     mov r1, r0
-    mov r2, 4
-    mov r3, 16
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -2222,7 +2466,7 @@ gp_as_dest:
 
 gp_mount:
     call current_euid
-    cmp r0, 0
+    cmp r0, ${UID_ROOT}
     jne gp_fail
     mov r4, 0
     stw [r4+0x0050], r1
@@ -2326,7 +2570,7 @@ gp_dev_no:
 
 gp_umount:
     call current_euid
-    cmp r0, 0
+    cmp r0, ${UID_ROOT}
     jne gp_fail
     mov r4, 0
     stw [r4+0x0050], r1
@@ -2443,7 +2687,7 @@ gp_ps_loop:
     call view_putc
     pop r5
     push r5
-    ldw r1, [r5+178]
+    ldw r1, [r5+${PCB_EUID}]
     mov r2, 5
     mov r3, 0
     call view_num
@@ -2962,8 +3206,8 @@ gp_hex:
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0060]
-    mov r2, 2
-    mov r3, 8
+    mov r2, ${M_READ}
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -3139,8 +3383,8 @@ gp_od:
     jne gp_fail
     mov r4, 0
     ldw r1, [r4+0x0060]
-    mov r2, 2
-    mov r3, 8
+    mov r2, ${M_READ}
+    mov r3, ${M_OREAD}
     call vfs_may
     cmp r0, 0
     jne gp_fail
@@ -3189,7 +3433,7 @@ gp_home:
 gp_sh:
     .asciz "sh"
 gp_login_env:
-    .ascii "USER\\01\\0HOME\\0/home/user\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
+    .ascii "USER\\0${UID_USER_NAME}\\0HOME\\0/home/user\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
     .byte 0
 gp_root_env:
     .ascii "USER\\0root\\0HOME\\0/\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"

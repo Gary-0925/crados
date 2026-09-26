@@ -49,7 +49,7 @@ export default function Transparent() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#0d1117] font-mono text-[#c9d1d9]">
-      <Header kernel={kernel} ips={snap.ips} onReboot={reboot} />
+      <Header kernel={kernel} onReboot={reboot} />
 
       <main className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <section className="min-h-[40vh] flex-1 lg:min-h-0">

@@ -40,11 +40,10 @@ const SB_DATA = 12
 const SB_LABEL = 16
 const LABEL_MAX = 16
 
-// inode 字段偏移。机器码内核按这些偏移直接解析，不能挪。
 const I_TYPE = 0
-const I_FLAGS = 1
+export const I_FLAGS = 1
 const I_SIZE = 2
-const I_PARENT = 4
+export const I_PARENT = 4
 const I_DRIVER = 6
 const I_PTR = 8
 
@@ -65,12 +64,17 @@ export const MODE_TMP = MODE_DIR | M_OWRITE | M_STICKY // 1777
 
 export const UID_ROOT = 0
 export const UID_USER = 1
+export const UID_ROOT_NAME = 'root'
+export const UID_USER_NAME = 'user'
 
 // 超级块空闲区：偏移 14 是特性字，偏移 32 起每个 inode 一个大端 uid。
 // 64 × 2 = 128 字节，落在最小的 256 B 超级块里，不占用数据块。
 const SB_FEAT = 14
 const FEAT_CREDS = 0x0001
-const SB_UID = 32
+export const SB_UID = 32
+
+export const ITABLE_START = 3
+export const ITABLE_BYTE = ITABLE_START * 256
 
 export interface FNode {
   dev: BlockDev
@@ -116,7 +120,7 @@ export class CRFS {
 
   constructor(readonly dev: BlockDev) {
     this.inodeCount = dev.spec.inodeCount
-    this.itableStart = 3
+    this.itableStart = ITABLE_START
     const itableBlocks = Math.ceil((this.inodeCount * INODE_SIZE) / dev.blockSize)
     this.dataStart = this.itableStart + itableBlocks
   }
@@ -137,6 +141,7 @@ export class CRFS {
     for (let b = 0; b < this.dataStart; b++) this.setBlockBit(b, true) // 元数据区预占
     const root = this.allocInode(T_DIR, 0)
     if (root !== 1) throw new Error('mkfs: root inode must be 1')
+    this.setFlags(root, MODE_TMP)
     this.markCreds()
   }
 
@@ -263,6 +268,7 @@ export class CRFS {
       if (!this.inodeUsed(ino)) continue
       const type = this.itype(ino)
       let mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
+      if (ino === 1) mode = MODE_TMP
       if (this.iexec(ino)) mode |= M_EXEC | M_OEXEC
       this.setFlags(ino, mode)
       this.setOwner(ino, UID_ROOT)
