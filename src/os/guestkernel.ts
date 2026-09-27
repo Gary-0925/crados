@@ -1443,11 +1443,6 @@ view_type_put:
     add r1, 1
     call vfs_u8
     mov r6, r0          ; flags, kept in r6 by view_bit
-    mov r4, 0
-    ldw r1, [r4+0x0084]
-    mov r2, r6
-    call gp_cap_flags   ; a file cannot show bits its directory lacks
-    mov r6, r0
     mov r1, 2
     mov r2, 114         ; owner r
     call view_bit

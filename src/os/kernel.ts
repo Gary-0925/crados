@@ -130,6 +130,9 @@ export class Kernel {
   private ttyIrqPending = false
   // canonical tty 回显开关：密码输入时 CRX 内核通过 MMIO 0xFF12 关掉它
   private ttyEcho = true
+  // CRX 以字节写 TTY，清屏序列可能跨多个 MMIO write；驱动保留控制序列前缀，
+  // 不能把 ESC、[、2、J 当成四个普通可见字符。
+  private ttyEscape = ''
   // TTY 是字节设备，UTF-8 只在驱动边界解码；stream 模式能跨 write 调用保留半个字符。
   private readonly ttyDecoders = {
     out: new TextDecoder('utf-8', { fatal: false }),
@@ -727,14 +730,44 @@ export class Kernel {
     }
   }
 
+  private conWriteTty(text: string, cls: SegClass) {
+    if (!text) return
+    const sequence = '\x1b[2J'
+    const combined = this.ttyEscape + text
+    this.ttyEscape = ''
+    let from = 0
+    while (from < combined.length) {
+      const hit = combined.indexOf(sequence, from)
+      if (hit >= 0) {
+        if (hit > from) this.conWrite(combined.slice(from, hit), cls)
+        this.lines = []
+        from = hit + sequence.length
+        continue
+      }
+      const tail = combined.slice(from)
+      let keep = 0
+      for (let n = 1; n < sequence.length; n++) {
+        if (tail.endsWith(sequence.slice(0, n))) keep = n
+      }
+      if (keep) {
+        const visible = tail.slice(0, -keep)
+        if (visible) this.conWrite(visible, cls)
+        this.ttyEscape = tail.slice(-keep)
+      } else {
+        this.conWrite(tail, cls)
+      }
+      return
+    }
+  }
+
   // TypeScript only supplies the virtual UART hardware. It does not inspect
   // syscalls or file descriptors; those decisions are made by CRX kernel code.
   private mmioWrite(port: number, byte: number) {
     const raw = Uint8Array.of(byte & 0xff)
     if (port === MMIO_TTY_OUT) {
-      this.conWrite(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
+      this.conWriteTty(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
     } else if (port === MMIO_TTY_ERR) {
-      this.conWrite(this.ttyDecoders.err.decode(raw, { stream: true }), 'err')
+      this.conWriteTty(this.ttyDecoders.err.decode(raw, { stream: true }), 'err')
     } else if (port === MMIO_TTY_MODE) {
       this.ttyEcho = (byte & 0xff) !== 0
     }
@@ -903,6 +936,11 @@ export class Kernel {
     }
   }
 
+  private singletonBusy(name: string): boolean {
+    if (name !== 'init' && name !== 'login') return false
+    return [...this.procs.values()].some((p) => p.name === name && p.state !== 'zombie')
+  }
+
   // svc 40: the guest already resolved the path, checked permission, and filled
   // the request. The host only loads the authorized image and attaches a CPU.
   private hwExec(parent: Process, at: number): number | Err {
@@ -928,6 +966,7 @@ export class Kernel {
     const cwdDev = b[at + 266] ?? 0
     const cwdIno = b[at + 267] ?? 0
     const flags = b[at + 268] ?? 0
+    if (this.singletonBusy(name)) return { err: 'EAGAIN' }
     const fs = this.fss.get(deviceName(dev))
     if (!fs || !fs.inodeUsed(ino)) return { err: 'ENOENT' }
     const exe = loadExe(String.fromCharCode(...fs.readBytes(ino)))
