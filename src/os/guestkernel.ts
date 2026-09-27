@@ -29,7 +29,7 @@
 //   0x0100..0x0CFF : Process Control Block Table (16 PCBs x 192 bytes)
 //   0x0D00..0x0DFF : Kernel Device Scratch Page
 //   0x0E00..0x11FF : host kmsg (u16 length, then text). Not a user page.
-//   0x1200..0x13FF : host device catalog, 8 x 64 B. CRX formats lsblk and df.
+//   0x1200..0x13FF : host device catalog, 8 x 64 B. CRX formats lsblk queries.
 //   high frames    : CRX Kernel Text (KERNEL_TEXT_PAGES, physical direct map)
 //   0xFF00..0xFFFF : MMIO，不是内存
 

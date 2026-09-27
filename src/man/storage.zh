@@ -44,7 +44,8 @@ readview 第 8 类给出，所以 ls 只需要沿途目录的搜索权，不需�
 
 ls 用到的两个调用 getdents 和 readview 第 8 类，全部由 CRX 内核完成。它的
 只读 VFS 能在任意设备上解析 inode 和目录块，经 KCB 0x00C0 的挂载表跨越
-挂载点。ps、mem、help、lsblk、df、dmesg 和 hexdump 都由这个内核排版。
+挂载点。ps、help、lsblk、dmesg 和 hexdump 都由这个内核排版；内存与文件
+系统详情分别通过 ps 和 lsblk 的查询参数显示，不再使用单独命令。
 objdump 自己检查路径，再请宿主解码指令。
 
     -rwxr-x-- root    464 cat
@@ -72,8 +73,10 @@ objdump 自己检查路径，再请宿主解码指令。
 
 ## 挂载
 
-    lsblk                    列出块设备
-    df                       各文件系统用量
+    lsblk                    合并显示设备和文件系统详情
+    lsblk -d                 只看设备详情
+    lsblk -f                 只看文件系统用量
+    lsblk -a                 显示全部字段（默认）
     mount /dev/sdb /mnt      把设备接入目录树
     cp /usr/man/README /mnt/      复制文件到该设备
     umount /mnt              摘除
