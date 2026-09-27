@@ -473,7 +473,6 @@ export class CRFS {
     if (this.lookup(dirIno, name)) return { err: 'EEXIST' }
     const ino = this.allocInode(type, dirIno)
     if (ino < 0) return { err: 'ENOSPC' }
-    if (type === T_FILE) this.setFlags(ino, this.iflags(ino) & this.iflags(dirIno))
     const r = this.link(dirIno, name, ino)
     if (r !== 0) {
       this.setBit(2, ino, false)

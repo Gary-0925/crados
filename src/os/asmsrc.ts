@@ -88,6 +88,17 @@ atoi_done:
     ret
 `
 
+// 清屏必须走 CRX 的 write(1)，由 TTY 驱动解释控制序列；宿主不替命令补清屏。
+const CLEAR_SCREEN = `
+clear_screen:
+    mov r0, 1
+    mov r1, 1
+    mov r2, clear_seq
+    mov r3, 4
+    sys
+    ret
+`
+
 // ---- 账户表 (/etc/passwd) 的通用子程序，各账户命令按需复制进自己的映像 ----
 
 // 读整张表进 acctbuf，NUL 结尾。出口 r0 = 0 / 0xffff
@@ -882,6 +893,7 @@ notfound:
     sys
     jmp prompt
 logout:
+    call clear_screen
     mov r0, 1
     mov r1, 1
     mov r2, bye
@@ -896,9 +908,9 @@ redirfail:
     mov r2, rfail
     mov r3, 0
     sys
-    mov r1, 1
-    hlt
+    jmp prompt
 
+${CLEAR_SCREEN}
 .data
 line:   .space 192
 onebyte: .byte 0
@@ -926,6 +938,9 @@ nf:     .asciz "sh: command not found\\n"
 bye:    .asciz "logout\\n"
 sfail:  .asciz "sh: cannot open script\\n"
 rfail:  .asciz "sh: cannot open redirection target\\n"
+clear_seq:
+    .byte 27
+    .ascii "[2J"
 `,
 
   cat: `; cat — with an argument copy that file, without one copy standard input
@@ -2350,6 +2365,7 @@ need_pass:
     mov r2, badmsg
     jmp fail
 do_login:
+    call clear_screen
     mov r0, 38
     mov r1, shpath
     mov r2, 0
@@ -2375,8 +2391,10 @@ retry:
     mov r1, 1
     hlt
 fail:
+    call clear_screen
     mov r0, 1
     mov r1, 2
+    mov r2, badmsg
     mov r3, 0
     sys
     mov r0, 0
@@ -2386,6 +2404,7 @@ fail:
     mov r1, 1
     hlt
 spawnfail:
+    call clear_screen
     mov r0, 1
     mov r1, 2
     mov r2, spfail
@@ -2401,8 +2420,12 @@ ${ACCT_LOAD}
 ${ACCT_FIND}
 ${HASH_PASS}
 ${ATOI}
+${CLEAR_SCREEN}
 .data
 ${ACCT_DATA}
+clear_seq:
+    .byte 27
+    .ascii "[2J"
 nprompt:
     .asciz "crados login: "
 pprompt:

@@ -8,7 +8,6 @@
 
 import {
   I_FLAGS,
-  I_PARENT,
   INODE_SIZE,
   ITABLE_BYTE,
   M_EXEC,
@@ -69,7 +68,6 @@ gp_bd_no:
 
 ; vfs_may: r1 = inode，r2 = 属主位，r3 = 其他人位。0 允许，0xffff 拒绝。
 ; 判定只看 inode 自己的 flags（Unix 语义），走 gp_bit_decide（r7 = 其他人位）。
-; 「子不超父」由创建（gp_create）和 chmod（gp_cap_flags）在写入时保证。
 vfs_may:
     call ino_in_range
     cmp r0, 0
@@ -672,41 +670,6 @@ gp_dir_commit:
     call crfs_write_u16
     ret
 
-; gp_cap_flags: r1 = inode, r2 = 候选 flags → r0 = r2 ∩ 父目录 flags（根目录不封顶）。
-; 只在 chmod 时用：不允许给文件加上父目录都没有的位。权限检查本身只看
-; inode 自己的 flags（Unix 语义），目录的位负责守住目录里的进出。
-; vfs_u8/vfs_u16 破坏 r1-r5，候选值暂存 0x0078。
-gp_cap_flags:
-    mov r4, 0
-    stw [r4+0x0078], r2
-    cmp r1, 1
-    je gp_cap_keep
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_keep
-    add r0, ${I_PARENT}
-    mov r1, r0
-    call vfs_u16
-    cmp r0, 65535
-    je gp_cap_keep
-    cmp r0, 0
-    je gp_cap_keep
-    mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cap_keep
-    add r0, ${I_FLAGS}
-    mov r1, r0
-    call vfs_u8
-    mov r4, 0
-    ldw r2, [r4+0x0078]
-    and r2, r0
-    stw [r4+0x0078], r2
-gp_cap_keep:
-    mov r4, 0
-    ldw r0, [r4+0x0078]
-    ret
-
 ; r1 = user path, r2 = type. Creates the inode and links it. 0 or 65535.
 gp_create:
     mov r4, 0
@@ -770,21 +733,6 @@ gp_create:
     mov r2, 143
     jmp gp_create_store
 gp_create_file:
-    stw [r4+0x0066], r2
-    ldw r1, [r4+0x0062]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_create_file_raw
-    add r0, 1
-    mov r1, r0
-    call vfs_u8
-    mov r4, 0
-    ldw r2, [r4+0x0066]
-    and r2, r0
-    jmp gp_create_store
-gp_create_file_raw:
-    mov r4, 0
-    ldw r2, [r4+0x0066]
 gp_create_store:
     ldw r1, [r4+0x0064]
     mul r1, 48
@@ -1031,12 +979,6 @@ gp_chmod_or:
     xor r2, 65535
     and r0, r2
     and r0, 255
-    ; 上限只取父目录一级（且不包含 inode 自己的旧模式），否则任何尚未
-    ; 置位的权限都永远设不上去。
-    stw [r4+0x005C], r0
-    ldw r1, [r4+0x0056]
-    ldw r2, [r4+0x005C]
-    call gp_cap_flags
     stw [r4+0x005C], r0
 gp_chmod_store:
     mov r4, 0
@@ -1384,6 +1326,84 @@ gp_rm_shrink:
     mov r2, 0
     call crfs_write_u16
 gp_rm_ok:
+    mov r0, 0
+    ret
+
+; r1 = kernel string, r2 = kernel string. 0 if equal up to NUL.
+gp_kern_kern_eq:
+    mov r7, 0
+gp_kke_loop:
+    ldb r3, [r1+0]
+    ldb r4, [r2+0]
+    cmp r3, r4
+    jne gp_ret_fail
+    cmp r3, 0
+    je gp_kke_yes
+    add r1, 1
+    add r2, 1
+    add r7, 1
+    cmp r7, 14
+    jlt gp_kke_loop
+    jmp gp_ret_fail
+gp_kke_yes:
+    mov r0, 0
+    ret
+
+; init and login are singleton system processes. Refuse a second live instance;
+; a zombie is allowed so init can reap it before starting its replacement.
+gp_singleton:
+    mov r1, spawn_req
+    add r1, 8
+    mov r2, singleton_init
+    call gp_kern_kern_eq
+    cmp r0, 0
+    je gp_singleton_init
+    mov r1, spawn_req
+    add r1, 8
+    mov r2, singleton_login
+    call gp_kern_kern_eq
+    cmp r0, 0
+    jne gp_singleton_clear
+    mov r2, singleton_login
+    jmp gp_singleton_scan_setup
+gp_singleton_init:
+    mov r2, singleton_init
+gp_singleton_scan_setup:
+    mov r4, 0
+    stw [r4+0x0080], r2
+    mov r3, 0
+    stw [r4+0x0082], r3
+gp_singleton_scan:
+    mov r4, 0
+    ldw r3, [r4+0x0082]
+    cmp r3, 16
+    je gp_singleton_clear
+    mov r4, r3
+    mul r4, 192
+    add r4, 0x0100
+    ldb r6, [r4+0]
+    cmp r6, 1
+    jne gp_singleton_next
+    ldb r6, [r4+1]
+    cmp r6, 5
+    je gp_singleton_next
+    mov r1, r4
+    add r1, 90
+    mov r4, 0
+    ldw r2, [r4+0x0080]
+    call gp_kern_kern_eq
+    cmp r0, 0
+    je gp_singleton_busy
+gp_singleton_next:
+    mov r4, 0
+    ldw r3, [r4+0x0082]
+    add r3, 1
+    stw [r4+0x0082], r3
+    jmp gp_singleton_scan
+gp_singleton_busy:
+    mov r0, 65535
+    ret
+gp_singleton_clear:
     mov r0, 0
     ret
 
@@ -1914,6 +1934,10 @@ gp_spawn:
     stw [r1+0], r2
     ldw r1, [r4+0x0050]
     call gp_basename
+    call gp_singleton
+    cmp r0, 0
+    jne gp_fail
+    mov r4, 0
     ldw r1, [r4+0x0050]
     call gp_has_slash
     cmp r0, 0
@@ -1989,6 +2013,10 @@ gp_spawnas:
     call gp_req_zero
     ldw r1, [r4+0x0050]
     call gp_basename
+    call gp_singleton
+    cmp r0, 0
+    jne gp_fail
+    mov r4, 0
     ldw r1, [r4+0x0050]
     call gp_has_slash
     cmp r0, 0
@@ -3451,6 +3479,10 @@ gp_names:
     .space 128
 spawn_req:
     .space 272
+singleton_init:
+    .asciz "init"
+singleton_login:
+    .asciz "login"
 gp_as_req:
     .space 4
 gp_od_req:
