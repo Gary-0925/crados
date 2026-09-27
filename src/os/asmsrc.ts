@@ -454,13 +454,17 @@ use:
 // Text views are kernel pseudo-files exposed through syscall 26. The executable
 // is still real CRX machine code; the kernel only supplies the same bytes that
 // /proc and /sys files supply to Unix utilities.
-const viewProgram = (name: string, kind: number, takesArg = false) => `; ${name} — read a kernel pseudo-file
+const viewProgram = (name: string, kind: number, takesArg = false, optionalArg = false) => `; ${name} — read a kernel pseudo-file
 .text
 _start:
     mov r4, 0
 ${takesArg ? `    cmp r1, 0
     je usage
     mov r4, r2
+` : optionalArg ? `    cmp r1, 0
+    je view
+    mov r4, r2
+view:
 ` : ''}    mov r0, 26
     mov r1, ${kind}
     mov r2, r4
@@ -2140,10 +2144,11 @@ err: .asciz "wc: cannot read file\\n"
 use: .asciz "usage: wc file\\n"
 `,
 
-  ps: viewProgram('ps', 1),
-  mem: viewProgram('mem', 2),
-  lsblk: viewProgram('lsblk', 3),
-  df: viewProgram('df', 4),
+  // ps folds in the old mem view; lsblk folds in the old df view.
+  // Their optional selector is passed to the guest kernel, which still formats
+  // every byte of the result from the underlying RAM/device records.
+  ps: viewProgram('ps', 1, false, true),
+  lsblk: viewProgram('lsblk', 3, false, true),
   dmesg: viewProgram('dmesg', 5),
   hexdump: viewProgram('hexdump', 6, true),
   objdump: viewProgram('objdump', 7, true),

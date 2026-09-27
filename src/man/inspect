@@ -8,8 +8,10 @@ into it. A disk image is a block array whose first block is the superblock.
 
     hexdump file            dump the bytes of a regular file
     objdump prog            disassemble a CRX executable
-    mem                     frame usage per process
-    ps                      the process table
+    ps                      memory summary and process table
+    ps -p                   process table only
+    ps -m                   memory summary only
+    ps -a                   both views (the default)
 
 ## The process table is in RAM
 

@@ -54,7 +54,9 @@ permission on the file.
 Both calls ls makes, getdents and readview kind 8, run entirely in the
 CRX kernel. Its read-only VFS walks inodes and directory blocks on any
 device, crossing mount points through a table at 0x00C0 in the KCB.
-ps, mem, help, lsblk, df, dmesg and hexdump are formatted by that kernel.
+ps, help, lsblk, dmesg and hexdump are formatted by that kernel. The ps
+and lsblk selectors expose memory and filesystem details without separate
+commands.
 objdump checks the path itself, then asks the host to decode instructions.
 
     -rwxr-x-- root    464 cat
@@ -87,8 +89,10 @@ free name; each one is a separate device.
 
 ## Mounting
 
-    lsblk                    list block devices
-    df                       usage per filesystem
+    lsblk                    combined device and filesystem details
+    lsblk -d                 device details only
+    lsblk -f                 filesystem usage only
+    lsblk -a                 all fields (the default)
     mount /dev/sdb /mnt      attach the device to a directory
     cp /usr/man/README /mnt/      copy a file onto it
     umount /mnt              detach it

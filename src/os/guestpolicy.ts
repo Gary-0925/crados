@@ -2700,12 +2700,8 @@ gp_view:
     ldw r1, [r4+0x0094]
     cmp r1, 1
     je gp_ps
-    cmp r1, 2
-    je gp_mem
     cmp r1, 3
     je gp_lsblk
-    cmp r1, 4
-    je gp_df
     cmp r1, 5
     je gp_dmesg
     cmp r1, 6
@@ -2721,7 +2717,29 @@ gp_help:
     call gp_puts
     jmp gp_view_done
 
+; ps is the single process/memory inspector. No selector (or -a) prints both
+; the RAM summary and the process table; -p and -m select one part.
 gp_ps:
+    mov r4, 0
+    ldw r1, [r4+0x0090]
+    cmp r1, 0
+    je gp_ps_all
+    uldb r0, [r1+0]
+    cmp r0, 45
+    jne gp_ps_usage
+    uldb r0, [r1+1]
+    cmp r0, 112
+    je gp_ps_table
+    cmp r0, 109
+    je gp_mem
+    cmp r0, 97
+    je gp_ps_all
+    cmp r0, 104
+    je gp_ps_usage
+    jmp gp_ps_usage
+gp_ps_all:
+    call gp_mem_summary
+gp_ps_table:
     mov r1, gp_ps_hdr
     call gp_puts
     mov r6, 0
@@ -2765,17 +2783,24 @@ gp_ps_loop:
     pop r5
     push r5
     ldb r1, [r5+21]
-    mov r2, 3
+    mov r2, 5
     mov r3, 0
     call view_num
-    mov r0, 112
+    mov r0, 32
     call view_putc
+    pop r5
+    push r5
+    ldb r1, [r5+21]
+    mul r1, 256
+    mov r2, 5
+    mov r3, 0
+    call view_num
     mov r0, 32
     call view_putc
     pop r5
     push r5
     ldw r1, [r5+153]
-    mov r2, 4
+    mov r2, 5
     mov r3, 0
     call view_num
     mov r0, 32
@@ -2798,6 +2823,11 @@ gp_ps_nl:
 gp_ps_next:
     add r6, 1
     jmp gp_ps_loop
+
+gp_ps_usage:
+    mov r1, gp_ps_usage_text
+    call gp_puts
+    jmp gp_view_done
 
 gp_ps_state:
     cmp r1, 1
@@ -2845,7 +2875,12 @@ gp_pcb_str_loop:
 gp_pcb_str_done:
     ret
 
+; Memory is now a query of ps rather than a second command.
 gp_mem:
+    call gp_mem_summary
+    jmp gp_view_done
+
+gp_mem_summary:
     mov r1, gp_mem_hdr
     call gp_puts
     mov r1, gp_total
@@ -2862,42 +2897,7 @@ gp_mem:
     call gp_frames_bytes
     mov r1, gp_bytes_nl
     call gp_puts
-    mov r6, 0
-gp_mem_proc:
-    cmp r6, 16
-    je gp_view_done
-    mov r5, r6
-    mul r5, 192
-    add r5, 0x0100
-    ldb r0, [r5+0]
-    cmp r0, 1
-    jne gp_mem_next
-    push r6
-    mov r1, gp_pid_lbl
-    call gp_puts
-    ldw r1, [r5+2]
-    mov r2, 5
-    mov r3, 1
-    push r5
-    call view_num
-    mov r0, 32
-    call view_putc
-    pop r5
-    mov r1, r5
-    add r1, 89
-    call gp_pcb_str
-    mov r0, 32
-    call view_putc
-    ldb r1, [r5+21]
-    mov r2, 3
-    mov r3, 1
-    call view_num
-    mov r1, gp_pages_nl
-    call gp_puts
-    pop r6
-gp_mem_next:
-    add r6, 1
-    jmp gp_mem_proc
+    ret
 
 gp_frames_used:
     mov r6, 0
@@ -3087,7 +3087,125 @@ gp_ncopy_done:
     ret
 
 ; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
+; lsblk is the single storage inspector: -d device data, -f filesystem usage,
+; and no selector/-a a consistently aligned merged table.
 gp_lsblk:
+    mov r4, 0
+    ldw r1, [r4+0x0090]
+    cmp r1, 0
+    je gp_lsblk_all
+    uldb r0, [r1+0]
+    cmp r0, 45
+    jne gp_lsblk_usage
+    uldb r0, [r1+1]
+    cmp r0, 100
+    je gp_lsblk_dev
+    cmp r0, 102
+    je gp_lsblk_fs
+    cmp r0, 97
+    je gp_lsblk_all
+    cmp r0, 104
+    je gp_lsblk_usage
+    jmp gp_lsblk_usage
+
+gp_lsblk_usage:
+    mov r1, gp_lsblk_usage_text
+    call gp_puts
+    jmp gp_view_done
+
+gp_lsblk_all:
+    mov r1, gp_lsblk_all_hdr
+    call gp_puts
+    mov r6, 0
+gp_lsblk_all_loop:
+    cmp r6, 8
+    je gp_view_done
+    mov r5, r6
+    mul r5, 64
+    add r5, 0x1200
+    ldb r0, [r5+0]
+    cmp r0, 1
+    jne gp_lsblk_all_next
+    push r6
+    push r5
+    mov r1, r5
+    add r1, 2
+    mov r2, 3
+    call gp_ncopy
+    mov r2, 2
+    call view_pad
+    pop r5
+    push r5
+    mov r1, r5
+    add r1, 6
+    mov r2, 17
+    call gp_ncopy
+    pop r5
+    push r5
+    ldw r1, [r5+40]
+    mov r2, 6
+    mov r3, 0
+    call view_num
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    ldw r1, [r5+42]
+    mov r2, 5
+    mov r3, 0
+    call view_num
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    ldw r1, [r5+40]
+    ldw r2, [r5+42]
+    sub r1, r2
+    mov r2, 5
+    mov r3, 0
+    call view_num
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    ldb r1, [r5+39]
+    mov r2, 3
+    mov r3, 0
+    call view_num
+    mov r0, 37
+    call view_putc
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    mov r1, r5
+    add r1, 23
+    ldb r2, [r5+5]
+    call gp_ncopy
+    mov r0, 32
+    call view_putc
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    ldb r0, [r5+1]
+    add r0, 48
+    call view_putc
+    mov r0, 32
+    call view_putc
+    pop r5
+    mov r1, r5
+    add r1, 44
+    call gp_puts
+    mov r0, 10
+    call view_putc
+    pop r6
+gp_lsblk_all_next:
+    add r6, 1
+    jmp gp_lsblk_all_loop
+
+; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
+gp_lsblk_dev:
     mov r1, gp_lsblk_hdr
     call gp_puts
     mov r6, 0
@@ -3156,7 +3274,7 @@ gp_lsblk_next:
     add r6, 1
     jmp gp_lsblk_loop
 
-gp_df:
+gp_lsblk_fs:
     mov r1, gp_df_hdr
     call gp_puts
     mov r6, 0
@@ -3487,10 +3605,14 @@ gp_as_req:
     .space 4
 gp_od_req:
     .space 8
+gp_lsblk_all_hdr:
+    .asciz "NAME MODEL            BLOCKS  USED AVAIL USE% BS  RM MOUNTPOINT\\n"
 gp_lsblk_hdr:
-    .asciz "NAME MODEL             SIZE  USED  BS  RM MOUNTPOINT\\n"
+    .asciz "NAME MODEL             SIZE  USED BS  RM MOUNTPOINT\\n"
 gp_df_hdr:
-    .asciz "Filesystem Blocks Used Avail Use% Mounted on\\n"
+    .asciz "FILESYSTEM BLOCKS USED AVAIL USE% MOUNTPOINT\\n"
+gp_lsblk_usage_text:
+    .asciz "usage: lsblk [-a|-d|-f|-h]\\n  -a  all device and filesystem fields (default)\\n  -d  device details\\n  -f  filesystem usage\\n"
 gp_dev_prefix:
     .asciz "/dev/"
 gp_bin:
@@ -3501,7 +3623,9 @@ gp_root_env:
     .ascii "USER\\0root\\0HOME\\0/root\\0PATH\\0/bin:/usr/bin\\0SHELL\\0/bin/sh\\0"
     .byte 0
 gp_ps_hdr:
-    .asciz "  PID  PPID   UID STAT MEM TIME COMMAND\\n"
+    .asciz "  PID  PPID   UID STATE PAGES BYTES TICKS COMMAND\\n"
+gp_ps_usage_text:
+    .asciz "usage: ps [-a|-p|-m|-h]\\n  -a  memory summary and processes (default)\\n  -p  processes only\\n  -m  memory summary only\\n"
 gp_st_new:
     .asciz "NEW  "
 gp_st_ready:
@@ -3515,24 +3639,33 @@ gp_st_zombie:
 gp_defunct:
     .asciz " <defunct>"
 gp_mem_hdr:
-    .asciz "             total      used      free\\nMem:  "
+    .asciz "MEMORY      TOTAL      USED      FREE\\nbytes  "
 gp_total:
     .asciz "     65536"
 gp_bytes_nl:
-    .asciz " bytes\\n"
-gp_pid_lbl:
-    .asciz "pid "
-gp_pages_nl:
-    .asciz " pages\\n"
+    .asciz "\\n"
 gp_help_text:
-    .ascii "crados commands (every file in /bin is CRX machine code)\\n\\n"
-    .ascii "files:   ls [-l] cat head wc cp mv rm rmdir mkdir touch chmod chown echo\\n"
-    .ascii "process: ps kill sleep count pid\\n"
-    .ascii "storage: lsblk df mount umount   (writeback is automatic)\\n"
-    .ascii "account: login su passwd useradd userdel users chperm\\n"
-    .ascii "kernel:  mem dmesg hexdump objdump uname whoami\\n"
-    .ascii "build:   as source.s -o program\\n"
-    .ascii "shell:   cd pwd clear exit; > redirects; & runs in background\\n"
-    .ascii "manual:  man [README|asm|storage|inspect|script|accounts]\\n"
-    .asciz "         append .zh for Chinese, e.g. man asm.zh\\n"
+    .ascii "crados commands\\n\\n"
+    .ascii "INSPECT\\n"
+    .ascii "  ps [-a|-p|-m|-h]       processes and memory (-a is default)\\n"
+    .ascii "  lsblk [-a|-d|-f|-h]    devices and filesystems (-a is default)\\n"
+    .ascii "  dmesg | hexdump FILE | objdump FILE\\n\\n"
+    .ascii "FILES\\n"
+    .ascii "  ls [-l] [DIR]  cat [FILE]  head FILE  wc FILE  echo [TEXT]\\n"
+    .ascii "  cp SRC DST  mv SRC DST  rm FILE  rmdir DIR  mkdir DIR  touch FILE\\n"
+    .ascii "  chmod MODE FILE  chown UID FILE  cd DIR  pwd\\n\\n"
+    .ascii "PROCESS / SYSTEM\\n"
+    .ascii "  kill PID  sleep SEC  count [N]  pid  uname [-a]  whoami\\n"
+    .ascii "  clear  true  false  as SOURCE -o PROGRAM\\n\\n"
+    .ascii "STORAGE / ACCOUNTS\\n"
+    .ascii "  mount DEV DIR  umount TARGET\\n"
+    .ascii "  login  su [USER]  passwd [USER]  users  useradd USER  userdel USER\\n"
+    .ascii "  chperm USER PERMS\\n\\n"
+    .ascii "SHELL\\n"
+    .ascii "  COMMAND > FILE        redirect output\\n"
+    .ascii "  COMMAND &             run in background\\n"
+    .ascii "  exit                   leave the shell\\n\\n"
+    .ascii "MANUALS\\n"
+    .ascii "  man [README|asm|storage|inspect|script|man]\\n"
+    .asciz "  Add .zh for Chinese, for example: man inspect.zh\\n"
 `

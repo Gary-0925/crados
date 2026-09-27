@@ -1535,7 +1535,8 @@ export class Kernel {
     this.mem.setU16(base, len + n)
   }
 
-  // Hardware facts for lsblk/df. CRX formats the text; this only fills the table.
+  // Hardware facts for the merged lsblk views (-a/-d/-f). CRX formats the text;
+  // this only fills the table.
   // Record: present, removable, name[3], bs_len, model[17], bs[4], size[6],
   // used[6], pct, blocks u16, usedBlocks u16, mount[20].
   private publishDevinfo() {
