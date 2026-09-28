@@ -2717,13 +2717,13 @@ gp_help:
     call gp_puts
     jmp gp_view_done
 
-; ps is the single process/memory inspector. No selector (or -a) prints both
-; the RAM summary and the process table; -p and -m select one part.
+; ps is the single process/memory inspector. No selector (or -p) prints the
+; process table; -a adds the RAM summary; -m shows the summary alone.
 gp_ps:
     mov r4, 0
     ldw r1, [r4+0x0090]
     cmp r1, 0
-    je gp_ps_all
+    je gp_ps_table
     uldb r0, [r1+0]
     cmp r0, 45
     jne gp_ps_usage
@@ -2780,6 +2780,8 @@ gp_ps_loop:
     push r5
     ldb r1, [r5+1]
     call gp_ps_state
+    mov r0, 32          ; the state word is exactly 5 chars; add the separator
+    call view_putc
     pop r5
     push r5
     ldb r1, [r5+21]
@@ -3087,13 +3089,13 @@ gp_ncopy_done:
     ret
 
 ; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
-; lsblk is the single storage inspector: -d device data, -f filesystem usage,
-; and no selector/-a a consistently aligned merged table.
+; lsblk is the single storage inspector: no selector prints the short device
+; list, -a every device and filesystem field, -d device data, -f filesystem usage.
 gp_lsblk:
     mov r4, 0
     ldw r1, [r4+0x0090]
     cmp r1, 0
-    je gp_lsblk_all
+    je gp_lsblk_basic
     uldb r0, [r1+0]
     cmp r0, 45
     jne gp_lsblk_usage
@@ -3108,11 +3110,70 @@ gp_lsblk:
     je gp_lsblk_usage
     jmp gp_lsblk_usage
 
+; lsblk with no selector: NAME SIZE TYPE MOUNTPOINT, the short device list.
+gp_lsblk_basic:
+    mov r1, gp_lsblk_basic_hdr
+    call gp_puts
+    mov r6, 0
+gp_lsblk_basic_loop:
+    cmp r6, 8
+    je gp_view_done
+    mov r5, r6
+    mul r5, 64
+    add r5, 0x1200
+    ldb r0, [r5+0]
+    cmp r0, 1
+    jne gp_lsblk_basic_next
+    push r6
+    push r5
+    mov r1, r5
+    add r1, 2
+    mov r2, 3
+    call gp_ncopy
+    mov r2, 3           ; pad the 3-byte name out to the NAME header width
+    call view_pad
+    pop r5
+    push r5
+    mov r1, r5
+    add r1, 27          ; size in bytes, 6 chars, right aligned by the host
+    mov r2, 6
+    call gp_ncopy
+    mov r0, 32
+    call view_putc
+    pop r5
+    push r5
+    mov r1, gp_type_disk
+    ldb r0, [r5+2]
+    cmp r0, 114         ; the firmware device is the one named "rom"
+    jne gp_basic_type
+    ldb r0, [r5+3]
+    cmp r0, 111
+    jne gp_basic_type
+    ldb r0, [r5+4]
+    cmp r0, 109
+    jne gp_basic_type
+    mov r1, gp_type_rom
+gp_basic_type:
+    call gp_puts
+    mov r2, 2
+    call view_pad
+    pop r5
+    mov r1, r5
+    add r1, 44
+    call gp_puts
+    mov r0, 10
+    call view_putc
+    pop r6
+gp_lsblk_basic_next:
+    add r6, 1
+    jmp gp_lsblk_basic_loop
+
 gp_lsblk_usage:
     mov r1, gp_lsblk_usage_text
     call gp_puts
     jmp gp_view_done
 
+; lsblk -a: every device and filesystem field the catalog carries.
 gp_lsblk_all:
     mov r1, gp_lsblk_all_hdr
     call gp_puts
@@ -3132,7 +3193,7 @@ gp_lsblk_all_loop:
     add r1, 2
     mov r2, 3
     call gp_ncopy
-    mov r2, 2
+    mov r2, 3
     call view_pad
     pop r5
     push r5
@@ -3140,6 +3201,8 @@ gp_lsblk_all_loop:
     add r1, 6
     mov r2, 17
     call gp_ncopy
+    mov r2, 2
+    call view_pad
     pop r5
     push r5
     ldw r1, [r5+40]
@@ -3180,7 +3243,13 @@ gp_lsblk_all_loop:
     push r5
     mov r1, r5
     add r1, 23
-    ldb r2, [r5+5]
+    ldb r2, [r5+5]      ; blockSize string, 1..4 chars
+    mov r3, 4
+    sub r3, r2
+    push r2
+    mov r2, r3
+    call view_pad       ; right-align inside the 4-wide BS column
+    pop r2
     call gp_ncopy
     mov r0, 32
     call view_putc
@@ -3190,6 +3259,12 @@ gp_lsblk_all_loop:
     push r5
     ldb r0, [r5+1]
     add r0, 48
+    push r0
+    mov r2, 1           ; RM right-aligned inside its 2-wide column
+    call view_pad
+    pop r0
+    call view_putc
+    mov r0, 32
     call view_putc
     mov r0, 32
     call view_putc
@@ -3224,7 +3299,7 @@ gp_lsblk_loop:
     add r1, 2
     mov r2, 3
     call gp_ncopy
-    mov r2, 2
+    mov r2, 3
     call view_pad
     pop r5
     push r5
@@ -3232,12 +3307,16 @@ gp_lsblk_loop:
     add r1, 6
     mov r2, 17
     call gp_ncopy
+    mov r2, 2
+    call view_pad
     pop r5
     push r5
     mov r1, r5
     add r1, 27
     mov r2, 6
     call gp_ncopy
+    mov r0, 32
+    call view_putc
     pop r5
     push r5
     mov r1, r5
@@ -3250,7 +3329,13 @@ gp_lsblk_loop:
     push r5
     mov r1, r5
     add r1, 23
-    ldb r2, [r5+5]
+    ldb r2, [r5+5]      ; blockSize string, 1..4 chars
+    mov r3, 4
+    sub r3, r2
+    push r2
+    mov r2, r3
+    call view_pad       ; right-align inside the 4-wide BS column
+    pop r2
     call gp_ncopy
     mov r0, 32
     call view_putc
@@ -3260,6 +3345,12 @@ gp_lsblk_loop:
     push r5
     ldb r0, [r5+1]
     add r0, 48
+    push r0
+    mov r2, 1           ; RM right-aligned inside its 2-wide column
+    call view_pad
+    pop r0
+    call view_putc
+    mov r0, 32
     call view_putc
     mov r0, 32
     call view_putc
@@ -3288,21 +3379,17 @@ gp_df_loop:
     cmp r0, 1
     jne gp_df_next
     push r6
-    mov r1, gp_dev_prefix
-    call gp_puts
     push r5
     mov r1, r5
     add r1, 2
     mov r2, 3
     call gp_ncopy
-    mov r2, 4
+    mov r2, 3           ; same NAME column as the other lsblk views
     call view_pad
-    mov r0, 32
-    call view_putc
     pop r5
     push r5
     ldw r1, [r5+40]
-    mov r2, 5
+    mov r2, 6
     mov r3, 0
     call view_num
     mov r0, 32
@@ -3310,7 +3397,7 @@ gp_df_loop:
     pop r5
     push r5
     ldw r1, [r5+42]
-    mov r2, 4
+    mov r2, 5
     mov r3, 0
     call view_num
     mov r0, 32
@@ -3605,16 +3692,20 @@ gp_as_req:
     .space 4
 gp_od_req:
     .space 8
+gp_lsblk_basic_hdr:
+    .asciz "NAME    SIZE TYPE  MOUNTPOINT\\n"
 gp_lsblk_all_hdr:
-    .asciz "NAME MODEL            BLOCKS  USED AVAIL USE% BS  RM MOUNTPOINT\\n"
+    .asciz "NAME  MODEL              BLOCKS  USED AVAIL USE%   BS  RM  MOUNTPOINT\\n"
 gp_lsblk_hdr:
-    .asciz "NAME MODEL             SIZE  USED BS  RM MOUNTPOINT\\n"
+    .asciz "NAME  MODEL                SIZE   USED   BS  RM  MOUNTPOINT\\n"
 gp_df_hdr:
-    .asciz "FILESYSTEM BLOCKS USED AVAIL USE% MOUNTPOINT\\n"
+    .asciz "NAME  BLOCKS  USED AVAIL USE% MOUNTPOINT\\n"
 gp_lsblk_usage_text:
-    .asciz "usage: lsblk [-a|-d|-f|-h]\\n  -a  all device and filesystem fields (default)\\n  -d  device details\\n  -f  filesystem usage\\n"
-gp_dev_prefix:
-    .asciz "/dev/"
+    .asciz "usage: lsblk [-a|-d|-f|-h]\\n  (no selector)  name, size, type, mountpoint\\n  -a  all device and filesystem fields\\n  -d  device details\\n  -f  filesystem usage\\n"
+gp_type_disk:
+    .asciz "disk"
+gp_type_rom:
+    .asciz "rom "
 gp_bin:
     .asciz "/bin/"
 gp_usr:
@@ -3625,7 +3716,7 @@ gp_root_env:
 gp_ps_hdr:
     .asciz "  PID  PPID   UID STATE PAGES BYTES TICKS COMMAND\\n"
 gp_ps_usage_text:
-    .asciz "usage: ps [-a|-p|-m|-h]\\n  -a  memory summary and processes (default)\\n  -p  processes only\\n  -m  memory summary only\\n"
+    .asciz "usage: ps [-a|-p|-m|-h]\\n  (no selector)  process table\\n  -p  process table\\n  -a  memory summary and process table\\n  -m  memory summary only\\n"
 gp_st_new:
     .asciz "NEW  "
 gp_st_ready:
@@ -3647,8 +3738,8 @@ gp_bytes_nl:
 gp_help_text:
     .ascii "crados commands\\n\\n"
     .ascii "INSPECT\\n"
-    .ascii "  ps [-a|-p|-m|-h]       processes and memory (-a is default)\\n"
-    .ascii "  lsblk [-a|-d|-f|-h]    devices and filesystems (-a is default)\\n"
+    .ascii "  ps [-a|-p|-m|-h]       process table (-a adds the memory summary)\\n"
+    .ascii "  lsblk [-a|-d|-f|-h]    devices (-a shows every device/fs field)\\n"
     .ascii "  dmesg | hexdump FILE | objdump FILE\\n\\n"
     .ascii "FILES\\n"
     .ascii "  ls [-l] [DIR]  cat [FILE]  head FILE  wc FILE  echo [TEXT]\\n"

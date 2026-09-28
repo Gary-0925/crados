@@ -254,10 +254,10 @@ write_file_scan_len:
 write_file_have_len:
     mov r6, 0
     stw [r6+0x0060], r3 ; fd base
-    stw [r6+0x0062], r4 ; user buffer
+    stw [r6+0x0062], r4 ; user buffer cursor
     stw [r6+0x0064], r5 ; requested length
-    ldw r7, [r3+45]     ; current offset
-    stw [r6+0x0066], r7
+    mov r4, 0
+    stw [r6+0x0074], r4 ; total written so far
     ldb r5, [r3+43]     ; inode number
     mul r5, 48
     add r5, 768         ; inode global byte offset
@@ -271,14 +271,27 @@ write_file_have_len:
     mov r6, 0
     stw [r6+0x006A], r0
 
-    ; count = min(length, 256 - (pos mod 256))
-    ldw r7, [r6+0x0066]
+; One 256-byte block per pass: pos, block pointer, copy, commit, repeat
+; until the whole request is on disk. A write therefore never ends mid-request.
+write_file_block:
+    mov r6, 0
+    ldw r3, [r6+0x0060]
+    ldw r7, [r3+45]     ; current offset
+    stw [r6+0x0066], r7
+
+    ; remaining = requested - total; 0 means everything is written
+    ldw r3, [r6+0x0064]
+    ldw r4, [r6+0x0074]
+    sub r3, r4
+    cmp r3, 0
+    je write_file_done
+
+    ; count = min(remaining, 256 - (pos mod 256))
     mov r5, r7
     mod r5, 256
     stw [r6+0x006C], r5
     mov r4, 256
     sub r4, r5
-    ldw r3, [r6+0x0064]
     cmp r3, r4
     jlt write_count_ok
     mov r3, r4
@@ -345,26 +358,41 @@ write_file_commit:
     cmp r0, 0
     jne write_file_failed
 
-    ; Advance fd offset and grow inode size if necessary
+    ; Advance fd offset, cursor and total; grow inode size if necessary
     mov r6, 0
     ldw r3, [r6+0x006E] ; count
     ldw r4, [r6+0x0066] ; old pos
     add r4, r3          ; new pos
     ldw r5, [r6+0x0060]
     stw [r5+45], r4
+    ldw r2, [r6+0x0062]
+    add r2, r3
+    stw [r6+0x0062], r2
+    ldw r2, [r6+0x0074]
+    add r2, r3
+    stw [r6+0x0074], r2
     ldw r7, [r6+0x006A] ; old size
     cmp r4, r7
-    jlt write_file_done
-    je write_file_done
+    jlt write_file_more
+    je write_file_more
     ldw r1, [r6+0x0068]
     add r1, 2
     mov r2, r4
     call crfs_write_u16
     cmp r0, 0
     jne write_file_failed
+    mov r6, 0
+    stw [r6+0x006A], r4 ; size grew; later passes compare against it
+
+write_file_more:
+    mov r6, 0
+    ldw r3, [r6+0x0064] ; requested
+    ldw r4, [r6+0x0074] ; total
+    cmp r4, r3
+    jlt write_file_block
 write_file_done:
     mov r6, 0
-    ldw r0, [r6+0x006E]
+    ldw r0, [r6+0x0074]
     iret
 write_file_failed:
     mov r0, 65535
@@ -1469,6 +1497,8 @@ view_type_put:
     call view_bit
     mov r0, 32
     call view_putc
+    mov r0, 32
+    call view_putc
 
     ; owner: uid table in the superblock of the same device
     ldw r1, [r4+0x0084]
@@ -1496,6 +1526,8 @@ view_root:
 view_owner_done:
     mov r0, 32
     call view_putc
+    mov r0, 32
+    call view_putc
 
     ; size
     ldw r1, [r4+0x0084]
@@ -1509,6 +1541,8 @@ view_owner_done:
     mov r2, 5
     mov r3, 0           ; right aligned
     call view_num
+    mov r0, 32
+    call view_putc
     mov r0, 32
     call view_putc
 
