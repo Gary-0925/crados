@@ -7,10 +7,10 @@
 
     hexdump file            dump 一个普通文件的字节
     objdump prog            反汇编 CRX 可执行文件
-    ps                      内存摘要和进程表
-    ps -p                   只看进程表
+    ps                      进程表
+    ps -p                   进程表（与不带参数相同）
     ps -m                   只看内存摘要
-    ps -a                   两者都看（默认）
+    ps -a                   内存摘要和进程表都看
 
 ## 进程表就在内存条里
 
