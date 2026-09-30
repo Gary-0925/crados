@@ -1,14 +1,17 @@
 // 透明版：在纯净系统之上挂载 /cp 观测层。
 //
 // ControlPanel 是唯一接触内核 observer 的对象；它把内核的只读接口聚合成
-// Snapshot 供面板渲染。
+// Snapshot 供面板渲染。开机之前渲染启动菜单，机器就绪后才建观测层。
 
-import { useEffect, useState, useSyncExternalStore } from 'react'
-import { Kernel } from '@/os/kernel'
+import { useState, useSyncExternalStore } from 'react'
+import type { BootSource } from '@/os/kernel'
 import { Header } from '@/ui/Header'
 import { PanicOverlay } from '@/ui/PanicOverlay'
 import { Terminal } from '@/ui/Terminal'
+import { BootMenu } from '@/ui/BootMenu'
+import { useBoot } from '@/ui/useBoot'
 import { ControlPanel } from '@/cp/snapshot'
+import type { Snapshot } from '@/cp/snapshot'
 import { ProcessesPanel } from '@/cp/ProcessesPanel'
 import { MemoryPanel } from '@/cp/MemoryPanel'
 import { StoragePanel } from '@/cp/StoragePanel'
@@ -25,31 +28,31 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'kmsg', label: '日志' },
 ]
 
+// 机器还没就绪时 useSyncExternalStore 也要有稳定的 subscribe/getSnapshot
+const noopSubscribe = () => () => {}
+const nullSnapshot = (): Snapshot | null => null
+
 export default function Transparent() {
-  const [kernel, setKernel] = useState(() => new Kernel())
-  const [cp, setCp] = useState(() => new ControlPanel(kernel))
+  const { kernel, error, busy, boot, reboot } = useBoot()
+  const [cp, setCp] = useState<ControlPanel | null>(null)
   const [tab, setTab] = useState<Tab>('proc')
   const [selPid, setSelPid] = useState(2)
 
-  useEffect(() => {
-    return () => {
-      cp.detach()
-      kernel.destroy()
-    }
-  }, [kernel, cp])
-  const snap = useSyncExternalStore(cp.subscribe, cp.getSnapshot)
-
-  const reboot = () => {
-    kernel.destroy()
-    const next = new Kernel()
+  const start = (source: BootSource) => boot(source, (k) => setCp(new ControlPanel(k)))
+  const restart = () => {
+    cp?.detach()
+    setCp(null)
     setSelPid(2)
-    setKernel(next)
-    setCp(new ControlPanel(next))
+    reboot()
   }
+
+  const snap = useSyncExternalStore(cp ? cp.subscribe : noopSubscribe, cp ? cp.getSnapshot : nullSnapshot, nullSnapshot)
+
+  if (!kernel || !cp || !snap) return <BootMenu busy={busy} error={error} onBoot={start} />
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#0d1117] font-mono text-[#c9d1d9]">
-      <Header kernel={kernel} onReboot={reboot} />
+      <Header kernel={kernel} onReboot={restart} />
 
       <main className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <section className="min-h-[40vh] flex-1 lg:min-h-0">
@@ -82,7 +85,7 @@ export default function Transparent() {
         </aside>
       </main>
 
-      {snap.panic && <PanicOverlay panic={snap.panic} log={snap.kmsgText} onReboot={reboot} />}
+      {snap.panic && <PanicOverlay panic={snap.panic} log={snap.kmsgText} onReboot={restart} />}
     </div>
   )
 }

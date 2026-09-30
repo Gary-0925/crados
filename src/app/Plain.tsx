@@ -1,19 +1,21 @@
 // 纯净版：只有 /os 与 /ui。整个 /cp 目录不参与打包。
 //
 // 重绘直接挂在内核的 observer 上：内核只发一个“状态已变”的信号，不构造任何
-// 观测数据结构。
+// 观测数据结构。开机之前渲染启动菜单，机器就绪后才挂 observer。
 
-import { useEffect, useReducer, useState } from 'react'
-import { Kernel } from '@/os/kernel'
+import { useEffect, useReducer } from 'react'
 import { Header } from '@/ui/Header'
 import { PanicOverlay } from '@/ui/PanicOverlay'
 import { Terminal } from '@/ui/Terminal'
+import { BootMenu } from '@/ui/BootMenu'
+import { useBoot } from '@/ui/useBoot'
 
 export default function Plain() {
-  const [kernel, setKernel] = useState(() => new Kernel())
+  const { kernel, error, busy, boot, reboot } = useBoot()
   const [, redraw] = useReducer((n: number) => n + 1, 0)
 
   useEffect(() => {
+    if (!kernel) return
     let frame = 0
     kernel.observer = {
       changed: () => {
@@ -27,14 +29,10 @@ export default function Plain() {
     return () => {
       if (frame) cancelAnimationFrame(frame)
       kernel.observer = null
-      kernel.destroy()
     }
   }, [kernel])
 
-  const reboot = () => {
-    kernel.destroy()
-    setKernel(new Kernel())
-  }
+  if (!kernel) return <BootMenu busy={busy} error={error} onBoot={boot} />
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#0d1117] font-mono text-[#c9d1d9]">

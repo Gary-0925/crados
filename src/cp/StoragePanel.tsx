@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, Download, Eraser, Trash2, Upload, Usb } from 'lucide-react'
 import type { Kernel } from '@/os/kernel'
-import { saveDev } from '@/os/blockdev'
 import { isErr, strerror } from '@/os/types'
 import type { FSNode, Snapshot } from '@/cp/snapshot'
 import { HexDump } from '@/cp/HexDump'
@@ -19,7 +18,6 @@ const BLOCK_TONE: Record<string, string> = {
 
 const DISK_TONE: Record<string, string> = {
   sda: 'text-[#58a6ff]',
-  rom: 'text-[#d29922]',
 }
 
 function IconBtn({
@@ -147,7 +145,11 @@ export function StoragePanel({
   const bs = layout?.blockSize ?? 256
   const cur = layout ? Math.min(block, layout.map.length - 1) : 0
 
-  const run = (r: unknown, ok: string) => setMsg(isErr(r) ? `error: ${strerror(r)}` : ok)
+  // 存储操作有的会落盘（IndexedDB 是异步的），统一 await 之后再报告结果
+  const run = async (result: unknown | Promise<unknown>, ok: string) => {
+    const value = await result
+    setMsg(isErr(value) ? `error: ${strerror(value)}` : ok)
+  }
 
   const gotoBlock = (b: number) => {
     setBlock(b)
@@ -187,25 +189,25 @@ export function StoragePanel({
               </button>
             ))}
           </div>
-          <IconBtn label={`导出 ${active} 镜像`} onClick={() => run(kernel.exportDisk(active), 'image saved')}>
+          <IconBtn label={`导出 ${active} 镜像`} onClick={() => void run(kernel.exportDisk(active), 'image saved')}>
             <Download size={12} />
           </IconBtn>
           <IconBtn label="导入镜像为新设备" onClick={() => fileRef.current?.click()}>
             <Upload size={12} />
           </IconBtn>
-          <IconBtn label="新建空盘" onClick={() => run(kernel.attachDisk(), 'disk attached')}>
+          <IconBtn label="新建空盘" onClick={() => void run(kernel.attachDisk(), 'disk attached')}>
             <Usb size={12} />
           </IconBtn>
           <IconBtn
             label={`格式化 ${active}`}
-            onClick={() => run(kernel.formatDisk(active), 'mkfs complete')}
+            onClick={() => void run(kernel.formatDisk(active), 'mkfs complete')}
             disabled={!removable || !!info.mountpoint}
           >
             <Eraser size={12} />
           </IconBtn>
           <IconBtn
             label={`移除 ${active}`}
-            onClick={() => run(kernel.detachDisk(active), 'device detached')}
+            onClick={() => void run(kernel.detachDisk(active), 'device detached')}
             disabled={!removable || !!info.mountpoint}
             danger
           >
@@ -345,7 +347,9 @@ export function StoragePanel({
                   base={cur * bs}
                   onByteChange={(address, value) => {
                     layout.bytes[address] = value
-                    if (active !== 'rom') saveDev(activeFs!.dev)
+                    void kernel.saveDisk(active).then((ok) => {
+                      if (!ok) setMsg('error: 存储不可用，改动只留在内存里')
+                    })
                     onMutate()
                   }}
                 />

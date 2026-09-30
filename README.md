@@ -1,4 +1,4 @@
-## crados 4.0 (Cradle OS) - a transparent OS
+## crados 4.1 (Cradle OS) - a transparent OS
 
 Try plain version at <https://gary-0925.github.io/crados/>, or transparent version at <https://gary-0925.github.io/crados/transparent>.
 
@@ -129,11 +129,27 @@ sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有�
 英文版：man README、man asm，以此类推。
 ```
 
+## Booting
+
+Power-on asks where the system disk comes from, and the three answers are the
+whole point of the choice:
+
+    from IndexedDB       the disk saved in this browser — files and edits intact
+    from a .img file     an exported image as the system disk (ext2, matching geometry)
+    new empty disk       format one and install the factory system
+
+All three re-install `/bin` so the shipped programs always match the running
+firmware, and all three re-attach the removable disks stored in IndexedDB.
+While you work, changed 16 KiB chunks are written back to IndexedDB about once
+a second (and on unmount, panic and shutdown). The Storage panel still exports
+any device as a `.img`, and that export is what you feed back in on the next
+boot.
+
 ## Development
 
     npm ci          # install dependencies
     npm run dev     # plain build on http://localhost:5173
-    npm run check   # tsc --noEmit + a headless smoke test that boots the OS and runs a session
+    npm run check   # tsc --noEmit + headless smoke, IndexedDB persistence and ext2 tests
 
 The transparent build is produced by CI, which rewrites `src/App.tsx` to point at
 `src/app/Transparent.tsx`. For local work on the control panel, change that line by hand.

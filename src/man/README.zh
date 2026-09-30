@@ -27,6 +27,9 @@ Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
     /tmp        临时目录
     /usr/bin    存放你自己编译的程序
 
+开机时机器会问系统盘从哪来：IndexedDB 里保存的副本、导出的 .img，或者现做
+一张装好出厂系统的新盘。选好之后，磁盘改动会随用随写回 IndexedDB。
+
 ## 上手
 
 出厂只有一个账户：`root`，密码为空。登录后：

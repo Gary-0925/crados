@@ -12,13 +12,25 @@ import {
   listStoredDisks,
   loadDev,
   nextDiskName,
-  rememberDisk,
+  persistAvailable,
   saveDev,
   SPECS,
 } from './blockdev'
 import { factoryAccounts, parsePasswd, serializePasswd } from './accounts'
 import type { Account } from './accounts'
-import { FS, lookupAbs, M_SETUID, MODE_DIR, MODE_FILE, T_DIR, T_FILE, UID_ROOT, VFS } from './fs'
+import {
+  FS,
+  lookupAbs,
+  M_SETUID,
+  MODE_DIR,
+  MODE_FILE,
+  sameGeometry,
+  systemGeometry,
+  T_DIR,
+  T_FILE,
+  UID_ROOT,
+  VFS,
+} from './fs'
 import { ROOT_INO } from './ext2'
 import {
   DEVINFO_BASE,
@@ -68,6 +80,15 @@ const MMIO_BLOCK = 0xfe00
 const KCB_MOUNTS = 0x00c0
 const KCB_MOUNT_SLOTS = 8
 const UTF8_ENCODER = new TextEncoder()
+
+/** 系统盘的来源：开机时三选一 */
+export type BootSource =
+  // 这个浏览器里上次保存的 sda
+  | { kind: 'stored' }
+  // 用户提供的整盘镜像，几何必须与本机一致
+  | { kind: 'image'; bytes: Uint8Array; filename: string }
+  // 现做一张空盘，装上出厂目录树与 /bin
+  | { kind: 'fresh' }
 
 
 export type SegClass = 'out' | 'err' | 'sys' | 'echo'
@@ -136,10 +157,13 @@ export class Kernel {
 
   // 可移动设备没有数量上限；键是设备名，值是它当前的挂载点
   private readonly mounts = new Map<string, string>()
+  /** 只有真正启动过的机器才配落盘：没启动成的机器上面可能是坏镜像 */
+  private booted = false
   private dirty = false
   private lastSyncMs = 0
-  private storageOk = true
-  private persist = true
+  private storageOk = persistAvailable()
+  /** 在飞的落盘事务：停机时要等它们写完 */
+  private readonly writes = new Set<Promise<boolean>>()
 
   turbo = false
   private suppress = false // 批量执行时合并通知，避免每 tick 都唤醒观察者
@@ -149,13 +173,16 @@ export class Kernel {
   observer: KernelObserver | null = null
   private nextTimerIrq = performance.now()
 
-  constructor() {
-    this.boot()
-  }
-
   // ---------- 引导 ----------
 
-  private boot() {
+  /**
+   * 启动。磁盘可能来自 IndexedDB 或用户选的文件，两者都是异步的，所以引导也异步：
+   * 先造机器，再由这里决定系统盘从哪来。
+   *
+   * 返回 null 表示机器已经跑起来；否则是给人的错误说明，此时机器尚未启动
+   * （调用方应当留在启动菜单上）。
+   */
+  async boot(source: BootSource): Promise<string | null> {
     const stamp = (msg: string) => {
       this.ticks++
       this.log(msg, true)
@@ -166,18 +193,38 @@ export class Kernel {
 
     if (!this.installGuestKernel()) {
       this.setPanic('cannot install CRX kernel trap page')
-      return
+      return null
     }
 
-    // sda：根盘（相当于 Windows 的 C 盘），优先从持久化存储恢复整盘字节。
-    // 系统程序 /bin/* 也装在这块盘上，每次上电重新写入以保证与当前固件一致。
+    // sda：根盘（相当于 Windows 的 C 盘）。系统程序 /bin/* 也装在这块盘上，
+    // 每次上电重新写入以保证与当前固件一致。
     const sda = this.makeDev('sda')
     const sdafs = this.fss.get('sda')!
-    const restored = loadDev(sda) && sdafs.valid()
-    if (!restored) {
+    let restored = false
+    if (source.kind === 'stored') {
+      if (!(await loadDev(sda))) {
+        return 'IndexedDB 里没有保存过系统盘：请改用 .img 文件，或新建空盘'
+      }
+      if (!sdafs.valid() || !sameGeometry(sdafs.layout(), systemGeometry())) {
+        return 'IndexedDB 里的系统盘读不出来（格式或几何不符）：请改用 .img 文件，或新建空盘'
+      }
+      restored = true
+      stamp('sda: restored from IndexedDB')
+    } else if (source.kind === 'image') {
+      // 系统盘就是固定容量：短于容量的镜像会让后面的块读成零，不如当场拒掉
+      if (source.bytes.length !== sda.size) {
+        return `${source.filename}: ${source.bytes.length} 字节，系统盘镜像必须是 ${sda.size} 字节`
+      }
+      sda.load(source.bytes)
+      if (!sdafs.valid() || !sameGeometry(sdafs.layout(), systemGeometry())) {
+        return `${source.filename}: 不是本机可用的 ext2 系统盘（魔数或盘上几何不符）`
+      }
+      stamp(`sda: image ${source.filename} loaded, ${source.bytes.length} bytes`)
+    } else {
       const image = buildRootImage()
       sda.load(image.bytes)
       for (const e of image.errors) this.log(`rootfs image: ${e}`)
+      stamp('sda: fresh disk created, factory system written')
     }
     this.vfs.umount('/')
     this.vfs.mount('/', sdafs)
@@ -191,35 +238,39 @@ export class Kernel {
     )
     stamp('vfs: mounted /dev/sda on /')
 
-    for (const name of listStoredDisks()) {
-      const dev = this.makeDev(name, diskSpec(name))
-      if (loadDev(dev) && this.fss.get(name)!.valid()) {
-        stamp(`${name}: medium present, label "${this.fss.get(name)!.label()}"`)
+    // 这台浏览器里存过的可移动盘逐个装回来；内容已失效就撤掉，避免留下读不出的空盘
+    for (const media of await listStoredDisks()) {
+      if (media.name === 'sda') continue
+      const dev = this.makeDev(media.name, diskSpec(media.name))
+      if ((await loadDev(dev)) && this.fss.get(media.name)!.valid()) {
+        stamp(`${media.name}: medium present, label "${this.fss.get(media.name)!.label()}"`)
         continue
       }
-      // 内容已失效就撤掉这个设备，避免留下一个读不出内容的空盘
-      this.devs.delete(name)
-      this.fss.delete(name)
-      dropDev(name)
+      this.devs.delete(media.name)
+      this.fss.delete(media.name)
+      void dropDev(media.name)
     }
 
-    this.storageOk = this.persist ? saveDev(sda) : false
+    // 系统盘立刻落盘：新建或导入的盘要成为 IndexedDB 里的新存档
+    await this.persistDev('sda')
     stamp('tty0: console ready, canonical mode with echo')
 
     if (this.binErrors.length) {
       this.panic = `program install failed: ${this.binErrors.join('; ')}`
       this.log(`Kernel panic - not syncing: ${this.panic}`, true)
       this.emit()
-      return
+      return null
     }
 
     if (!this.startIdle()) {
       this.setPanic('cannot execute CRX idle process')
-      return
+      return null
     }
     stamp(this.startInit())
     this.startTimer()
+    this.booted = true
     this.emit()
+    return null
   }
 
   // 供 PCB 使用：工作目录以 (设备号, inode 号) 落在内存里，路径靠 parent 链回溯
@@ -254,7 +305,7 @@ export class Kernel {
     return dev
   }
 
-  // 烧写 ROM：/bin 里只接受汇编后的 CRX 映像
+  // 烧写 /bin：里面只接受汇编后的 CRX 映像
   private installPrograms(fs: FS): number {
     let compiled = 0
     let bin = fs.lookup(ROOT_INO, 'bin')
@@ -333,7 +384,7 @@ export class Kernel {
     return !('err' in this.exec(null, 'idle', '[idle]', [], { entry: exe.entry }, exe.image))
   }
 
-  // init 必须从 ROM 以 CRX 映像启动；不存在函数回退
+  // init 必须以 CRX 映像从 /bin/init 启动；不存在函数回退
   private startInit(): string {
     const node = this.vfs.resolve('/bin/init', '/')
     if (!('err' in node)) {
@@ -348,9 +399,15 @@ export class Kernel {
     return 'init: failed to start'
   }
 
-  destroy() {
+  /** 停机：先灭硬件时钟，再把脏数据写进 IndexedDB。调用方无需等待写完。 */
+  destroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer)
+    this.timer = null
+    // 启动失败的机器不落盘：sda 上的字节可能就是那份被拒的镜像，
+    // 写进去会把 IndexedDB 里好好存着的旧盘覆盖掉。
+    if (!this.booted) return Promise.resolve()
     this.flush(true)
+    return Promise.all([...this.writes]).then(() => {})
   }
 
   // 限速模式每个定时器周期推进一拍；不限速模式在时间预算内连续推进，
@@ -641,13 +698,10 @@ export class Kernel {
     const runBlockCommand = () => {
       const command = reg16(0)
       if (command === 3) {
-        let ok = true
-        if (this.persist) {
-          for (const [name, disk] of this.devs) {
-            if (name === 'rom') continue
-            ok = saveDev(disk) && ok
-          }
-        }
+        // sync：把每台设备的脏分块排进写队列。IndexedDB 的写入是异步的，
+        // 这里返回的是"已经接管"，落盘结果由 storageOk 反映。
+        const ok = persistAvailable()
+        if (ok) for (const name of this.devs.keys()) this.persistDev(name)
         this.storageOk = ok
         this.dirty = false
         this.lastSyncMs = Date.now()
@@ -658,32 +712,27 @@ export class Kernel {
       const dev = name ? this.devs.get(name) : undefined
       const block = reg16(4)
       const buffer = reg16(6)
-      // 命令 1/2 是用户态 block_read/block_write。找不到进程时拒绝，不能当成 root。
-      if ((command === 1 || command === 2) && this.euidOf(this.currentPid) !== UID_ROOT) {
-        setReg16(8, 0xffff)
-        return
-      }
-      // 命令 4/5 只服务内核自己的暂存区。用户可控的缓冲区不能从这里写进物理内存。
-      if ((command === 4 || command === 5) && buffer !== SCRATCH_BASE) {
-        setReg16(8, 0xffff)
-        return
-      }
-      if (!dev || block >= dev.blockCount) {
-        setReg16(8, 0xffff)
-        return
-      }
-      try {
-        const bytes = dev.block(block)
-        if (bytes.length > SCRATCH_SIZE) {
+        // 命令 1/2 是用户态 block_read/block_write。找不到进程时拒绝，不能当成 root。
+        if ((command === 1 || command === 2) && this.euidOf(this.currentPid) !== UID_ROOT) {
           setReg16(8, 0xffff)
           return
         }
-        // 命令 4 是内核读，ROM 可以读。用户态块读写和内核写都不能改固件。
-        if ((command === 1 || command === 2 || command === 5) && name === 'rom') {
+        // 命令 4/5 只服务内核自己的暂存区。用户可控的缓冲区不能从这里写进物理内存。
+        if ((command === 4 || command === 5) && buffer !== SCRATCH_BASE) {
           setReg16(8, 0xffff)
           return
         }
-        if (command === 1 || command === 4) {
+        if (!dev || block >= dev.blockCount) {
+          setReg16(8, 0xffff)
+          return
+        }
+        try {
+          const bytes = dev.block(block)
+          if (bytes.length > SCRATCH_SIZE) {
+            setReg16(8, 0xffff)
+            return
+          }
+          if (command === 1 || command === 4) {
           const forceUser = command === 1
           for (let i = 0; i < bytes.length; i++) writeMem(buffer + i, bytes[i], forceUser)
         } else if (command === 2 || command === 5) {
@@ -1097,8 +1146,7 @@ export class Kernel {
       if (wanted.get(name) === m.path) continue
       this.vfs.umount(m.path)
       this.mounts.delete(name)
-      const disk = this.devs.get(name)
-      if (disk && name !== 'rom' && this.persist) saveDev(disk)
+      if (this.devs.has(name)) this.persistDev(name)
     }
     for (const [name, path] of wanted) {
       if (this.vfs.mounts.some((m) => m.fs.dev.spec.name === name && m.path === path)) {
@@ -1123,7 +1171,7 @@ export class Kernel {
   private hwAssemble(srcDev: number, srcIno: number, dstDev: number, dstIno: number): 0 | Err {
     const src = this.fss.get(deviceName(srcDev))
     const dst = this.fss.get(deviceName(dstDev))
-    if (!src || !dst || deviceName(dstDev) === 'rom') return { err: 'ENOENT' }
+    if (!src || !dst) return { err: 'ENOENT' }
     const built = assemble(src.read(srcIno))
     if (built.errors.length) {
       this.log(`as: ${built.errors[0]}`)
@@ -1241,31 +1289,39 @@ export class Kernel {
    */
   private geometryOk(name: string): boolean {
     const fs = this.fss.get(name)
-    const ref = this.fss.get('sda')
-    if (!fs || !ref) return false
-    const a = fs.layout()
-    const b = ref.layout()
-    if (!a || !b) return false
-    for (const k of Object.keys(b) as (keyof typeof b)[]) {
-      if (a[k] !== b[k]) return false
-    }
-    return true
+    return !!fs && sameGeometry(fs.layout(), systemGeometry())
   }
 
   private fsOf(name: string): FS {
     return this.fss.get(name)!
   }
 
+  /** 把一台设备排进落盘队列。返回的 promise 在写成功后兑现 true。 */
+  private persistDev(name: string): Promise<boolean> {
+    const dev = this.devs.get(name)
+    if (!dev) return Promise.resolve(false)
+    const pending = saveDev(dev)
+    this.writes.add(pending)
+    void pending.then(
+      (ok) => {
+        this.writes.delete(pending)
+        if (this.devs.has(name)) this.storageOk = ok
+      },
+      () => {
+        this.writes.delete(pending)
+        this.storageOk = false
+      },
+    )
+    return pending
+  }
+
   private flush(quiet: boolean): number {
     let blocks = 0
-    let ok = true
     for (const name of this.devs.keys()) {
-      if (name === 'rom') continue // ROM 每次上电重新烧写，无需回写
-      const fs = this.fsOf(name)
-      blocks += fs.usedBlocks()
-      ok = (this.persist ? saveDev(this.devs.get(name)!) : false) && ok
+      const fs = this.fss.get(name)
+      if (fs) blocks += fs.usedBlocks()
+      void this.persistDev(name)
     }
-    this.storageOk = ok
     this.dirty = false
     this.lastSyncMs = Date.now()
     if (!quiet) this.log(`sync: ${blocks} block(s) written to persistent store`)
@@ -1277,7 +1333,7 @@ export class Kernel {
       const dev = this.devs.get(name)!
       const fs = this.fsOf(name)
       const used = fs.valid() ? fs.usedBlocks() : 0
-      const mount = name === 'sda' ? '/' : name === 'rom' ? '/bin' : (this.mounts.get(name) ?? null)
+      const mount = name === 'sda' ? '/' : (this.mounts.get(name) ?? null)
       return {
         name,
         model: dev.spec.model,
@@ -1297,33 +1353,30 @@ export class Kernel {
   // ---------- UI 存储操作 ----------
 
   // 新建空盘：分配下一个可用的 sdX
-  attachDisk(label = 'disk'): Err | 0 {
+  async attachDisk(label = 'disk'): Promise<Err | 0> {
     const name = nextDiskName(this.devs.keys())
     if (!name) return { err: 'ENOSPC' }
-    const dev = this.makeDev(name, diskSpec(name))
+    this.makeDev(name, diskSpec(name))
     this.fsOf(name).format(label)
-    if (this.persist) {
-      saveDev(dev)
-      rememberDisk(name)
-    }
+    await this.persistDev(name)
     this.log(`${name}: attached, mkfs done, label "${label}"`)
     this.emit()
     return 0
   }
 
-  detachDisk(name: string): Err | 0 {
-    const dev = this.devs.get(name)
-    if (!dev || name === 'sda' || name === 'rom') return { err: 'ENODEV' }
+  async detachDisk(name: string): Promise<Err | 0> {
+    if (!this.devs.has(name) || name === 'sda') return { err: 'ENODEV' }
     if (this.mounts.has(name)) return { err: 'EBUSY' }
     this.devs.delete(name)
     this.fss.delete(name)
-    dropDev(name)
+    await dropDev(name)
     this.log(`${name}: detached`)
     this.emit()
     return 0
   }
 
-  // 导出整盘字节。sda 导出的 .img 与首次上电写入的根盘镜像同构。
+  // 导出整盘字节。sda 导出的 .img 与首次上电写入的根盘镜像同构，
+  // 也能在下次开机时用「从 .img 文件加载」当系统盘装回来。
   exportDisk(name: string): Err | 0 {
     const dev = this.devs.get(name)
     if (!dev) return { err: 'ENODEV' }
@@ -1333,36 +1386,38 @@ export class Kernel {
     return 0
   }
 
+  /** 立刻回写一块盘。存储面板直接改盘上字节时用，正常情况下脏数据自动回写。 */
+  saveDisk(name: string): Promise<boolean> {
+    return this.persistDev(name)
+  }
+
   // 导入镜像：每次都占用一个新的 sdX，不覆盖已有设备
-  importDisk(raw: Uint8Array, filename: string): Err | 0 {
+  async importDisk(raw: Uint8Array, filename: string): Promise<Err | 0> {
     const name = nextDiskName(this.devs.keys())
     if (!name) return { err: 'ENOSPC' }
     const spec = diskSpec(name)
     if (raw.length > spec.blockSize * spec.blockCount) return { err: 'ENOSPC' }
     const dev = this.makeDev(name, spec)
     dev.load(raw)
-    if (!this.fsOf(name).valid()) {
+    if (!this.fsOf(name).valid() || !this.geometryOk(name)) {
       this.devs.delete(name)
       this.fss.delete(name)
       return { err: 'EINVAL' }
     }
-    if (this.persist) {
-      saveDev(dev)
-      rememberDisk(name)
-    }
+    await this.persistDev(name)
     const fs = this.fsOf(name)
     this.log(`${name}: image ${filename} loaded, ${fs.usedInodes()} inodes, label "${fs.label()}"`)
     this.emit()
     return 0
   }
 
-  formatDisk(name: string): Err | 0 {
+  async formatDisk(name: string): Promise<Err | 0> {
     const dev = this.devs.get(name)
-    if (!dev || name === 'sda' || name === 'rom') return { err: 'ENODEV' }
+    if (!dev || name === 'sda') return { err: 'ENODEV' }
     if (this.mounts.has(name)) return { err: 'EBUSY' }
     const fs = this.fsOf(name)
     fs.format(fs.label() || name)
-    if (this.persist) saveDev(dev)
+    await this.persistDev(name)
     this.log(`${name}: mkfs complete, all data blocks free`)
     this.emit()
     return 0

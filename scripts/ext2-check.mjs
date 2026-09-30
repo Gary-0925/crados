@@ -242,6 +242,9 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
     g.cancelAnimationFrame = (id) => clearTimeout(id)
   }
   const guest = new Kernel()
+  // 引导异步：现做一张出厂盘就行（这里要验的是 guest 写盘，不是恢复存档）
+  const guestBoot = await guest.boot({ kind: 'fresh' })
+  if (guestBoot) check('guest 机器启动', false, guestBoot)
   // 控制台安静下来就算跑完：这些命令里有位图扫描，固定 tick 数会白等很久
   const fingerprint = () => {
     const ls = guest.consoleLines()
@@ -316,7 +319,7 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
     )
   }
   // 机器跑过就一定要收摊：内核自己挂着硬件时钟的 setInterval，不销毁进程退不出去
-  guest.destroy()
+  await guest.destroy()
 }
 
 fs.rmSync(bundleDir, { recursive: true, force: true })

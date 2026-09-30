@@ -72,14 +72,13 @@ const FD_SIZE = 6
 const STATES: PState[] = ['new', 'new', 'ready', 'running', 'blocked', 'zombie']
 const STATE_CODE: Record<PState, number> = { new: 1, ready: 2, running: 3, blocked: 4, zombie: 5 }
 
+// 设备号：sdX 是 1..26，与 CRX 内核看到的一致
 export const deviceCode = (name: string): number => {
-  if (name === 'rom') return 0xfe
   const m = /^sd([a-z])$/.exec(name)
   return m ? m[1].charCodeAt(0) - 96 : 0
 }
 
 export const deviceName = (code: number): string => {
-  if (code === 0xfe) return 'rom'
   // 未知设备号不能落成 sda，否则原始块读写会读到根盘。
   if (code >= 1 && code <= 26) return `sd${String.fromCharCode(96 + code)}`
   return ''
