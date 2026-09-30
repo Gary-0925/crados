@@ -78,7 +78,8 @@ files have to come from a real ext2 tool on the host side.
     /dev/sdb   first imported or created disk, then sdc, sdd, ...
 
 Only sda exists at boot, holding the root tree and the installed programs;
-a new disk takes the next free name.
+a new disk takes the next free name. Where the system disk comes from is
+chosen at boot — see Booting below.
 
 ## Mounting
 
@@ -101,12 +102,28 @@ count, bitmap and inode-table positions must match this machine, because
 the CRX machine code holds those numbers as constants. A foreign layout is
 refused rather than half-read.
 
+## Booting
+
+The system disk comes from one of three places, chosen at boot:
+
+    from IndexedDB          the sda saved in this browser, files and edits intact
+    from a .img file        an exported image as the system disk; must be ext2
+                            with this machine's geometry
+    create an empty disk    format a fresh one and write the factory tree
+
+All three re-install /bin at power-on so the programs match the current
+firmware, and all three re-attach the removable disks stored in IndexedDB.
+Without IndexedDB (headless runs, private mode) nothing is persisted but the
+machine runs exactly the same.
+
 ## Writeback
 
 There is no sync command. The kernel tracks a dirty flag and flushes
-modified devices to browser storage about once a second, on unmount, on
-panic and on shutdown; the Storage panel shows the current state.
-sync(2) still exists as call 17.
+modified devices to IndexedDB about once a second, on unmount, on panic and
+on shutdown; the Storage panel shows the current state. A disk is stored as
+16 KiB chunks and a flush only writes the chunks whose contents changed —
+an all-zero chunk is no different from a fresh disk and is not stored at
+all. sync(2) still exists as call 17.
 
 ## Host transfer
 
@@ -114,4 +131,6 @@ The Storage panel saves a device as <name>.img, a byte-for-byte copy with
 the superblock first, so sda exports as sda.img — a real ext2 image that
 e2fsck -fn, debugfs and loop mounts accept on Linux. Importing never
 overwrites a device: the image attaches as the next free name, and
-mismatching images (wrong magic, different block size) are refused.
+mismatching images (wrong magic, different block size) are refused. An
+exported sda.img can also come back as the system disk at the next boot
+with "from a .img file".

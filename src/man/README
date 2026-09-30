@@ -28,6 +28,10 @@ mount -o loop on Linux will read it as-is.
     /tmp        scratch
     /usr/bin    where your own programs go
 
+At power-on the machine asks where the system disk comes from: the copy saved
+in IndexedDB, an exported .img, or a brand-new disk with the factory system on
+it. Whatever you pick, the disk is written back to IndexedDB as you work.
+
 ## First steps
 
 Log in as `root` (empty password by default), then:

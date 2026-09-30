@@ -305,9 +305,6 @@ gp_create:
     je gp_ret_fail
     mov r4, 0
     stw [r4+0x0062], r0
-    ldw r5, [r4+0x0040]
-    cmp r5, 254             ; rom 只读
-    je gp_ret_fail
     ldw r1, [r4+0x0062]
     call vfs_type
     cmp r0, 2
@@ -421,9 +418,6 @@ gp_open_found:
     jmp gp_open_file
 gp_open_write:
     mov r4, 0
-    ldw r5, [r4+0x0040]
-    cmp r5, 254
-    je gp_fail
     ldw r1, [r4+0x0056]
     mov r2, ${M_WRITE}
     mov r3, ${M_OWRITE}
@@ -468,9 +462,6 @@ gp_open_dev:
     jmp gp_open_dev_kind
 gp_open_dev_w:
     mov r4, 0
-    ldw r5, [r4+0x0040]
-    cmp r5, 254
-    je gp_fail
     ldw r1, [r4+0x0056]
     mov r2, ${M_WRITE}
     mov r3, ${M_OWRITE}
@@ -532,9 +523,6 @@ gp_chmod:
     je gp_fail
     mov r4, 0
     stw [r4+0x0056], r0
-    ldw r5, [r4+0x0040]
-    cmp r5, 254
-    je gp_fail
     call current_euid
     cmp r0, ${UID_ROOT}
     je gp_chmod_apply
@@ -688,11 +676,6 @@ gp_do_unlink:
     stw [r4+0x0056], r0     ; 目标 inode
     cmp r0, ${ROOT_INO}
     je gp_ret_fail          ; 根目录不能删
-    ldw r5, [r4+0x0040]
-    cmp r5, 254
-    jne gp_ul_notrom
-    jmp gp_ret_fail         ; rom 固件只读
-gp_ul_notrom:
     call gp_is_mount
     cmp r0, 0
     je gp_ret_fail          ; 挂载点不能删
@@ -938,8 +921,6 @@ gp_rename:
     stw [r4+0x0064], r0
     ldw r5, [r4+0x0040]
     stw [r4+0x007C], r5
-    cmp r5, 254
-    je gp_fail
     mov r1, r0
     call vfs_type
     cmp r0, 3
@@ -1559,9 +1540,6 @@ gp_chown:
     je gp_fail
     mov r4, 0
     stw [r4+0x0056], r0
-    ldw r5, [r4+0x0040]
-    cmp r5, 254
-    je gp_fail
     ldw r1, [r4+0x0056]
     ldw r2, [r4+0x0052]
     call vfs_set_uid
@@ -1937,8 +1915,6 @@ gp_as_dest:
     mov r4, 0
     stw [r4+0x0060], r0
     ldw r5, [r4+0x0040]
-    cmp r5, 254
-    je gp_fail
     stw [r4+0x0062], r5
     mov r1, r0
     mov r2, ${M_WRITE}
@@ -1975,8 +1951,6 @@ gp_mount:
     mov r1, r1
     call gp_dev_code
     cmp r0, 0
-    je gp_fail
-    cmp r0, 254
     je gp_fail
     stw [r4+0x0056], r0
     mov r1, r0
@@ -2468,17 +2442,6 @@ gp_lsblk_basic_loop:
     pop r5
     push r5
     mov r1, gp_type_disk
-    ldb r0, [r5+2]
-    cmp r0, 114         ; the firmware device is the one named "rom"
-    jne gp_basic_type
-    ldb r0, [r5+3]
-    cmp r0, 111
-    jne gp_basic_type
-    ldb r0, [r5+4]
-    cmp r0, 109
-    jne gp_basic_type
-    mov r1, gp_type_rom
-gp_basic_type:
     call gp_puts
     mov r2, 2
     call view_pad
@@ -3019,8 +2982,6 @@ gp_lsblk_usage_text:
     .asciz "usage: lsblk [-a|-d|-f|-h]\\n  (no selector)  name, size, type, mountpoint\\n  -a  all device and filesystem fields\\n  -d  device details\\n  -f  filesystem usage\\n"
 gp_type_disk:
     .asciz "disk"
-gp_type_rom:
-    .asciz "rom "
 gp_bin:
     .asciz "/bin/"
 gp_usr:

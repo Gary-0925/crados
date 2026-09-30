@@ -9,8 +9,9 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "check": "npm run typecheck && npm run smoke && npm run ext2",
-    "ext2": "node scripts/ext2-check.mjs"
+    "check": "npm run typecheck && npm run smoke && npm run persist && npm run ext2",
+    "ext2": "node scripts/ext2-check.mjs",
+    "persist": "node scripts/persist-check.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

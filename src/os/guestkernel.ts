@@ -193,8 +193,6 @@ sys_write:
     cmp r6, 6           ; regular file
     jne write_bridge
     ldb r6, [r3+42]     ; fd.device
-    cmp r6, 254         ; rom 是固件，不能写
-    je write_file_failed
     push r3
     push r4
     push r5
@@ -3245,8 +3243,6 @@ sys_block_read:
     pop r1
     cmp r0, 0
     jne block_failed
-    cmp r1, 254         ; rom 不能由系统调用整块读出
-    je block_failed
     mov r4, 0xFE00
     stw [r4+2], r1
     stw [r4+4], r2
@@ -3266,8 +3262,6 @@ sys_block_write:
     pop r1
     cmp r0, 0
     jne block_failed
-    cmp r1, 254         ; 0xfe = rom，固件不可由系统调用改写
-    je block_failed
     mov r4, 0xFE00
     stw [r4+2], r1
     stw [r4+4], r2

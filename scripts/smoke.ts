@@ -2,8 +2,9 @@
 //
 // 覆盖范围
 //   1. 引导：内核启动、42 个系统程序汇编进 /bin、sda 根盘写盘、init/login 起来
-//   2. 交互：登录 root，跑一遍真实命令（ls / as / count / 重定向 / ps / lsblk / dmesg）
-//   3. 观测层：ControlPanel 能构建快照与目录树（打开“存储”面板时走的那条路）
+//   2. 启动来源：从 .img 引导、坏镜像被拒、没有 IndexedDB 时明确报错
+//   3. 交互：登录 root，跑一遍真实命令（ls / as / count / 重定向 / ps / lsblk / dmesg）
+//   4. 观测层：ControlPanel 能构建快照与目录树（打开“存储”面板时走的那条路）
 //
 // 任何 panic、断言失败或超时都以非零码退出。由 scripts/smoke.mjs 打包后运行。
 
@@ -18,6 +19,8 @@ if (typeof (globalThis as { requestAnimationFrame?: unknown }).requestAnimationF
 }
 
 const k = new Kernel()
+// 引导是异步的（磁盘可能来自 IndexedDB 或文件）；Node 里没有 IndexedDB，落盘整体停用
+const bootErr = await k.boot({ kind: 'fresh' })
 const consoleText = () => k.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')
 // 廉价的变化指纹：行数 + 最后两行（提示符会在原行上重绘）
 const fingerprint = () => {
@@ -65,14 +68,49 @@ function check(label: string, ok: boolean, detail = '') {
 // ---------- 1. 引导 ----------
 const bootTicks = settle(4000, 40)
 const boot = consoleText()
-check('引导完成且没有 panic', k.panic === null, k.panic ?? '')
+check('引导完成且没有 panic', k.panic === null && bootErr === null, bootErr ?? k.panic ?? '')
 check('登录提示出现', /crados login:/.test(boot))
 check('42 个系统程序装进 /bin', boot.includes('42 programs installed on /dev/sda'))
 check('根盘写盘成功', /sda: root image written, \d+ inodes/.test(boot))
 check('引导在 4000 个 tick 内结束', bootTicks < 4000, `${bootTicks} ticks`)
 void bootTicks
 
-// ---------- 2. 交互 ----------
+// ---------- 2. 启动来源 ----------
+// 三种引导方式覆盖开机菜单的三个选项；这里每种都开一台新机器，跑完就扔
+const sdaImage = k.diskImage('sda')!
+check('能取到 sda 整盘字节', sdaImage.length === 1024 * 1024, `${sdaImage.length} B`)
+
+const fromImage = new Kernel()
+const imageErr = await fromImage.boot({ kind: 'image', bytes: sdaImage, filename: 'sda.img' })
+check('从 .img 引导成功', imageErr === null && fromImage.panic === null, imageErr ?? fromImage.panic ?? '')
+check(
+  '从 .img 引导后系统程序就位',
+  /bin: \d+ programs installed/.test(fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')),
+)
+check(
+  '从 .img 引导后 init 以机器码启动',
+  /init: pid 1 started from \/bin\/init as machine code/.test(
+    fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n'),
+  ),
+)
+await fromImage.destroy()
+
+const shortImage = new Kernel()
+const shortErr = await shortImage.boot({ kind: 'image', bytes: new Uint8Array(4096), filename: 'junk.img' })
+check('长度不对的镜像被拒', typeof shortErr === 'string' && shortErr.length > 0, String(shortErr))
+await shortImage.destroy()
+
+const blankImage = new Kernel()
+const blankErr = await blankImage.boot({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
+check('全零镜像被拒且给出原因', typeof blankErr === 'string' && blankErr.length > 0, String(blankErr))
+await blankImage.destroy()
+
+const noStore = new Kernel()
+const storeErr = await noStore.boot({ kind: 'stored' })
+check('没有 IndexedDB 时明确报错', typeof storeErr === 'string' && storeErr.length > 0, String(storeErr))
+await noStore.destroy()
+
+// ---------- 3. 交互 ----------
 const session: Array<[string, RegExp]> = [
   ['root', /root@crados:\/root\$/],
   ['ls /bin', /(^|\s)cat(\s|$)/],
@@ -164,7 +202,7 @@ const countDisasm = (n: { kids: unknown[]; disasm?: string[] }): number =>
 check('目录树可构建', countNodes(snap.tree) > 60, `${countNodes(snap.tree)} 个节点`)
 check('可执行文件都能反汇编', countDisasm(snap.tree) >= 40, `${countDisasm(snap.tree)} 个`)
 cp.detach()
-k.destroy()
+await k.destroy()
 
 if (failures.length) {
   console.error(`\n${failures.length} 项失败:\n  - ${failures.join('\n  - ')}`)

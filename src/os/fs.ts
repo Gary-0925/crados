@@ -8,7 +8,7 @@
 //
 // 这里另外提供一个 VFS：挂载表 + 跨设备路径解析，模拟真实内核的 vfsmount 查找。
 
-import { BlockDev } from './blockdev'
+import { BlockDev, SPECS } from './blockdev'
 import {
   BLOCK_SIZE,
   Ext2,
@@ -18,7 +18,6 @@ import {
   S_IFBLK,
   S_IFCHR,
   S_IFDIR,
-  S_IFMT,
   S_IFREG,
   formatExt2,
   modeType,
@@ -97,6 +96,14 @@ const errCode = (e: unknown): Err => {
   return { err: code ?? 'EINVAL' }
 }
 
+export interface FSLayout {
+  blockSize: number
+  inodeSize: number
+  inodeCount: number
+  inodeTableBlock: number
+  inodeTableByte: number
+}
+
 // ---------- 单个设备上的 ext2 文件系统 ----------
 
 export class FS {
@@ -138,7 +145,7 @@ export class FS {
    * 盘上几何：CRX 内核要用 inode 表的字节偏移和 inode 总数来算偏移、验 inode 号。
    * 宿主只发布这些数字，inode 里的字段仍是内核自己按字节读的。
    */
-  layout(): { blockSize: number; inodeSize: number; inodeCount: number; inodeTableBlock: number; inodeTableByte: number } | null {
+  layout(): FSLayout | null {
     const e = this.tryExt()
     if (!e) return null
     return {
@@ -158,9 +165,6 @@ export class FS {
     return this.tryExt()?.statfs().inodes ?? this.dev.spec.inodeCount
   }
 
-  blockUsed(no: number): boolean {
-    return this.tryExt()?.isBlockUsed(no) ?? false
-  }
   inodeUsed(ino: number): boolean {
     return this.tryExt()?.isInodeUsed(ino) ?? false
   }
@@ -485,8 +489,28 @@ export class VFS {
   }
 }
 
-// 设备类型判定：面板与内核都用得上
-export const isDevice = (type: number): boolean => type === T_DEV
-export const isDir = (type: number): boolean => type === T_DIR
-export const isFile = (type: number): boolean => type === T_FILE
-export const S_IFMT_MASK = S_IFMT
+/**
+ * 本机系统盘的参照几何。CRX 机器码是按固定布局汇编的（inode 表在哪、位图在哪、
+ * 块总数多少都是常量），别的布局它读不了：挂载前、把 .img 当系统盘引导前，
+ * 都要拿这张表核对。宿主只发布事实，几何不符一律拒绝。几何是常量，算一次就够。
+ */
+let geometryCache: FSLayout | null | undefined
+export function systemGeometry(): FSLayout | null {
+  if (geometryCache !== undefined) return geometryCache
+  const dev = new BlockDev(SPECS.sda)
+  dev.load(formatExt2({ blockCount: SPECS.sda.blockCount, inodeCount: SPECS.sda.inodeCount, label: 'geometry' }))
+  geometryCache = new FS(dev).layout()
+  return geometryCache
+}
+
+/** 两份盘上几何是否逐字段一致（任一侧缺失即不符） */
+export function sameGeometry(a: FSLayout | null, b: FSLayout | null): boolean {
+  if (!a || !b) return false
+  return (
+    a.blockSize === b.blockSize &&
+    a.inodeSize === b.inodeSize &&
+    a.inodeCount === b.inodeCount &&
+    a.inodeTableBlock === b.inodeTableBlock &&
+    a.inodeTableByte === b.inodeTableByte
+  )
+}
