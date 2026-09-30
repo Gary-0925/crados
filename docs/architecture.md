@@ -10,13 +10,13 @@
 
 机器本身还带一个前端与固件：`src/hw/ui/` 是显示器、键盘、机箱控制条与上电菜单——上电菜单问的是介质
 （"系统盘位上的字节从哪来"），它是固件，在操作系统存在之前就能运行，所以它只依赖 `hw/boot` 与 `hw/store`。
-它跟硬件一样属于"机器"。根目录的 `src/Plain.tsx` 与 `src/Transparent.tsx` 是装配层：
-前者把机器与操作系统装成纯净版，后者再叠上面板。
+它跟硬件一样属于"机器"。`src/app/` 是装配层（不属于任何一部分）：`Plain.tsx` 把机器与操作系统装起来，
+`Transparent.tsx` 再叠上面板；`src/App.tsx` 指出构建哪一个（部署工作流会改写这一行）。
 
 ## 依赖方向
 
 ```
-入口（装配层）   纯净版 src/Plain.tsx       透明版 src/Transparent.tsx
+入口（装配层）   纯净版 src/app/Plain.tsx   透明版 src/app/Transparent.tsx
                             │                    │
                             │                    └──→ cp（面板，只读观测 hw + os）
                             ▼

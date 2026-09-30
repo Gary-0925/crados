@@ -165,8 +165,9 @@ the sake of another part:
     src/cp     透明化面板 the transparent panel: the snapshot layer and the five
                          panels.  The plain build leaves the whole folder out.
 
-`src/Plain.tsx` assembles machine + OS; `src/Transparent.tsx` adds the panel on
-top; `src/App.tsx` picks the one to build.  Who may import whom, and why the
+`src/app/Plain.tsx` assembles machine + OS; `src/app/Transparent.tsx` adds the
+panel on top; `src/App.tsx` picks the one to build (that is the line the deploy
+workflow rewrites, so the path stays where CI expects it).  Who may import whom, and why the
 boundary sits where it does, is written down in `docs/architecture.md`.
 
 ## Development
@@ -177,6 +178,6 @@ boundary sits where it does, is written down in `docs/architecture.md`.
     npm run check   # typecheck + parts + smoke + IndexedDB persistence + ext2 tests
 
 The transparent build is produced by CI, which rewrites `src/App.tsx` to point at
-`src/Transparent.tsx`. For local work on the control panel, change that line by hand.
+`src/app/Transparent.tsx`. For local work on the control panel, change that line by hand.
 The CI build also fails if the panel leaks into the plain bundle (it greps the
 built page for `crados/control-panel`, the panel's own tag).
