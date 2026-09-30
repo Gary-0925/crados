@@ -1,21 +1,13 @@
-// crados 内核：时钟中断驱动的轮转调度、系统调用分发、真实块设备与内存管理
+// crados 操作系统（跑在虚拟硬件上的软件）
 //
-// 存储的真相只有两处：BlockDev 的字节数组（磁盘）与 Memory 的字节数组（内存条）。
+// 存储的真相只有两处：主存条里的字节（hw/ram.ts）与磁盘上的字节（hw/disk.ts）。
 // 文件系统的目录、inode、位图都是磁盘字节里的字段；执行程序必须先把磁盘上的
 // 映像逐块拷贝进物理页帧，CPU 再从内存取指——没有任何数据"住在" JS 对象里。
+//
+// 这台操作系统装载在 hw/machine.ts 的机器上：机器出主存、盘位、控制台、硬件时钟
+// 与总线，操作系统出引导、进程、文件系统与权限。两边只通过 MachineSoftware 接口
+// 往来：机器每个时钟沿叫一次操作系统，块控制器放行用户态原始读写前问一次授权。
 
-import {
-  BlockDev,
-  diskSpec,
-  downloadDev,
-  dropDev,
-  listStoredDisks,
-  loadDev,
-  nextDiskName,
-  persistAvailable,
-  saveDev,
-  SPECS,
-} from './blockdev'
 import { factoryAccounts, parsePasswd, serializePasswd } from './accounts'
 import type { Account } from './accounts'
 import {
@@ -32,6 +24,23 @@ import {
   VFS,
 } from './fs'
 import { ROOT_INO } from './ext2'
+import { ASM_PROGRAMS } from './asmsrc'
+import { GUEST_IDLE_SOURCE, GUEST_KERNEL_SOURCE } from './guestkernel'
+import { GUEST_POLICY_SOURCE } from './guestpolicy'
+import { OS_VERSION } from './version'
+import { MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
+import type { VfsHooks } from './process'
+import { buildRootImage } from './rootimg'
+import { isErr, sys } from './types'
+import type { BlkInfo, Err, Syscall } from './types'
+import { deviceCode, deviceName } from '@/hw/disk'
+import type { BlockDev } from '@/hw/disk'
+import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from '@/hw/cpu'
+import type { CpuProgram, HwCall } from '@/hw/cpu'
+import { assemble, disassemble, loadExe } from '@/hw/isa'
+import { Machine } from '@/hw/machine'
+import type { MachineSoftware } from '@/hw/machine'
+import type { SegClass } from '@/hw/console'
 import {
   DEVINFO_BASE,
   DEVINFO_SLOTS,
@@ -41,41 +50,20 @@ import {
   KERNEL_TEXT_PAGES,
   KMSG_BASE,
   KMSG_SIZE,
-  Memory,
   PAGE_SIZE,
   RAM_SIZE,
   RESERVED_FRAME,
   RESERVED_FRAMES,
-  SCRATCH_BASE,
-  SCRATCH_SIZE,
   USER_FRAME_START,
-} from './memory'
-import { assemble, disassemble, loadExe } from './isa'
-import { ASM_PROGRAMS } from './asmsrc'
-import { GUEST_IDLE_SOURCE, GUEST_KERNEL_SOURCE } from './guestkernel'
-import { GUEST_POLICY_SOURCE } from './guestpolicy'
-import { OS_VERSION } from '../utils/config'
-import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from './vm'
-import type { Bus } from './vm'
-import { deviceCode, deviceName, MAX_PAGES, MAX_PROCS, PCB_BASE, PCB_MODE, PCB_SIZE, Process } from './process'
-import type { VfsHooks } from './process'
-import { buildRootImage } from './rootimg'
-import { isErr } from './types'
-import type { BlkInfo, Err, Gen, Syscall } from './types'
+} from '@/hw/ram'
 
 export const QUANTUM = 5
-const AUTOSYNC_MS = 1000 // 脏数据自动回写间隔，按真实时间计而非 tick
-const TURBO_BUDGET_MS = 6 // 不限速模式每帧允许占用的时间
+/** 不限速模式：一个时钟沿允许占用的宿主时间 */
+const TURBO_BUDGET_MS = 6
 const SLICES_PER_PUMP = 8
 const KERNEL_STACK_VPN = 15
 const KERNEL_TEXT_PFN = KERNEL_TEXT_FRAME
 const KERNEL_TEXT_BASE = KERNEL_TEXT_PFN * PAGE_SIZE
-const MMIO_TTY_OUT = 0xff00
-const MMIO_TTY_ERR = 0xff01
-const MMIO_TTY_STATUS = 0xff10
-const MMIO_TTY_DATA = 0xff11
-const MMIO_TTY_MODE = 0xff12 // 0 = 关闭回显（密码输入），非 0 = 恢复
-const MMIO_BLOCK = 0xfe00
 // 挂载表：8 项 x 4 字节，CRX 内核的只读 VFS 靠它跨越挂载点
 const KCB_MOUNTS = 0x00c0
 const KCB_MOUNT_SLOTS = 8
@@ -90,22 +78,20 @@ export type BootSource =
   // 现做一张空盘，装上出厂目录树与 /bin
   | { kind: 'fresh' }
 
-
-export type SegClass = 'out' | 'err' | 'sys' | 'echo'
-export interface Seg {
-  t: string
-  c: SegClass
-}
-export interface Line {
-  segs: Seg[]
-}
-// Optional observer; absent observers have no trace storage cost.
+/**
+ * 观测点：一个可选的通知口，只在有观察者（透明化面板）时才有内容。
+ * 操作系统自己的接口，不依赖面板：没有挂观察者时一条追踪数据都不会产生。
+ */
+/**
+ * 操作系统的观测口：任何前端都可以挂上来收事件，操作系统不关心它是不是面板。
+ * 没有订阅者时一条事件都不发，系统照常运行。
+ */
 export interface KernelObserver {
   changed(): void
   syscall?(tick: number, pid: number, pname: string, call: Syscall, result: unknown, blocked: boolean): void
 }
 
-function* unloadedGen(): Gen {
+function* unloadedProgram(): CpuProgram {
   return
 }
 
@@ -113,71 +99,100 @@ type ExecSpec = { entry: number }
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s)
 const hexAddr = (n: number) => '0x' + n.toString(16).padStart(4, '0')
-export class Kernel {
-  readonly mem = new Memory()
+
+export class Kernel implements MachineSoftware {
+  /** 这台操作系统跑着的机器：主存、盘位、控制台、硬件时钟都在里面 */
+  readonly machine: Machine
   readonly vfs = new VFS()
-  private readonly devs = new Map<string, BlockDev>()
+  /** 操作系统自己那份视图：每台设备上的文件系统 */
   private readonly fss = new Map<string, FS>()
   private readonly procs = new Map<number, Process>()
   private readonly binErrors: string[] = []
   private kernelIvt = 0
   private nextPid = 0
-  // 页表缓存纪元：PCB 页表字节被改写就递增，各进程的 MMU 缓存在下次访存时重建
-  private xlateEpoch = 0
 
   ticks = 0
   instructions = 0
-  hz = 20
-  paused = false
   private currentPid = -1
   private lastPicked = -1
   private shellPid = -1
   private fgPid: number | null = null
 
-  private lines: Line[] = []
-  private lineBuf = ''
-  private lineQueue: (string | null)[] = []
-  private inputPacket: Uint8Array | null | undefined
-  private inputOffset = 0
-  private ttyIrqPending = false
-  // canonical tty 回显开关：密码输入时 CRX 内核通过 MMIO 0xFF12 关掉它
-  private ttyEcho = true
-  // CRX 以字节写 TTY，清屏序列可能跨多个 MMIO write；驱动保留控制序列前缀，
-  // 不能把 ESC、[、2、J 当成四个普通可见字符。
-  private ttyEscape = ''
-  // TTY 是字节设备，UTF-8 只在驱动边界解码；stream 模式能跨 write 调用保留半个字符。
-  private readonly ttyDecoders = {
-    out: new TextDecoder('utf-8', { fatal: false }),
-    err: new TextDecoder('utf-8', { fatal: false }),
-  }
-  // Block controller registers (big-endian u16): command, device, block,
-  // buffer, status. TypeScript implements DMA only; the on-disk layout stays the guest's business.
-  private readonly blockRegs = new Uint8Array(10)
   private readonly klog: { tick: number; msg: string }[] = []
-
-  // 可移动设备没有数量上限；键是设备名，值是它当前的挂载点
+  /** 可移动设备当前的挂载点：键是设备名，值是挂载路径 */
   private readonly mounts = new Map<string, string>()
   /** 只有真正启动过的机器才配落盘：没启动成的机器上面可能是坏镜像 */
   private booted = false
-  private dirty = false
-  private lastSyncMs = 0
-  private storageOk = persistAvailable()
-  /** 在飞的落盘事务：停机时要等它们写完 */
-  private readonly writes = new Set<Promise<boolean>>()
-
-  turbo = false
   private suppress = false // 批量执行时合并通知，避免每 tick 都唤醒观察者
 
   panic: string | null = null
-  private timer: ReturnType<typeof setInterval> | null = null
   observer: KernelObserver | null = null
-  private nextTimerIrq = performance.now()
+
+  constructor(machine = new Machine()) {
+    this.machine = machine
+    machine.attachSoftware(this)
+  }
+
+  // ---------- 时钟（前端旋钮 → 硬件时钟） ----------
+
+  get hz(): number {
+    return this.machine.hz
+  }
+  get turbo(): boolean {
+    return this.machine.turbo
+  }
+  get paused(): boolean {
+    return this.machine.paused
+  }
+  setSpeed(v: number | 'max') {
+    this.machine.setSpeed(v)
+    if (typeof v === 'number') this.machine.ram.setU16(0x0024, v)
+    this.emit()
+  }
+  setPaused(paused: boolean) {
+    this.machine.setPaused(paused)
+    this.emit()
+  }
+  step() {
+    this.machine.setPaused(true)
+    this.tick()
+  }
+
+  // ---------- 装载在这台机器上（MachineSoftware） ----------
+
+  /** 一个时钟沿。不限速模式把若干个时钟周期合成一批，中途不唤醒观察者。 */
+  clockEdge(burst: boolean) {
+    if (this.panic) return
+    if (!burst) {
+      this.tick()
+      return
+    }
+    const t0 = performance.now()
+    this.suppress = true
+    try {
+      do this.tick()
+      while (!this.panic && performance.now() - t0 < TURBO_BUDGET_MS)
+    } finally {
+      this.suppress = false
+    }
+    this.emit()
+  }
+
+  clockFailed(error: unknown) {
+    this.suppress = false
+    this.setPanic(`host timer failure: ${(error as Error).message}`)
+  }
+
+  /** 用户态原始块读写（块控制器命令 1/2）的授权：只有 root 可以 */
+  rawBlockIOAllowed(): boolean {
+    return this.euidOf(this.currentPid) === UID_ROOT
+  }
 
   // ---------- 引导 ----------
 
   /**
-   * 启动。磁盘可能来自 IndexedDB 或用户选的文件，两者都是异步的，所以引导也异步：
-   * 先造机器，再由这里决定系统盘从哪来。
+   * 启动。机器由装配层先造好（new Kernel(machine)），这里决定系统盘从哪来：
+   * 可能来自浏览器的持久介质，也可能是用户选的 .img，两者都是异步的。
    *
    * 返回 null 表示机器已经跑起来；否则是给人的错误说明，此时机器尚未启动
    * （调用方应当留在启动菜单上）。
@@ -188,7 +203,7 @@ export class Kernel {
       this.log(msg, true)
     }
     stamp(`crados ${OS_VERSION} booting on browser/js`)
-    stamp(`cpu: 1 core, timer interrupt ${this.hz} Hz, round robin quantum ${QUANTUM}`)
+    stamp(`cpu: 1 core, timer interrupt ${this.machine.hz} Hz, round robin quantum ${QUANTUM}`)
     stamp(`mm: ${FRAME_COUNT} frames of ${PAGE_SIZE} B, ${RAM_SIZE / 1024} KiB`)
 
     if (!this.installGuestKernel()) {
@@ -198,11 +213,11 @@ export class Kernel {
 
     // sda：根盘（相当于 Windows 的 C 盘）。系统程序 /bin/* 也装在这块盘上，
     // 每次上电重新写入以保证与当前固件一致。
-    const sda = this.makeDev('sda')
-    const sdafs = this.fss.get('sda')!
+    const sda = this.machine.disks.insertSystem()
+    const sdafs = this.attachFilesystem(sda)
     let restored = false
     if (source.kind === 'stored') {
-      if (!(await loadDev(sda))) {
+      if (!(await this.machine.disks.restore(sda))) {
         return 'IndexedDB 里没有保存过系统盘：请改用 .img 文件，或新建空盘'
       }
       if (!sdafs.valid() || !sameGeometry(sdafs.layout(), systemGeometry())) {
@@ -239,20 +254,19 @@ export class Kernel {
     stamp('vfs: mounted /dev/sda on /')
 
     // 这台浏览器里存过的可移动盘逐个装回来；内容已失效就撤掉，避免留下读不出的空盘
-    for (const media of await listStoredDisks()) {
+    for (const media of await this.machine.disks.storedMedia()) {
       if (media.name === 'sda') continue
-      const dev = this.makeDev(media.name, diskSpec(media.name))
-      if ((await loadDev(dev)) && this.fss.get(media.name)!.valid()) {
-        stamp(`${media.name}: medium present, label "${this.fss.get(media.name)!.label()}"`)
+      const dev = this.machine.disks.insertStored(media.name)
+      const fs = this.attachFilesystem(dev)
+      if ((await this.machine.disks.restore(dev)) && fs.valid()) {
+        stamp(`${media.name}: medium present, label "${fs.label()}"`)
         continue
       }
-      this.devs.delete(media.name)
-      this.fss.delete(media.name)
-      void dropDev(media.name)
+      this.forgetFilesystem(media.name)
     }
 
     // 系统盘立刻落盘：新建或导入的盘要成为 IndexedDB 里的新存档
-    await this.persistDev('sda')
+    await this.machine.disks.save('sda')
     stamp('tty0: console ready, canonical mode with echo')
 
     if (this.binErrors.length) {
@@ -267,7 +281,7 @@ export class Kernel {
       return null
     }
     stamp(this.startInit())
-    this.startTimer()
+    this.machine.startClock()
     this.booted = true
     this.emit()
     return null
@@ -298,11 +312,17 @@ export class Kernel {
     },
   }
 
-  private makeDev(name: string, spec = SPECS[name]): BlockDev {
-    const dev = new BlockDev(spec)
-    this.devs.set(name, dev)
-    this.fss.set(name, new FS(dev))
-    return dev
+  /** 给一块已经插上的盘建立操作系统的文件系统视图 */
+  private attachFilesystem(dev: BlockDev): FS {
+    const fs = new FS(dev)
+    this.fss.set(dev.spec.name, fs)
+    return fs
+  }
+
+  /** 撤掉一台设备：文件系统视图与盘位上的盘一起拔掉 */
+  private forgetFilesystem(name: string): void {
+    this.fss.delete(name)
+    this.machine.disks.remove(name)
   }
 
   // 烧写 /bin：里面只接受汇编后的 CRX 映像
@@ -365,9 +385,9 @@ export class Kernel {
 
     for (let page = 0; page < KERNEL_TEXT_PAGES; page++) {
       const pfn = KERNEL_TEXT_PFN + page
-      this.mem.zero(pfn)
+      this.machine.ram.zero(pfn)
       const chunk = image.subarray(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
-      this.mem.bytes.set(chunk, pfn * PAGE_SIZE)
+      this.machine.ram.bytes.set(chunk, pfn * PAGE_SIZE)
     }
     this.kernelIvt = KERNEL_TEXT_BASE + built.symbols.ivt
     return true
@@ -399,77 +419,23 @@ export class Kernel {
     return 'init: failed to start'
   }
 
-  /** 停机：先灭硬件时钟，再把脏数据写进 IndexedDB。调用方无需等待写完。 */
+  /** 停机：先灭硬件时钟，再把脏数据写进浏览器的持久介质。调用方无需等待写完。 */
   destroy(): Promise<void> {
-    if (this.timer) clearInterval(this.timer)
-    this.timer = null
+    this.machine.stopClock()
     // 启动失败的机器不落盘：sda 上的字节可能就是那份被拒的镜像，
     // 写进去会把 IndexedDB 里好好存着的旧盘覆盖掉。
     if (!this.booted) return Promise.resolve()
     this.flush(true)
-    return Promise.all([...this.writes]).then(() => {})
+    return this.machine.disks.drain()
   }
 
-  // 限速模式每个定时器周期推进一拍；不限速模式在时间预算内连续推进，
-  // 并抑制中途的快照生成，否则光是渲染就会成为瓶颈
-  private startTimer() {
-    if (this.timer) clearInterval(this.timer)
-    this.nextTimerIrq = performance.now() + 1000 / this.hz
-    this.timer = setInterval(
-      () => {
-        if (this.paused || this.panic) return
-        try {
-          if (!this.turbo) {
-            this.tick()
-            return
-          }
-          const t0 = performance.now()
-          this.suppress = true
-          do this.tick()
-          while (!this.panic && performance.now() - t0 < TURBO_BUDGET_MS)
-          this.suppress = false
-          this.emit()
-        } catch (e) {
-          this.suppress = false
-          this.setPanic(`host timer failure: ${(e as Error).message}`)
-        }
-      },
-      this.turbo ? 0 : 1000 / this.hz,
-    )
-  }
-
-  setSpeed(v: number | 'max') {
-    this.turbo = v === 'max'
-    if (typeof v === 'number') {
-      this.hz = v
-      this.mem.setU16(0x0024, v)
-    }
-    this.nextTimerIrq = performance.now() + 1000 / this.hz
-    this.startTimer()
-    this.emit()
-  }
-  setPaused(paused: boolean) {
-    this.paused = paused
-    this.emit()
-  }
-  step() {
-    this.paused = true
-    this.tick()
-  }
   processes(): Process[] {
     return [...this.procs.values()]
   }
   filesystem(name: string): FS | undefined {
     return this.fss.get(name)
   }
-  /** 整盘字节的副本。验收脚本靠它把 guest 写过的盘交给 e2fsck；界面也可用来导出镜像。 */
-  diskImage(name: string): Uint8Array | null {
-    const dev = this.devs.get(name)
-    return dev ? dev.bytes.slice() : null
-  }
-  consoleLines(): Line[] {
-    return this.lines
-  }
+  /** 这块盘上操作系统看到的设备信息（几何来自硬件，用量与挂载点来自操作系统） */
   blockDevices(): BlkInfo[] {
     return this.blkInfo()
   }
@@ -483,13 +449,7 @@ export class Kernel {
     return this.currentPid
   }
   get foregroundPid(): number | null {
-    return this.mem.u16(0x002c) || this.fgPid
-  }
-  get storageReady(): boolean {
-    return this.storageOk
-  }
-  get pendingWriteback(): boolean {
-    return this.dirty
+    return this.machine.ram.u16(0x002c) || this.fgPid
   }
   // ---------- 调度 ----------
 
@@ -500,12 +460,7 @@ export class Kernel {
     // MAX 只增加 CPU cycle 吞吐。硬件 timer IRQ 由真实单调时间驱动，始终
     // 保持 hz 频率；sleep 和抢占因此不会随 MAX 加速。
     const nowMs = performance.now()
-    const timerDue = this.turbo || nowMs >= this.nextTimerIrq
-    if (!this.turbo && timerDue) {
-      const period = 1000 / this.hz
-      do this.nextTimerIrq += period
-      while (this.nextTimerIrq <= nowMs)
-    }
+    const timerDue = this.machine.pollTimerInterrupt()
 
     for (const process of this.procs.values()) {
       if (process.state !== 'blocked' || process.sleepMode !== 2 || nowMs < process.wakeAt) continue
@@ -515,9 +470,9 @@ export class Kernel {
     }
 
     let timerPending = timerDue
-    const slices = this.turbo ? 1 : SLICES_PER_PUMP
+    const slices = this.machine.turbo ? 1 : SLICES_PER_PUMP
     for (let slice = 0; slice < slices && !this.panic; slice++) {
-      const kCurrentPid = this.mem.u16(0x0020)
+      const kCurrentPid = this.machine.ram.u16(0x0020)
       if (kCurrentPid !== this.currentPid && this.procs.has(kCurrentPid)) {
         const selected = this.procs.get(kCurrentPid)!
         this.currentPid = kCurrentPid
@@ -541,11 +496,11 @@ export class Kernel {
           for (const p of this.procs.values()) {
             if (p !== next && p.state === 'running') p.state = 'ready'
           }
-          if (next !== cur) this.mem.setU16(0x0026, this.mem.u16(0x0026) + 1)
+          if (next !== cur) this.machine.ram.setU16(0x0026, this.machine.ram.u16(0x0026) + 1)
           next.state = 'running'
           this.currentPid = next.pid
-          this.mem.setU16(0x0020, next.pid)
-          this.mem.setU16(0x0022, next.slot)
+          this.machine.ram.setU16(0x0020, next.pid)
+          this.machine.ram.setU16(0x0022, next.slot)
           cur = next
         }
       }
@@ -556,25 +511,25 @@ export class Kernel {
       // 的间隙到达，那一拍的中断会被正在内核态的读端自己收走（永远不响应），
       // 或在扫描时读端还没挂上而被丢弃。只要还有输入且有进程阻塞在 stdin，
       // 就重新拉起 TTY 中断，让空闲进程再扫一次并唤醒它。
-      if (!this.ttyIrqPending && (this.lineQueue.length > 0 || this.inputPacket !== undefined)) {
+      if (!this.machine.console.irqPending && this.machine.console.hasInput) {
         for (const p of this.procs.values()) {
           if (p.state === 'blocked' && p.readStdin) {
-            this.ttyIrqPending = true
+            this.machine.console.raiseIrq()
             break
           }
         }
       }
       if (cur.cpu && cur.cpu.pendingIrq === NO_IRQ) {
-        if (this.ttyIrqPending) {
+        if (this.machine.console.irqPending) {
           cur.cpu.pendingIrq = VECTOR_TTY
-          this.ttyIrqPending = false
+          this.machine.console.takeIrq()
         } else if (timerPending) {
           cur.cpu.pendingIrq = VECTOR_TIMER
           timerPending = false
         }
       }
 
-      let r: IteratorResult<Syscall, unknown>
+      let r: IteratorResult<HwCall, unknown>
       try {
         r = cur.gen.next(cur.pending)
       } catch (e) {
@@ -588,7 +543,7 @@ export class Kernel {
         continue
       }
       cur.pending = undefined
-      this.fgPid = this.mem.u16(0x002c) || this.fgPid
+      this.fgPid = this.machine.ram.u16(0x002c) || this.fgPid
       if (r.done) {
         if (cur.pid <= 1) {
           this.setPanic(`critical process ${cur.pid} (${cur.name}) returned unexpectedly`)
@@ -600,7 +555,7 @@ export class Kernel {
       }
     }
 
-    if (this.dirty && Date.now() - this.lastSyncMs >= AUTOSYNC_MS) this.flush(false)
+    if (this.machine.disks.autosyncDue()) this.flush(false)
     this.emit()
   }
 
@@ -619,221 +574,6 @@ export class Kernel {
   }
 
   // ---------- 进程与加载器 ----------
-
-  private makeBus(p: Process): Bus {
-    const mem = this.mem
-    const bytes = mem.bytes
-    const pcbBase = p.base
-    // 每进程页表缓存：vpn → (pfn | supervisor<<15)，未映射为 -1。
-    // 只有 PCB 的页表字节被写过时才重建（写路径递增 xlateEpoch）。
-    const xlate = new Int32Array(MAX_PAGES)
-    let xlateEpoch = -1
-    const syncXlate = () => {
-      for (let vpn = 0; vpn < MAX_PAGES; vpn++) xlate[vpn] = p.pteBits(vpn)
-      xlateEpoch = this.xlateEpoch
-    }
-    const userAddr = (va: number): number => {
-      if (xlateEpoch !== this.xlateEpoch) syncXlate()
-      const raw = xlate[va >>> 8]
-      if (raw < 0) throw new Fault(va, 'page fault')
-      if (raw & 0x8000) throw new Fault(va, 'supervisor page fault')
-      return ((raw & 0x7fff) << 8) + (va & 0xff)
-    }
-    // Kernel instructions use a physical direct map. The sole exception is
-    // the per-process supervisor stack at VPN 15. Access to user virtual
-    // memory must use ULDB/USTB (forceUser=true), never an ordinary load.
-    const kernelAddr = (va: number): number => {
-      if (xlateEpoch !== this.xlateEpoch) syncXlate()
-      const raw = xlate[va >>> 8]
-      if (raw >= 0 && raw & 0x8000) return ((raw & 0x7fff) << 8) + (va & 0xff)
-      if (va < RAM_SIZE) return va
-      throw new Fault(va, 'kernel address fault')
-    }
-    const inKernel = () => bytes[pcbBase + PCB_MODE] !== 0
-    const addr = (va: number, forceUser: boolean): number =>
-      forceUser || !inKernel() ? userAddr(va) : kernelAddr(va)
-    const readMem = (va: number, forceUser = false) => bytes[addr(va, forceUser)]
-    const writeMem = (va: number, b: number, forceUser = false) => {
-      bytes[addr(va, forceUser)] = b & 0xff
-    }
-    // PCB 页表字节被改写后，缓存必须在下次访存前失效
-    const noteWrite = (pa: number) => {
-      if ((pa - PCB_BASE) >>> 0 < MAX_PROCS * PCB_SIZE) this.xlateEpoch++
-    }
-    const reg16 = (off: number) => (this.blockRegs[off] << 8) | this.blockRegs[off + 1]
-    const setReg16 = (off: number, value: number) => {
-      this.blockRegs[off] = (value >> 8) & 0xff
-      this.blockRegs[off + 1] = value & 0xff
-    }
-    const loadInputPacket = () => {
-      if (this.inputPacket !== undefined || !this.lineQueue.length) return
-      const line = this.lineQueue.shift()
-      this.inputPacket = line === null || line === undefined ? null : UTF8_ENCODER.encode(line)
-      this.inputOffset = 0
-    }
-    const ttyStatus = () => {
-      loadInputPacket()
-      if (this.inputPacket === undefined) return 0
-      if (this.inputPacket === null) return 2
-      if (this.inputPacket.length === 0) return 3
-      // 4 = 本行只剩最后一个字节。读端凭它在行边界停住，一次 read 只拿一行，
-      // 否则排队里的多行会被拼成一条超长命令。
-      return this.inputOffset === this.inputPacket.length - 1 ? 4 : 1
-    }
-    const ttyData = () => {
-      loadInputPacket()
-      if (this.inputPacket === undefined) return 0
-      if (this.inputPacket === null || this.inputPacket.length === 0) {
-        this.inputPacket = undefined
-        this.inputOffset = 0
-        return 0
-      }
-      const value = this.inputPacket[this.inputOffset++]
-      if (this.inputOffset >= this.inputPacket.length) {
-        this.inputPacket = undefined
-        this.inputOffset = 0
-      }
-      return value
-    }
-    const runBlockCommand = () => {
-      const command = reg16(0)
-      if (command === 3) {
-        // sync：把每台设备的脏分块排进写队列。IndexedDB 的写入是异步的，
-        // 这里返回的是"已经接管"，落盘结果由 storageOk 反映。
-        const ok = persistAvailable()
-        if (ok) for (const name of this.devs.keys()) this.persistDev(name)
-        this.storageOk = ok
-        this.dirty = false
-        this.lastSyncMs = Date.now()
-        setReg16(8, ok ? 1 : 0xffff)
-        return
-      }
-      const name = deviceName(reg16(2))
-      const dev = name ? this.devs.get(name) : undefined
-      const block = reg16(4)
-      const buffer = reg16(6)
-        // 命令 1/2 是用户态 block_read/block_write。找不到进程时拒绝，不能当成 root。
-        if ((command === 1 || command === 2) && this.euidOf(this.currentPid) !== UID_ROOT) {
-          setReg16(8, 0xffff)
-          return
-        }
-        // 命令 4/5 只服务内核自己的暂存区。用户可控的缓冲区不能从这里写进物理内存。
-        if ((command === 4 || command === 5) && buffer !== SCRATCH_BASE) {
-          setReg16(8, 0xffff)
-          return
-        }
-        if (!dev || block >= dev.blockCount) {
-          setReg16(8, 0xffff)
-          return
-        }
-        try {
-          const bytes = dev.block(block)
-          if (bytes.length > SCRATCH_SIZE) {
-            setReg16(8, 0xffff)
-            return
-          }
-          if (command === 1 || command === 4) {
-          const forceUser = command === 1
-          for (let i = 0; i < bytes.length; i++) writeMem(buffer + i, bytes[i], forceUser)
-        } else if (command === 2 || command === 5) {
-          const forceUser = command === 2
-          for (let i = 0; i < bytes.length; i++) bytes[i] = readMem(buffer + i, forceUser)
-          this.dirty = true
-        } else {
-          setReg16(8, 0xffff)
-          return
-        }
-        setReg16(8, 1)
-      } catch {
-        setReg16(8, 0xffff)
-      }
-    }
-    return {
-      get limit() {
-        return inKernel() ? RAM_SIZE : p.addressLimit
-      },
-      read: (va) => {
-        if (!inKernel()) return bytes[userAddr(va)]
-        if (va === MMIO_TTY_STATUS) return ttyStatus()
-        if (va === MMIO_TTY_DATA) return ttyData()
-        if (va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
-          return this.blockRegs[va - MMIO_BLOCK]
-        }
-        if (va >= 0xff00) return 0
-        return bytes[kernelAddr(va)]
-      },
-      readUser: (va) => bytes[userAddr(va)],
-      writeUser: (va, b) => {
-        const pa = userAddr(va)
-        bytes[pa] = b & 0xff
-        noteWrite(pa)
-      },
-      write: (va, b) => {
-        if (!inKernel()) {
-          const pa = userAddr(va)
-          bytes[pa] = b & 0xff
-          noteWrite(pa)
-          return
-        }
-        if (va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
-          const off = va - MMIO_BLOCK
-          this.blockRegs[off] = b & 0xff
-          if (off === 1) runBlockCommand()
-          return
-        }
-        if (va >= 0xff00) {
-          this.mmioWrite(va, b)
-          return
-        }
-        const pa = kernelAddr(va)
-        bytes[pa] = b & 0xff
-        noteWrite(pa)
-      },
-    }
-  }
-
-  private conWriteTty(text: string, cls: SegClass) {
-    if (!text) return
-    const sequence = '\x1b[2J'
-    const combined = this.ttyEscape + text
-    this.ttyEscape = ''
-    let from = 0
-    while (from < combined.length) {
-      const hit = combined.indexOf(sequence, from)
-      if (hit >= 0) {
-        if (hit > from) this.conWrite(combined.slice(from, hit), cls)
-        this.lines = []
-        from = hit + sequence.length
-        continue
-      }
-      const tail = combined.slice(from)
-      let keep = 0
-      for (let n = 1; n < sequence.length; n++) {
-        if (tail.endsWith(sequence.slice(0, n))) keep = n
-      }
-      if (keep) {
-        const visible = tail.slice(0, -keep)
-        if (visible) this.conWrite(visible, cls)
-        this.ttyEscape = tail.slice(-keep)
-      } else {
-        this.conWrite(tail, cls)
-      }
-      return
-    }
-  }
-
-  // TypeScript only supplies the virtual UART hardware. It does not inspect
-  // syscalls or file descriptors; those decisions are made by CRX kernel code.
-  private mmioWrite(port: number, byte: number) {
-    const raw = Uint8Array.of(byte & 0xff)
-    if (port === MMIO_TTY_OUT) {
-      this.conWriteTty(this.ttyDecoders.out.decode(raw, { stream: true }), 'out')
-    } else if (port === MMIO_TTY_ERR) {
-      this.conWriteTty(this.ttyDecoders.err.decode(raw, { stream: true }), 'err')
-    } else if (port === MMIO_TTY_MODE) {
-      this.ttyEcho = (byte & 0xff) !== 0
-    }
-  }
 
   // 找一个空闲 PCB 槽。表满时先回收「没人会再 wait 的僵尸」：后台作业（命令后跟 &）
   // 的父进程只把自己标回读键盘，永远不会 wait 那个 pid，僵尸就永久占着槽位——攒到
@@ -877,20 +617,20 @@ export class Kernel {
     const codePages = Math.max(1, Math.ceil(image.length / PAGE_SIZE))
     if (codePages + 1 > KERNEL_STACK_VPN) return { err: 'EFBIG' }
     // Dynamic pages are allocated explicitly with page_alloc.
-    const pfns = this.mem.alloc(codePages + 2)
+    const pfns = this.machine.ram.alloc(codePages + 2)
     if (!pfns) return { err: 'ENOMEM' }
 
     // 加载：磁盘映像逐页拷贝进物理帧，此后 CPU 只面向内存
-    this.mem.writeBytesPages(pfns.slice(0, codePages), image)
+    this.machine.ram.writeBytesPages(pfns.slice(0, codePages), image)
     const stackVpn = codePages
     const stackFrame = pfns[stackVpn]
     const kernelStackFrame = pfns[codePages + 1]
     // argv 区位于栈页起始处：argc 在 r1，argv 基地址在 r2，字符串以 NUL 分隔
     const argvText = args.length ? args.join('\0') + '\0' : ''
-    this.mem.writeAt(stackFrame * PAGE_SIZE, argvText)
+    this.machine.ram.writeAt(stackFrame * PAGE_SIZE, argvText)
 
     const env = parent ? { ...parent.env } : { USER: 'root', HOME: '/', PATH: '/bin:/usr/bin', SHELL: '/bin/sh' }
-    const p = new Process(this.mem, slot, unloadedGen(), env, this.vfsHooks)
+    const p = new Process(this.machine.ram, slot, unloadedProgram(), env, this.vfsHooks)
     p.init(pid, parent ? parent.pid : 0, name, cmd, parent ? parent.cwd : '/')
     if (parent) {
       p.uid = parent.uid
@@ -916,7 +656,7 @@ export class Kernel {
     cpu.usp = cpu.sp
     cpu.regs[1] = args.length
     cpu.regs[2] = stackVpn * PAGE_SIZE
-    p.gen = runExe(cpu, this.makeBus(p), (count) => {
+    p.gen = runExe(cpu, this.machine.busFor(p), (count) => {
       this.instructions += count
     })
     p.regs.sp = p.cpu ? p.cpu.sp : stackFrame * PAGE_SIZE + PAGE_SIZE - 1
@@ -941,25 +681,25 @@ export class Kernel {
   private writeKernelTables() {
     const banner = `crados ${OS_VERSION}\n`
     for (let i = 0; i < 32; i++) {
-      this.mem.bytes[i] = i < banner.length ? banner.charCodeAt(i) : 0
+      this.machine.ram.bytes[i] = i < banner.length ? banner.charCodeAt(i) : 0
     }
-    this.mem.setU16(0x0024, this.hz)
-    this.mem.setU16(0x0030, this.kernelIvt)
-    this.mem.setU16(0x0032, this.procs.size)
+    this.machine.ram.setU16(0x0024, this.machine.hz)
+    this.machine.ram.setU16(0x0030, this.kernelIvt)
+    this.machine.ram.setU16(0x0032, this.procs.size)
     // 64 KiB 放不进 u16，这里记最后一个可寻址字节。mem 命令用的是真实字节数。
-    this.mem.setU16(0x0034, RAM_SIZE > 0xffff ? 0xffff : RAM_SIZE)
-    this.mem.setU16(0x0036, PAGE_SIZE)
-    this.mem.setU16(0x0038, PCB_BASE)
-    this.mem.setU16(0x003a, PCB_SIZE)
-    this.mem.setU16(0x003c, QUANTUM)
-    this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
-    this.mem.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
+    this.machine.ram.setU16(0x0034, RAM_SIZE > 0xffff ? 0xffff : RAM_SIZE)
+    this.machine.ram.setU16(0x0036, PAGE_SIZE)
+    this.machine.ram.setU16(0x0038, PCB_BASE)
+    this.machine.ram.setU16(0x003a, PCB_SIZE)
+    this.machine.ram.setU16(0x003c, QUANTUM)
+    this.machine.ram.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
+    this.machine.ram.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
     // ext2 几何：inode 表的字节偏移与 inode 总数。CRX 内核据此算 inode 偏移，
     // 但盘上结构仍然是它自己按字节解析的——宿主只发布事实。
     const root = this.fss.get('sda')
     const layout = root?.layout()
-    this.mem.setU16(0x004a, layout ? layout.inodeTableByte : 0)
-    this.mem.setU16(0x004c, layout ? layout.inodeCount : 0)
+    this.machine.ram.setU16(0x004a, layout ? layout.inodeTableByte : 0)
+    this.machine.ram.setU16(0x004c, layout ? layout.inodeCount : 0)
     this.writeMountTable()
     this.publishDevinfo()
   }
@@ -967,7 +707,7 @@ export class Kernel {
   // 把 VFS 挂载关系写成 CRX 内核能读的表：每项是宿主设备、挂载点在宿主上的
   // inode、被挂设备、被挂设备每块的扇区数。TypeScript 只登记，不替内核走路径。
   private writeMountTable() {
-    this.mem.bytes.fill(0, KCB_MOUNTS, KCB_MOUNTS + KCB_MOUNT_SLOTS * 4)
+    this.machine.ram.bytes.fill(0, KCB_MOUNTS, KCB_MOUNTS + KCB_MOUNT_SLOTS * 4)
     let slot = 0
     for (const m of this.vfs.mounts) {
       if (m.path === '/' || slot >= KCB_MOUNT_SLOTS) continue
@@ -982,10 +722,10 @@ export class Kernel {
       }
       if (!ino) continue
       const at = KCB_MOUNTS + slot++ * 4
-      this.mem.bytes[at] = deviceCode(host.fs.dev.spec.name)
-      this.mem.bytes[at + 1] = ino
-      this.mem.bytes[at + 2] = deviceCode(m.fs.dev.spec.name)
-      this.mem.bytes[at + 3] = 0 // 保留：块控制器现在整块搬运，不再按 256 B 扇区寻址
+      this.machine.ram.bytes[at] = deviceCode(host.fs.dev.spec.name)
+      this.machine.ram.bytes[at + 1] = ino
+      this.machine.ram.bytes[at + 2] = deviceCode(m.fs.dev.spec.name)
+      this.machine.ram.bytes[at + 3] = 0 // 保留：块控制器现在整块搬运，不再按 256 B 扇区寻址
     }
   }
 
@@ -1000,7 +740,7 @@ export class Kernel {
     p.wakeAt = 0
     p.readStdin = false
     p.waitFor = null
-    this.mem.freeFrames(p.pageTable.map((pte) => pte.pfn))
+    this.machine.ram.freeFrames(p.pageTable.map((pte) => pte.pfn))
     p.pageTable = []
     p.fds.clear()
     this.writeKernelTables()
@@ -1049,12 +789,12 @@ export class Kernel {
   // svc 40: the guest already resolved the path, checked permission, and filled
   // the request. The host only loads the authorized image and attaches a CPU.
   private hwExec(parent: Process, at: number): number | Err {
-    const b = this.mem.bytes
+    const b = this.machine.ram.bytes
     const dev = b[at] ?? 0
     const ino = b[at + 1] ?? 0
-    const uid = this.mem.u16(at + 2)
-    const euid = this.mem.u16(at + 4)
-    const argc = this.mem.u16(at + 6)
+    const uid = this.machine.ram.u16(at + 2)
+    const euid = this.machine.ram.u16(at + 4)
+    const argc = this.machine.ram.u16(at + 6)
     let name = ''
     for (let i = 0; i < 16 && b[at + 8 + i]; i++) name += String.fromCharCode(b[at + 8 + i])
     const args: string[] = []
@@ -1066,7 +806,7 @@ export class Kernel {
       cursor++
       args.push(s)
     }
-    const envLen = Math.min(80, this.mem.u16(at + 184))
+    const envLen = Math.min(80, this.machine.ram.u16(at + 184))
     const envBytes = b.slice(at + 186, at + 186 + envLen)
     const cwdDev = b[at + 266] ?? 0
     const cwdIno = b[at + 267] ?? 0
@@ -1082,16 +822,16 @@ export class Kernel {
     created.uid = uid
     created.euid = euid
     if (cwdDev) {
-      this.mem.bytes[created.base + 22] = cwdDev
-      this.mem.bytes[created.base + 23] = cwdIno
+      this.machine.ram.bytes[created.base + 22] = cwdDev
+      this.machine.ram.bytes[created.base + 23] = cwdIno
     }
     const argvLen = args.length ? args.join('\0').length + 1 : 0
     if (envBytes.length && argvLen + envBytes.length <= PAGE_SIZE) {
       const stackVpn = Math.max(1, Math.ceil(exe.image.length / PAGE_SIZE))
       const stack = created.pageTable.find((pte) => pte.vpn === stackVpn)
       if (stack) {
-        this.mem.bytes.set(envBytes, stack.pfn * PAGE_SIZE + argvLen)
-        this.mem.setU16(created.base + 10, stackVpn * PAGE_SIZE + argvLen)
+        this.machine.ram.bytes.set(envBytes, stack.pfn * PAGE_SIZE + argvLen)
+        this.machine.ram.setU16(created.base + 10, stackVpn * PAGE_SIZE + argvLen)
         for (const key of Object.keys(created.env)) delete created.env[key]
         let i = 0
         while (i < envBytes.length) {
@@ -1110,7 +850,7 @@ export class Kernel {
     if (flags & 1) {
       this.shellPid = created.pid
       this.fgPid = created.pid
-      this.mem.setU16(0x002c, created.pid)
+      this.machine.ram.setU16(0x002c, created.pid)
     }
     this.log(`sched: pid ${created.pid} (${name}) forked from pid ${parent.pid}, ${created.pageTable.length} pages`)
     return created.pid
@@ -1130,9 +870,9 @@ export class Kernel {
     const wanted = new Map<string, string>()
     for (let i = 0; i < KCB_MOUNT_SLOTS; i++) {
       const at = KCB_MOUNTS + i * 4
-      const hostDev = this.mem.bytes[at]
-      const hostIno = this.mem.bytes[at + 1]
-      const dev = this.mem.bytes[at + 2]
+      const hostDev = this.machine.ram.bytes[at]
+      const hostIno = this.machine.ram.bytes[at + 1]
+      const dev = this.machine.ram.bytes[at + 2]
       if (!dev) continue
       const name = deviceName(dev)
       if (!name || !this.fss.has(name)) continue
@@ -1146,7 +886,7 @@ export class Kernel {
       if (wanted.get(name) === m.path) continue
       this.vfs.umount(m.path)
       this.mounts.delete(name)
-      if (this.devs.has(name)) this.persistDev(name)
+      if (this.machine.disks.has(name)) void this.machine.disks.save(name)
     }
     for (const [name, path] of wanted) {
       if (this.vfs.mounts.some((m) => m.fs.dev.spec.name === name && m.path === path)) {
@@ -1180,7 +920,7 @@ export class Kernel {
     const wr = dst.writeBytes(dstIno, built.bytes)
     if (isErr(wr)) return wr
     dst.setExec(dstIno, true)
-    this.dirty = true
+    this.machine.disks.markDirty()
     return 0
   }
 
@@ -1228,7 +968,7 @@ export class Kernel {
     }
     fs.write(ino, serializePasswd(accounts))
     fs.setFlags(ino, MODE_FILE) // 0644：哈希很弱，这是教学系统
-    this.dirty = true
+    this.machine.disks.markDirty()
     this.log(`accounts: ${accounts.length} account${accounts.length > 1 ? 's' : ''} in /etc/passwd (${accounts.map((a) => a.name).join(', ')})`)
   }
 
@@ -1263,20 +1003,20 @@ export class Kernel {
   }
 
   private fillLoginEnv(at: number): number | Err {
-    const uid = this.mem.u16(at + 2)
+    const uid = this.machine.ram.u16(at + 2)
     const acct = this.accountsOf().find((a) => a.uid === uid)
     if (!acct) return { err: 'ENOENT' }
     const home = acct.uid === UID_ROOT ? '/root' : `/home/${acct.name}`
     const env = `USER\0${acct.name}\0HOME\0${home}\0PATH\0/bin:/usr/bin\0SHELL\0/bin/sh\0`
     const bytes = UTF8_ENCODER.encode(env)
     if (bytes.length > 80) return { err: 'E2BIG' }
-    this.mem.bytes.set(bytes, at + 186)
-    this.mem.setU16(at + 184, bytes.length)
+    this.machine.ram.bytes.set(bytes, at + 186)
+    this.machine.ram.setU16(at + 184, bytes.length)
     const fs = this.fss.get('sda')
     const ino = fs ? lookupAbs(fs, home) : 0
     if (fs && ino && fs.itype(ino) === T_DIR) {
-      this.mem.bytes[at + 266] = 1
-      this.mem.bytes[at + 267] = ino
+      this.machine.ram.bytes[at + 266] = 1
+      this.machine.ram.bytes[at + 267] = ino
     }
     return 0
   }
@@ -1296,41 +1036,24 @@ export class Kernel {
     return this.fss.get(name)!
   }
 
-  /** 把一台设备排进落盘队列。返回的 promise 在写成功后兑现 true。 */
-  private persistDev(name: string): Promise<boolean> {
-    const dev = this.devs.get(name)
-    if (!dev) return Promise.resolve(false)
-    const pending = saveDev(dev)
-    this.writes.add(pending)
-    void pending.then(
-      (ok) => {
-        this.writes.delete(pending)
-        if (this.devs.has(name)) this.storageOk = ok
-      },
-      () => {
-        this.writes.delete(pending)
-        this.storageOk = false
-      },
-    )
-    return pending
-  }
-
+  /**
+   * 把每台设备的脏分块排进落盘队列（不等待）。sync 块命令、自动回写、
+   * 停机与 panic 都走这里；真正"哪些分块变了"由盘位判断。
+   */
   private flush(quiet: boolean): number {
     let blocks = 0
-    for (const name of this.devs.keys()) {
+    for (const name of this.machine.disks.names()) {
       const fs = this.fss.get(name)
       if (fs) blocks += fs.usedBlocks()
-      void this.persistDev(name)
     }
-    this.dirty = false
-    this.lastSyncMs = Date.now()
+    this.machine.disks.flush()
     if (!quiet) this.log(`sync: ${blocks} block(s) written to persistent store`)
     return blocks
   }
 
   private blkInfo(): BlkInfo[] {
-    return [...this.devs.keys()].map((name) => {
-      const dev = this.devs.get(name)!
+    return this.machine.disks.names().map((name) => {
+      const dev = this.machine.disks.get(name)!
       const fs = this.fsOf(name)
       const used = fs.valid() ? fs.usedBlocks() : 0
       const mount = name === 'sda' ? '/' : (this.mounts.get(name) ?? null)
@@ -1345,79 +1068,58 @@ export class Kernel {
         removable: dev.spec.removable,
         present: true,
         mountpoint: mount,
-        persistent: this.storageOk,
+        persistent: this.machine.disks.storageReady,
       }
     })
   }
 
-  // ---------- UI 存储操作 ----------
+  // ---------- 设备管理（介质动作问盘位，mkfs 与挂载检查归操作系统） ----------
 
-  // 新建空盘：分配下一个可用的 sdX
+  /** 插一块新盘并格式化出文件系统；相当于把空盘装进机器再 mkfs */
   async attachDisk(label = 'disk'): Promise<Err | 0> {
-    const name = nextDiskName(this.devs.keys())
-    if (!name) return { err: 'ENOSPC' }
-    this.makeDev(name, diskSpec(name))
-    this.fsOf(name).format(label)
-    await this.persistDev(name)
+    const dev = this.machine.disks.insertBlank()
+    if (!dev) return { err: 'ENOSPC' }
+    const name = dev.spec.name
+    this.attachFilesystem(dev).format(label)
+    await this.machine.disks.save(name)
     this.log(`${name}: attached, mkfs done, label "${label}"`)
     this.emit()
     return 0
   }
 
+  /** 拔盘。挂载着的盘不给拔：先 umount。 */
   async detachDisk(name: string): Promise<Err | 0> {
-    if (!this.devs.has(name) || name === 'sda') return { err: 'ENODEV' }
+    if (!this.machine.disks.has(name) || name === 'sda') return { err: 'ENODEV' }
     if (this.mounts.has(name)) return { err: 'EBUSY' }
-    this.devs.delete(name)
-    this.fss.delete(name)
-    await dropDev(name)
+    this.forgetFilesystem(name)
+    await this.machine.disks.drain()
     this.log(`${name}: detached`)
     this.emit()
     return 0
   }
 
-  // 导出整盘字节。sda 导出的 .img 与首次上电写入的根盘镜像同构，
-  // 也能在下次开机时用「从 .img 文件加载」当系统盘装回来。
-  exportDisk(name: string): Err | 0 {
-    const dev = this.devs.get(name)
-    if (!dev) return { err: 'ENODEV' }
-    downloadDev(dev, `${name}.img`)
-    this.log(`${name}: raw image of ${dev.size} bytes written to host`)
-    this.emit()
-    return 0
-  }
-
-  /** 立刻回写一块盘。存储面板直接改盘上字节时用，正常情况下脏数据自动回写。 */
-  saveDisk(name: string): Promise<boolean> {
-    return this.persistDev(name)
-  }
-
   // 导入镜像：每次都占用一个新的 sdX，不覆盖已有设备
   async importDisk(raw: Uint8Array, filename: string): Promise<Err | 0> {
-    const name = nextDiskName(this.devs.keys())
-    if (!name) return { err: 'ENOSPC' }
-    const spec = diskSpec(name)
-    if (raw.length > spec.blockSize * spec.blockCount) return { err: 'ENOSPC' }
-    const dev = this.makeDev(name, spec)
-    dev.load(raw)
-    if (!this.fsOf(name).valid() || !this.geometryOk(name)) {
-      this.devs.delete(name)
-      this.fss.delete(name)
+    const dev = this.machine.disks.insertImage(raw)
+    if (!dev) return { err: 'ENOSPC' }
+    const name = dev.spec.name
+    const fs = this.attachFilesystem(dev)
+    if (!fs.valid() || !this.geometryOk(name)) {
+      this.forgetFilesystem(name)
       return { err: 'EINVAL' }
     }
-    await this.persistDev(name)
-    const fs = this.fsOf(name)
+    await this.machine.disks.save(name)
     this.log(`${name}: image ${filename} loaded, ${fs.usedInodes()} inodes, label "${fs.label()}"`)
     this.emit()
     return 0
   }
 
   async formatDisk(name: string): Promise<Err | 0> {
-    const dev = this.devs.get(name)
-    if (!dev || name === 'sda') return { err: 'ENODEV' }
+    if (!this.machine.disks.has(name) || name === 'sda') return { err: 'ENODEV' }
     if (this.mounts.has(name)) return { err: 'EBUSY' }
     const fs = this.fsOf(name)
     fs.format(fs.label() || name)
-    await this.persistDev(name)
+    await this.machine.disks.save(name)
     this.log(`${name}: mkfs complete, all data blocks free`)
     this.emit()
     return 0
@@ -1425,8 +1127,60 @@ export class Kernel {
 
   // ---------- 系统调用 ----------
 
-  private dispatch(p: Process, sc: Syscall) {
-    if (sc.call === 'yield') return
+  /**
+   * CRX 内核（supervisor 态的机器码）通过 svc 指令陷出来，r0 是号，r1..r3 是参数。
+   * 号段是这台机器与操作系统之间的约定：
+   *   3  exit(code)                 9 号以下沿用 Unix 传统号
+   *   22 kill(pid, sig)
+   *   40 hwexec(spawn_req)          创建进程（宿主只负责装载已授权的那份映像）
+   *   41 hwreap(pid)                回收 PCB 槽位
+   *   42 hwmount()                  按客户内核的挂载表重建宿主挂载视图
+   *   43 hwacct(op, arg)            账户与权限（/etc/passwd 的解析在宿主）
+   *   44 hwassemble(dev:ino → dev:ino)  汇编器（工具链）
+   *   45 hwdisasm(dev:ino, buf)     反汇编器（工具链）
+   * 号不对就是致命错误：与真正 CPU 上的非法系统调用一样，报给上层的是 Fault。
+   */
+  private hypercall(p: Process, num: number, a1: number, a2: number): Syscall | null {
+    switch (num) {
+      case 3:
+        return sys.exit(a1)
+      case 22:
+        return sys.kill(a1, a2 || 15)
+      case 40:
+        return { call: 'hwexec', at: a1 }
+      case 41:
+        return { call: 'hwreap', pid: a1 }
+      case 42:
+        return { call: 'hwmount' }
+      case 43:
+        return { call: 'hwacct', op: a1, arg: a2 }
+      case 44: {
+        const bus = this.machine.busFor(p)
+        return {
+          call: 'hwassemble',
+          srcDev: bus.read(a1),
+          srcIno: bus.read(a1 + 1),
+          dstDev: bus.read(a1 + 2),
+          dstIno: bus.read(a1 + 3),
+        }
+      }
+      case 45:
+        return { call: 'hwdisasm', at: a1 }
+      default:
+        return null
+    }
+  }
+
+  /** CPU 陷出：yield 让出时间片，halt 是停机，svc 交给上面那张表 */
+  private dispatch(p: Process, trap: HwCall) {
+    if (trap.call === 'yield') return
+    if (trap.call === 'halt') {
+      this.observer?.syscall?.(this.ticks, p.pid, p.name, sys.exit(trap.code), undefined, false)
+      this.doExit(p, trap.code)
+      return
+    }
+    const sc = this.hypercall(p, trap.num, trap.a1, trap.a2)
+    if (!sc) throw new Fault((p.cpu?.pc ?? 0) - 4, `unknown system call ${trap.num}`)
     let result: unknown = 0
 
     switch (sc.call) {
@@ -1468,15 +1222,15 @@ export class Kernel {
 
   // svc 45: disassemble one inode the guest already authorized. No path walk.
   private hwDisasm(p: Process, at: number): number | Err {
-    const dev = this.mem.bytes[at] ?? 0
-    const ino = this.mem.bytes[at + 1] ?? 0
-    const buf = this.mem.u16(at + 2)
-    const pathVa = this.mem.u16(at + 4)
+    const dev = this.machine.ram.bytes[at] ?? 0
+    const ino = this.machine.ram.bytes[at + 1] ?? 0
+    const buf = this.machine.ram.u16(at + 2)
+    const pathVa = this.machine.ram.u16(at + 4)
     const fs = this.fss.get(deviceName(dev))
     if (!fs || !fs.inodeUsed(ino) || fs.itype(ino) !== T_FILE) return { err: 'ENOENT' }
     const exe = loadExe(String.fromCharCode(...fs.readBytes(ino)))
     if (!exe) return { err: 'ENOEXEC' }
-    const bus = this.makeBus(p)
+    const bus = this.machine.busFor(p)
     let arg = ''
     for (let i = 0; i < 64; i++) {
       const c = bus.readUser(pathVa + i)
@@ -1500,50 +1254,29 @@ export class Kernel {
     return { max: fs.inodeCount, used: fs.usedInodes(), bytes: fs.usedBlocks() * fs.dev.blockSize }
   }
 
-  // ---------- 终端 ----------
+  // ---------- 终端（tty 行规：操作系统决定谁能收信号，屏幕与键盘在控制台设备里） ----------
 
   typeChar(ch: string) {
     if (this.panic) return
-    // canonical tty 只接收可打印字符；Ctrl-C/D/L 由对应的行规入口处理。
-    // 这样宿主浏览器产生的 DC1..DC4 等控制字节不会污染 argv 或文件。
-    if (!ch || (ch.charCodeAt(0) < 0x20 && ch !== '\t')) return
-    if (this.lineBuf.length < 256) this.lineBuf += ch
-    if (this.ttyEcho) this.conWrite(ch, 'echo')
+    this.machine.console.key(ch)
     this.emit()
   }
 
   pressEnter() {
     if (this.panic) return
-    this.lineQueue.push(this.lineBuf)
-    this.lineBuf = ''
-    if (this.ttyEcho) this.conWrite('\n', 'echo')
-    this.ttyIrqPending = true
+    this.machine.console.enter()
     this.emit()
   }
 
   pressBackspace() {
-    if (this.panic || !this.lineBuf) return
-    this.lineBuf = this.lineBuf.slice(0, -1)
-    if (this.ttyEcho) {
-      const line = this.lines[this.lines.length - 1]
-      const seg = line?.segs[line.segs.length - 1]
-      if (seg) {
-        seg.t = seg.t.slice(0, -1)
-        if (!seg.t) line.segs.pop()
-      }
-    }
+    if (this.panic) return
+    this.machine.console.backspace()
     this.emit()
   }
 
   pressCtrlD() {
     if (this.panic) return
-    if (this.lineBuf) {
-      this.lineQueue.push(this.lineBuf)
-      this.lineBuf = ''
-    }
-    this.lineQueue.push(null)
-    if (this.ttyEcho) this.conWrite('\n', 'echo')
-    this.ttyIrqPending = true
+    this.machine.console.eof()
     this.emit()
   }
 
@@ -1555,63 +1288,33 @@ export class Kernel {
     return !!acct && acct.perms.includes('k')
   }
 
+  /** Ctrl-C：能把前台进程杀掉就杀，杀不动就交一个空行让 shell 重画提示符 */
   pressCtrlC() {
     if (this.panic) return
-    this.conWrite('^C\n', 'err')
-    this.lineBuf = ''
+    this.machine.console.write('^C\n', 'err')
+    this.machine.console.discardLine()
     const fgPid = this.foregroundPid
     const fg = fgPid !== null ? this.procs.get(fgPid) : undefined
     const shell = this.procs.get(this.shellPid)
     const allowed = fg !== undefined && shell !== undefined && this.maySignalFg(fg, shell)
     if (allowed) this.killSig(fg, 2)
-    else {
-      this.lineQueue.push('')
-      this.ttyIrqPending = true
-    }
+    else this.machine.console.pushEmptyLine()
     this.emit()
   }
 
   pressCtrlL() {
-    this.lines = []
+    this.machine.console.clear()
     this.emit()
   }
 
   private conWrite(text: string, cls: SegClass) {
-    let rest = text
-    while (rest.includes('\x1b[2J')) {
-      const i = rest.indexOf('\x1b[2J')
-      if (i > 0) this.conWriteRaw(rest.slice(0, i), cls)
-      this.lines = []
-      rest = rest.slice(i + 4)
-    }
-    if (rest) this.conWriteRaw(rest, cls)
-  }
-
-  private conWriteRaw(text: string, cls: SegClass) {
-    const parts = text.split('\n')
-    this.append(parts[0], cls)
-    for (let i = 1; i < parts.length; i++) {
-      this.lines.push({ segs: parts[i] ? [{ t: parts[i], c: cls }] : [] })
-      if (this.lines.length > 600) this.lines.shift()
-    }
-  }
-
-  private append(s: string, cls: SegClass) {
-    if (!s) {
-      if (!this.lines.length) this.lines.push({ segs: [] })
-      return
-    }
-    if (!this.lines.length) this.lines.push({ segs: [] })
-    const line = this.lines[this.lines.length - 1]
-    const last = line.segs[line.segs.length - 1]
-    if (last && last.c === cls) last.t += s
-    else line.segs.push({ t: s, c: cls })
+    this.machine.console.write(text, cls)
   }
 
   private log(msg: string, toConsole = false) {
     this.klog.push({ tick: this.ticks, msg })
     if (this.klog.length > 400) this.klog.shift()
-    const line = `[${(this.ticks / this.hz).toFixed(4).padStart(9)}] ${msg}\n`
+    const line = `[${(this.ticks / this.machine.hz).toFixed(4).padStart(9)}] ${msg}\n`
     this.appendKmsg(line)
     if (toConsole) this.conWrite(line, 'sys')
   }
@@ -1621,18 +1324,18 @@ export class Kernel {
     const base = KMSG_BASE
     const max = KMSG_SIZE - 2
     const extra = UTF8_ENCODER.encode(text)
-    let len = this.mem.u16(base)
+    let len = this.machine.ram.u16(base)
     if (len > max) len = 0
     while (len + extra.length > max && len > 0) {
       let i = 0
-      while (i < len && this.mem.bytes[base + 2 + i] !== 10) i++
+      while (i < len && this.machine.ram.bytes[base + 2 + i] !== 10) i++
       const cut = i < len ? i + 1 : len
-      this.mem.bytes.copyWithin(base + 2, base + 2 + cut, base + 2 + len)
+      this.machine.ram.bytes.copyWithin(base + 2, base + 2 + cut, base + 2 + len)
       len -= cut
     }
     const n = Math.min(extra.length, Math.max(0, max - len))
-    if (n > 0) this.mem.bytes.set(extra.subarray(0, n), base + 2 + len)
-    this.mem.setU16(base, len + n)
+    if (n > 0) this.machine.ram.bytes.set(extra.subarray(0, n), base + 2 + len)
+    this.machine.ram.setU16(base, len + n)
   }
 
   // Hardware facts for the merged lsblk views (-a/-d/-f). CRX formats the text;
@@ -1640,14 +1343,14 @@ export class Kernel {
   // Record: present, removable, name[3], bs_len, model[17], bs[4], size[8],
   // used[7], pct, blocks u16, usedBlocks u16, mount[16].
   private publishDevinfo() {
-    for (let pfn = RESERVED_FRAME; pfn < RESERVED_FRAME + RESERVED_FRAMES; pfn++) this.mem.hold(pfn)
+    for (let pfn = RESERVED_FRAME; pfn < RESERVED_FRAME + RESERVED_FRAMES; pfn++) this.machine.ram.hold(pfn)
     const base = DEVINFO_BASE
-    this.mem.bytes.fill(0, base, base + DEVINFO_SLOTS * DEVINFO_STRIDE)
+    this.machine.ram.bytes.fill(0, base, base + DEVINFO_SLOTS * DEVINFO_STRIDE)
     let slot = 0
     for (const d of this.blkInfo()) {
       if (slot >= DEVINFO_SLOTS) break
       const at = base + slot++ * DEVINFO_STRIDE
-      const b = this.mem.bytes
+      const b = this.machine.ram.bytes
       b[at] = d.present ? 1 : 0
       b[at + 1] = d.removable ? 1 : 0
       for (let i = 0; i < 3; i++) b[at + 2 + i] = d.name.charCodeAt(i) || 0
@@ -1661,15 +1364,15 @@ export class Kernel {
       for (let i = 0; i < 8; i++) b[at + 27 + i] = size.charCodeAt(i)
       for (let i = 0; i < 7; i++) b[at + 35 + i] = used.charCodeAt(i)
       b[at + 42] = d.blocks ? Math.round((d.usedBlocks / d.blocks) * 100) : 0
-      this.mem.setU16(at + 43, d.blocks)
-      this.mem.setU16(at + 45, d.usedBlocks)
+      this.machine.ram.setU16(at + 43, d.blocks)
+      this.machine.ram.setU16(at + 45, d.usedBlocks)
       const mount = d.present ? (d.mountpoint ?? '-') : '(no medium)'
       for (let i = 0; i < mount.length && i < 16; i++) b[at + 47 + i] = mount.charCodeAt(i)
     }
   }
 
   private kmsgLines(): string[] {
-    return this.klog.map((e) => `[${(e.tick / this.hz).toFixed(4).padStart(9)}] ${e.msg}`)
+    return this.klog.map((e) => `[${(e.tick / this.machine.hz).toFixed(4).padStart(9)}] ${e.msg}`)
   }
 
   private emit() {

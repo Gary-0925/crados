@@ -1,6 +1,6 @@
 import type { ProcRow, Snapshot } from '@/cp/snapshot'
 import { hex } from '@/cp/theme'
-import { cn } from '@/utils/cn'
+import { cn } from '@/cp/cn'
 
 function Cell({ label, value }: { label: string; value: string }) {
   return (

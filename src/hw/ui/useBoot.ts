@@ -1,5 +1,7 @@
-// 开机流程：机器造好之后异步启动（磁盘可能在 IndexedDB 或用户选的文件里），
-// 启动菜单在 kernel 就绪之前接管整个屏幕。纯净版与透明版共用。
+// 固件：上电、选启动介质、把操作系统装载到机器上。
+//
+// 磁盘可能在浏览器的持久介质里，也可能是用户选的 .img，所以启动是异步的；
+// 操作系统就绪之前，启动菜单（固件界面）接管整个屏幕。纯净版与透明版共用。
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Kernel } from '@/os/kernel'

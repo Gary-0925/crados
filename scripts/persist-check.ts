@@ -3,7 +3,7 @@
 //   npm run persist
 //
 // 浏览器里才有真的 IndexedDB，Node 里没有，所以这里先装一个最小内存版
-// （只实现 blockdev 用到的那几个面），再驱动真实的 src/os/blockdev.ts 与内核：
+// （只实现分块存档用到的那几个面），再驱动真实的 src/hw/store.ts 与内核：
 //
 //   1. 整盘存取：写进去的字节要原样读回来，shadow 对齐
 //   2. 增量回写：改一个字节只落一个 16 KiB 分块，不是整盘重写
@@ -12,15 +12,8 @@
 //
 // 由 scripts/persist-check.mjs 打包后运行。
 
-import {
-  BlockDev,
-  SPECS,
-  dropDev,
-  listStoredDisks,
-  loadDev,
-  persistAvailable,
-  saveDev,
-} from '@/os/blockdev'
+import { BlockDev, SPECS } from '@/hw/disk'
+import { dropDev, listStoredDisks, loadDev, persistAvailable, saveDev } from '@/hw/store'
 import { Kernel } from '@/os/kernel'
 import { T_FILE } from '@/os/fs'
 
@@ -245,7 +238,7 @@ async function main() {
     if (typeof ino !== 'number') check('/tmp/marker 可创建', false, ino.err)
     else {
       fs.write(ino, 'persisted across boots')
-      check('立刻回写系统盘', (await fresh.saveDisk('sda')) === true)
+      check('立刻回写系统盘', (await fresh.machine.disks.save('sda')) === true)
     }
   }
 
@@ -266,10 +259,12 @@ async function main() {
   check('可移动盘被一并装回', stored.blockDevices().some((d) => d.name === 'sdb'))
   check(
     '系统程序照样重烧',
-    stored.consoleLines().some((l) => l.segs.some((s) => /bin: \d+ programs installed/.test(s.t))),
+    stored.machine.console
+      .screen()
+      .some((l) => l.segs.some((s) => /bin: \d+ programs installed/.test(s.t))),
   )
 
-  const image = stored.diskImage('sda')!
+  const image = stored.machine.disks.image('sda')!
   const fromImage = new Kernel()
   check(
     '从 .img 文件加载',

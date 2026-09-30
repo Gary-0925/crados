@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { FRAME_COUNT, PAGE_SIZE } from '@/os/memory'
+import { FRAME_COUNT, PAGE_SIZE } from '@/hw/ram'
 import type { Kernel } from '@/os/kernel'
 import type { Snapshot } from '@/cp/snapshot'
 import { HexDump } from '@/cp/HexDump'
 import { hex, pidColor } from '@/cp/theme'
-import { cn } from '@/utils/cn'
+import { cn } from '@/cp/cn'
 
 export function MemoryPanel({
   kernel,
@@ -32,7 +32,7 @@ export function MemoryPanel({
   const maxVa = proc ? proc.pts.length * PAGE_SIZE - 1 : 0
 
   const pfn = Math.min(frame, FRAME_COUNT - 1)
-  const bytes = kernel.mem.bytes.subarray(pfn * PAGE_SIZE, (pfn + 1) * PAGE_SIZE)
+  const bytes = kernel.machine.ram.bytes.subarray(pfn * PAGE_SIZE, (pfn + 1) * PAGE_SIZE)
   const nonZero = bytes.reduce((n, b) => n + (b !== 0 ? 1 : 0), 0)
   const mark = pa !== null && (pa >>> 8) === pfn ? pa : undefined
   const selectedFrame = snap.frames[pfn]
@@ -125,7 +125,7 @@ export function MemoryPanel({
           base={pfn * PAGE_SIZE}
           highlight={mark}
           onByteChange={(address, value) => {
-            kernel.mem.bytes[address] = value
+            kernel.machine.ram.bytes[address] = value
             onMutate()
           }}
         />

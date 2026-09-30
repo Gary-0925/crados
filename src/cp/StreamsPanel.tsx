@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { Snapshot } from '@/cp/snapshot'
-import { cn } from '@/utils/cn'
+import { cn } from '@/cp/cn'
 
 function useStick() {
   const ref = useRef<HTMLDivElement>(null)

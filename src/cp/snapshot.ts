@@ -5,11 +5,17 @@
 
 import type { Kernel } from '@/os/kernel'
 import { basename, modeText, T_DEV, T_DIR, T_FILE } from '@/os/fs'
-import { disassemble, isExecutable, loadExe } from '@/os/isa'
-import { FRAME_COUNT, KERNEL_TEXT_FRAME, USER_FRAME_START } from '@/os/memory'
+import { disassemble, isExecutable, loadExe } from '@/hw/isa'
+import { FRAME_COUNT, KERNEL_TEXT_FRAME, USER_FRAME_START } from '@/hw/ram'
 import type { PTE } from '@/os/process'
 import { isErr } from '@/os/types'
 import type { BlkInfo, PState, Syscall } from '@/os/types'
+
+/**
+ * 面板的自我标识。它出现在构建产物里，就说明面板混进了纯净版：
+ * CI 在打包后 grep 这个字符串把关（类名会被压缩混淆，字符串不会）。
+ */
+export const PANEL_TAG = 'crados/control-panel'
 
 export interface SysEntry {
   tick: number
@@ -172,6 +178,17 @@ function formatResult(result: unknown, blocked: boolean): { ret: string; err: bo
   return { ret: clip(JSON.stringify(result), 40), err: false }
 }
 
+// 阻塞原因的文字说明：面板自己从 PCB 字段拼出来，操作系统不为显示留接口。
+function waitDesc(p: ReturnType<Kernel['processes']>[number]): string | null {
+  if (p.state !== 'blocked') return null
+  if (p.sleepMode === 1) return `sleep until tick ${p.wakeAt}`
+  if (p.sleepMode === 2) return `sleep until monotonic ${p.wakeAt} ms`
+  if (p.readStdin) return 'waiting on stdin'
+  const w = p.waitFor
+  if (w !== null) return w === -1 ? 'wait for any child' : `wait for pid ${w}`
+  return 'blocked'
+}
+
 function describeFds(p: ReturnType<Kernel['processes']>[number]): string[] {
   return p.fds.entries().map(([fd, value]) => {
     switch (value.kind) {
@@ -296,7 +313,7 @@ export class ControlPanel {
 
   private build(): Snapshot {
     const k = this.kernel
-    const m = k.mem.stats()
+    const m = k.machine.ram.stats()
     const processes = k.processes()
     // Guest page_alloc updates only the physical bitmap and PCB PTEs. Rebuild
     // display ownership from those bytes rather than relying on host metadata.
@@ -338,7 +355,7 @@ export class ControlPanel {
         uid: p.uid,
         euid: p.euid,
         exitCode: p.exitCode,
-        waitDesc: p.waitDesc() as string | null,
+        waitDesc: waitDesc(p),
         pts: p.pageTable,
         fds: describeFds(p),
       })),
@@ -347,8 +364,9 @@ export class ControlPanel {
 
       fs: k.fsStats(),
       disks: k.blockDevices(),
-      storageOk: k.storageReady,
-      dirty: k.pendingWriteback,
+      // 存档能力与待回写量都是盘位（硬件）的事实，面板直接问硬件
+      storageOk: k.machine.disks.storageReady,
+      dirty: k.machine.disks.pendingWriteback,
       ips: this.ips,
       trace: this.trace,
       kmsgText: k.kmsg(),

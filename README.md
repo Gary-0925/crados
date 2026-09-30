@@ -145,13 +145,34 @@ a second (and on unmount, panic and shutdown). The Storage panel still exports
 any device as a `.img`, and that export is what you feed back in on the next
 boot.
 
+## Layout
+
+The project is exactly three parts, one folder each, with nothing kept around for
+the sake of another part:
+
+    src/hw     虚拟硬件  the machine: CPU and ISA, RAM, disks (bytes, IndexedDB,
+                         .img import/export), console (screen, keyboard, UART
+                         registers), hardware clock and interrupts, bus, MMU,
+                         block controller.  hw/ui is its front panel: display,
+                         keyboard, power-on menu.
+    src/os     操作系统  crados itself: boot loader, process table, scheduler,
+                         system calls, VFS and ext2, accounts, /bin sources,
+                         manuals, and the CRX kernel that runs in supervisor mode.
+    src/cp     透明化面板 the transparent panel: the snapshot layer and the five
+                         panels.  The plain build leaves the whole folder out.
+
+`src/Plain.tsx` assembles machine + OS; `src/Transparent.tsx` adds the panel on
+top; `src/App.tsx` picks the one to build.  Who may import whom, and why the
+boundary sits where it does, is written down in `docs/architecture.md`.
+
 ## Development
 
     npm ci          # install dependencies
     npm run dev     # plain build on http://localhost:5173
-    npm run check   # tsc --noEmit + headless smoke, IndexedDB persistence and ext2 tests
+    npm run parts   # the three part boundaries, checked against the import graph
+    npm run check   # typecheck + parts + smoke + IndexedDB persistence + ext2 tests
 
 The transparent build is produced by CI, which rewrites `src/App.tsx` to point at
-`src/app/Transparent.tsx`. For local work on the control panel, change that line by hand.
-
-Notes on performance work and the measurements behind them: `docs/optimization.md`.
+`src/Transparent.tsx`. For local work on the control panel, change that line by hand.
+The CI build also fails if the panel leaks into the plain bundle (it greps the
+built page for `crados/control-panel`, the panel's own tag).

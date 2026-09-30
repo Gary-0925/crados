@@ -59,7 +59,7 @@ import {
   SB_FREE_INODES,
   SB_INODES,
 } from './ext2'
-import { SCRATCH_BASE } from './memory'
+import { SCRATCH_BASE } from '@/hw/ram'
 import { PCB_EUID, PCB_UID } from './process'
 
 // 机器码里的绝对字节偏移：超级块在块 1、块组描述符在块 2（都是 1 KiB 块）。

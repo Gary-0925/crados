@@ -1,14 +1,14 @@
 // 启动菜单：开机前先决定系统盘从哪来。三种来源互斥，选完才开机。
 //
-// 这里只依赖 /os 的只读接口与启动入口，纯净版与透明版共用。
+// 这里只依赖硬件（持久介质里存过哪些盘）与操作系统的启动入口，纯净版与透明版共用。
 
 import { useEffect, useRef, useState } from 'react'
 import { CircleAlert, Database, FileUp, HardDrive, LoaderCircle } from 'lucide-react'
 import type { BootSource } from '@/os/kernel'
-import { listStoredDisks, persistAvailable } from '@/os/blockdev'
-import type { StoredMedia } from '@/os/blockdev'
-import { OS_VERSION } from '@/utils/config'
-import { cn } from '@/utils/cn'
+import { listStoredDisks, persistAvailable } from '@/hw/store'
+import type { StoredMedia } from '@/hw/store'
+import { OS_VERSION } from '@/os/version'
+import { cn } from '@/hw/ui/cn'
 
 const MiB = 1024 * 1024
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
-import type { Kernel, SegClass } from '@/os/kernel'
-import { showCtl } from '@/ui/theme'
+import type { Kernel } from '@/os/kernel'
+import type { SegClass } from '@/hw/console'
+import { showCtl } from '@/hw/ui/theme'
 
 const SEG_CLS: Record<SegClass, string> = {
   out: 'text-[#c9d1d9]',
@@ -9,7 +10,7 @@ const SEG_CLS: Record<SegClass, string> = {
   echo: 'text-[#e6edf3]',
 }
 
-// 控制台只依赖内核的 tty 设备，与 /cp 无关。
+// 机器的显示器与键盘：屏幕内容直接读控制台设备，按键交给操作系统的 tty 行规。
 export function Terminal({ kernel }: { kernel: Kernel }) {
   const boxRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -67,7 +68,8 @@ export function Terminal({ kernel }: { kernel: Kernel }) {
     e.preventDefault()
   }
 
-  const lines = kernel.consoleLines()
+  // 屏幕内容属于控制台设备：终端前端直接读硬件，不经操作系统转发
+  const lines = kernel.machine.console.screen()
 
   return (
     <div

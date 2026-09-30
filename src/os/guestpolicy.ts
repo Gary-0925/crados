@@ -8,7 +8,7 @@
 
 import { MODE_DIR, MODE_FILE, M_EXEC, M_OEXEC, M_OREAD, M_OWRITE, M_READ, M_SETUID, M_WRITE, UID_ROOT } from './fs'
 import { BLOCK_SIZE, EXT2_MAGIC, ROOT_INO, SB_BLOCK, S_IFDIR, S_IFREG, SB_MAGIC } from './ext2'
-import { DEVINFO_BASE, KMSG_BASE, SCRATCH_BASE } from './memory'
+import { DEVINFO_BASE, KMSG_BASE, SCRATCH_BASE } from '@/hw/ram'
 import { PCB_EUID, PCB_UID } from './process'
 
 // 盘上 inode 的 i_mode：类型位 + 权限位（guest 只认文件/目录/设备三种）

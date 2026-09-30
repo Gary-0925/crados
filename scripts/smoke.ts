@@ -21,10 +21,15 @@ if (typeof (globalThis as { requestAnimationFrame?: unknown }).requestAnimationF
 const k = new Kernel()
 // 引导是异步的（磁盘可能来自 IndexedDB 或文件）；Node 里没有 IndexedDB，落盘整体停用
 const bootErr = await k.boot({ kind: 'fresh' })
-const consoleText = () => k.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')
+const screenText = (kernel: Kernel) =>
+  kernel.machine.console
+    .screen()
+    .map((l) => l.segs.map((s) => s.t).join(''))
+    .join('\n')
+const consoleText = () => screenText(k)
 // 廉价的变化指纹：行数 + 最后两行（提示符会在原行上重绘）
 const fingerprint = () => {
-  const ls = k.consoleLines()
+  const ls = k.machine.console.screen()
   return `${ls.length}|${ls.slice(-2).map((l) => l.segs.map((s) => s.t).join('')).join('\u0001')}`
 }
 
@@ -77,7 +82,7 @@ void bootTicks
 
 // ---------- 2. 启动来源 ----------
 // 三种引导方式覆盖开机菜单的三个选项；这里每种都开一台新机器，跑完就扔
-const sdaImage = k.diskImage('sda')!
+const sdaImage = k.machine.disks.image('sda')!
 check('能取到 sda 整盘字节', sdaImage.length === 1024 * 1024, `${sdaImage.length} B`)
 
 const fromImage = new Kernel()
@@ -85,12 +90,12 @@ const imageErr = await fromImage.boot({ kind: 'image', bytes: sdaImage, filename
 check('从 .img 引导成功', imageErr === null && fromImage.panic === null, imageErr ?? fromImage.panic ?? '')
 check(
   '从 .img 引导后系统程序就位',
-  /bin: \d+ programs installed/.test(fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')),
+  /bin: \d+ programs installed/.test(screenText(fromImage)),
 )
 check(
   '从 .img 引导后 init 以机器码启动',
   /init: pid 1 started from \/bin\/init as machine code/.test(
-    fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n'),
+    screenText(fromImage),
   ),
 )
 await fromImage.destroy()

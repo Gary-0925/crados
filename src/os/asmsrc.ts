@@ -11,7 +11,7 @@
 //   20 mount(dev,dir)     21 umount(target)     22 kill(pid,sig)
 //   35 getuid → r0 uid, r1 euid   36 ttyecho(on)  38 spawnas(path,uid)
 //   39 chown(path,uid)
-import { OS_VERSION } from '../utils/config'
+import { OS_VERSION } from './version'
 
 
 // 取 argv 中第 n 个参数的地址：入口 r5 = argv 基址, r6 = n，出口 r5 指向该参数

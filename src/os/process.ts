@@ -17,10 +17,14 @@
 //   184-185 pfn bit6  186-187 pfn bit7  188-191 reserved
 //   页表字节只有 6 位帧号。bit6/bit7 各是一个 u16 掩码，第 n 位对应虚拟页 n。
 
-import type { Memory } from './memory'
-import { PAGE_SIZE } from './memory'
-import type { CpuState, RegisterFile } from './vm'
-import type { Err, Gen, PState } from './types'
+import type { Memory } from '@/hw/ram'
+import { PAGE_SIZE } from '@/hw/ram'
+import type { CpuState, RegisterFile } from '@/hw/cpu'
+import type { AddressSpace } from '@/hw/bus'
+import type { CpuProgram } from '@/hw/cpu'
+// 设备号：sdX 是 1..26，与 CRX 内核看到的一致。它由磁盘控制器定义，见 hw/disk.ts。
+import { deviceCode, deviceName } from '@/hw/disk'
+import type { PState } from './types'
 
 export const PCB_SIZE = 192
 export const PCB_BASE = PAGE_SIZE
@@ -72,17 +76,6 @@ const FD_SIZE = 6
 const STATES: PState[] = ['new', 'new', 'ready', 'running', 'blocked', 'zombie']
 const STATE_CODE: Record<PState, number> = { new: 1, ready: 2, running: 3, blocked: 4, zombie: 5 }
 
-// 设备号：sdX 是 1..26，与 CRX 内核看到的一致
-export const deviceCode = (name: string): number => {
-  const m = /^sd([a-z])$/.exec(name)
-  return m ? m[1].charCodeAt(0) - 96 : 0
-}
-
-export const deviceName = (code: number): string => {
-  // 未知设备号不能落成 sda，否则原始块读写会读到根盘。
-  if (code >= 1 && code <= 26) return `sd${String.fromCharCode(96 + code)}`
-  return ''
-}
 
 const FK_EMPTY = 0
 const FK_STDIN = 1
@@ -232,11 +225,11 @@ class FdTable {
   }
 }
 
-export class Process {
+export class Process implements AddressSpace {
   readonly base: number
   readonly fds: FdTable
   readonly regs: Regs
-  gen: Gen
+  gen: CpuProgram
 
   // 只有执行载体留在 JS 堆上：生成器、待传入的返回值与环境变量。
   // cpu 是一组访问器；寄存器、PC、SP、FLAGS 的值本身全部在 PCB 字节里。
@@ -246,7 +239,7 @@ export class Process {
   constructor(
     private readonly mem: Memory,
     readonly slot: number,
-    gen: Gen,
+    gen: CpuProgram,
     readonly env: Record<string, string>,
     private readonly vfs: VfsHooks,
   ) {
@@ -482,6 +475,19 @@ export class Process {
   get addressLimit(): number {
     return MAX_PAGES * PAGE_SIZE
   }
+  /** 交给 MMU 的地址空间视图：页表条数、上界、当前特权级、页表字节的范围 */
+  get pteCount(): number {
+    return MAX_PAGES
+  }
+  get limit(): number {
+    return this.addressLimit
+  }
+  kernelMode(): boolean {
+    return this.mem.bytes[this.base + PCB_MODE] !== 0
+  }
+  isPageTableByte(pa: number): boolean {
+    return (pa - PCB_BASE) >>> 0 < MAX_PROCS * PCB_SIZE
+  }
 
   // 无分配版 PTE 读取：返回 (pfn | supervisor<<15)，未映射返回 -1。
   // MMU 热路径用它代替 pteAt()，避免每次访存都新建一个对象。
@@ -597,13 +603,5 @@ export class Process {
     return state
   }
 
-  waitDesc(): string | Err | null {
-    if (this.state !== 'blocked') return null
-    if (this.sleepMode === 1) return `sleep until tick ${this.wakeAt}`
-    if (this.sleepMode === 2) return `sleep until monotonic ${this.wakeAt} ms`
-    if (this.readStdin) return 'waiting on stdin'
-    const w = this.waitFor
-    if (w !== null) return w === -1 ? 'wait for any child' : `wait for pid ${w}`
-    return 'blocked'
-  }
+
 }
