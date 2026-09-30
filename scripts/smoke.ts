@@ -9,6 +9,7 @@
 // 任何 panic、断言失败或超时都以非零码退出。由 scripts/smoke.mjs 打包后运行。
 
 import { Kernel } from '@/os/kernel'
+import { OS_VERSION } from '@/os/version'
 import { ControlPanel } from '@/cp/snapshot'
 
 // 观测层用 rAF 合并重绘；Node 里没有这个 API
@@ -77,6 +78,7 @@ const boot = consoleText()
 check('引导完成且没有 panic', k.panic === null && bootErr === null, bootErr ?? k.panic ?? '')
 check('登录提示出现', /crados login:/.test(boot))
 check('42 个系统程序装进 /bin', boot.includes('42 programs installed on /dev/sda'))
+check('引导标语带的是当前版本', boot.includes(`crados ${OS_VERSION}`), OS_VERSION)
 check('根盘写盘成功', /sda: root image written, \d+ inodes/.test(boot))
 check('引导在 4000 个 tick 内结束', bootTicks < 4000, `${bootTicks} ticks`)
 void bootTicks

@@ -1,1 +1,1 @@
-export const OS_VERSION = '4.1'
+export const OS_VERSION = '5.0'
