@@ -60,12 +60,7 @@ export function BootMenu({
       <div className="w-full max-w-xl">
         <div className="flex items-baseline gap-2">
           <span className="text-[17px] font-semibold text-[#e6edf3]">crados {OS_VERSION}</span>
-          <span className="text-[11px] text-[#6e7681]">a transparent OS · 系统盘从哪来</span>
         </div>
-        <p className="mt-1 text-[11px] leading-relaxed text-[#8b949e]">
-          这台机器的文件系统就是一块盘上的字节。上电前固件先问系统盘位上的字节从哪来：
-          接着用这个浏览器里保存的盘、插一份导出的 .img，或者现做一张空盘再往上面装系统。
-        </p>
 
         {error && (
           <div className="mt-4 flex items-start gap-2 rounded-md border border-[#f85149]/40 bg-[#f85149]/10 px-3 py-2 text-[11.5px] leading-relaxed text-[#ff7b72]">
@@ -78,7 +73,7 @@ export function BootMenu({
           <Option
             icon={<Database size={16} />}
             title="从 IndexedDB 加载"
-            desc="恢复这个浏览器里保存的系统盘，之前的文件与改动都还在"
+            desc="恢复上次该浏览器中保存的系统盘"
             meta={
               idbOk ? (
                 sda ? (
@@ -107,8 +102,8 @@ export function BootMenu({
           <Option
             icon={<FileUp size={16} />}
             title="从 .img 文件加载"
-            desc="把导出的整盘镜像当作系统盘；格式必须是 ext2 且几何与本机一致"
-            meta={<span className="text-[#6e7681]">整盘镜像 · 1 MiB · ext2</span>}
+            desc="从本机导入系统盘"
+            meta={}
             disabled={busy}
             onClick={() => fileRef.current?.click()}
           />
@@ -116,8 +111,8 @@ export function BootMenu({
           <Option
             icon={<HardDrive size={16} />}
             title="创建空盘并装载系统"
-            desc="格式化一张新盘，写入出厂目录树与 /bin，IndexedDB 里的旧存档被替换"
-            meta={<span className="text-[#6e7681]">factory image · 1 MiB</span>}
+            desc="格式化一张新盘并重新装载系统，IndexedDB 里的旧存档将被覆盖"
+            meta={}
             disabled={busy}
             onClick={() => onBoot({ kind: 'blank' })}
           />
