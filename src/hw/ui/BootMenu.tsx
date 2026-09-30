@@ -125,10 +125,6 @@ export function BootMenu({
           </div>
         )}
 
-        <p className="mt-5 text-[10.5px] leading-relaxed text-[#6e7681]">
-          三种方式都会在开机时重烧 /bin，保证程序与当前固件一致。开机之后磁盘改动按脏标记
-          回写 IndexedDB，只写变化过的 16 KiB 分块。
-        </p>
       </div>
 
       <input
