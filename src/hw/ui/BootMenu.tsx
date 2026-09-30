@@ -103,7 +103,7 @@ export function BootMenu({
             icon={<FileUp size={16} />}
             title="从 .img 文件加载"
             desc="从本机导入系统盘"
-            meta={}
+            meta={<span></span>}
             disabled={busy}
             onClick={() => fileRef.current?.click()}
           />
@@ -112,7 +112,7 @@ export function BootMenu({
             icon={<HardDrive size={16} />}
             title="创建空盘并装载系统"
             desc="格式化一张新盘并重新装载系统，IndexedDB 里的旧存档将被覆盖"
-            meta={}
+            meta={<span></span>}
             disabled={busy}
             onClick={() => onBoot({ kind: 'blank' })}
           />
