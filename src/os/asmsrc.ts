@@ -510,6 +510,8 @@ export const ASM_PROGRAMS: Record<string, string> = {
 _start:
     mov r0, 9
     mov r1, loginpath
+    mov r2, 0
+    mov r3, 0           ; 不带参数 = 控制台登录循环
     sys
     mov r4, r0          ; login pid
 loop:
@@ -520,6 +522,8 @@ loop:
     jne loop
     mov r0, 9           ; login exited, start a new one
     mov r1, loginpath
+    mov r2, 0
+    mov r3, 0
     sys
     mov r4, r0
     jmp loop
@@ -1625,17 +1629,18 @@ do_sys:
     mov r1, 0
     hlt
 
-; r7 = letter, r3 = who. Returns the bit mask in r7, or 0.
+; r7 = letter, r3 = who。返回 i_mode 里真正的权限位（ext2 的 0o777 + setuid/sticky），0 = 无效字母。
+; who：0 属主（u），1 其他人（o），2 两者（a）。
 letter_bits:
-    cmp r7, 120         ; x  shared execute bit
+    cmp r7, 120         ; x 执行位：属主 0o100，其他人 0o001
     je bit_x
-    cmp r7, 115         ; s
+    cmp r7, 115         ; s setuid 0o4000
     je bit_s
-    cmp r7, 116         ; t
+    cmp r7, 116         ; t sticky 0o1000
     je bit_t
-    cmp r7, 114         ; r
+    cmp r7, 114         ; r 读位：属主 0o400，其他人 0o004
     je bit_r
-    cmp r7, 119         ; w
+    cmp r7, 119         ; w 写位：属主 0o200，其他人 0o002
     je bit_w
     mov r7, 0
     ret
@@ -1644,45 +1649,45 @@ bit_x:
     je bit_ox
     cmp r3, 2
     je bit_ax
-    mov r7, 1
+    mov r7, 64
     ret
 bit_ox:
-    mov r7, 128
+    mov r7, 1
     ret
 bit_ax:
-    mov r7, 129
+    mov r7, 65
     ret
 bit_s:
-    mov r7, 32
+    mov r7, 2048
     ret
 bit_t:
-    mov r7, 64
+    mov r7, 512
     ret
 bit_r:
     cmp r3, 1
     je bit_or
     cmp r3, 2
     je bit_ar
-    mov r7, 2
+    mov r7, 256
     ret
 bit_or:
-    mov r7, 8
+    mov r7, 4
     ret
 bit_ar:
-    mov r7, 10
+    mov r7, 260
     ret
 bit_w:
     cmp r3, 1
     je bit_ow
     cmp r3, 2
     je bit_aw
-    mov r7, 4
+    mov r7, 128
     ret
 bit_ow:
-    mov r7, 16
+    mov r7, 2
     ret
 bit_aw:
-    mov r7, 20
+    mov r7, 130
     ret
 
 failed:

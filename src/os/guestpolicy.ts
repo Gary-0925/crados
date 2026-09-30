@@ -6,21 +6,15 @@
 //   8 name[16]  24 argv[160]  184 envLen  186 env[80]
 //   266 cwdDev  267 cwdIno  268 flags（bit0 = 登录会话）
 
-import {
-  I_FLAGS,
-  INODE_SIZE,
-  ITABLE_BYTE,
-  M_EXEC,
-  M_OEXEC,
-  M_OREAD,
-  M_OWRITE,
-  M_READ,
-  M_SETUID,
-  M_WRITE,
-  SB_UID,
-  UID_ROOT,
-} from './fs'
+import { MODE_DIR, MODE_FILE, M_EXEC, M_OEXEC, M_OREAD, M_OWRITE, M_READ, M_SETUID, M_WRITE, UID_ROOT } from './fs'
+import { BLOCK_SIZE, EXT2_MAGIC, ROOT_INO, SB_BLOCK, S_IFDIR, S_IFREG, SB_MAGIC } from './ext2'
+import { DEVINFO_BASE, KMSG_BASE, SCRATCH_BASE } from './memory'
 import { PCB_EUID, PCB_UID } from './process'
+
+// 盘上 inode 的 i_mode：类型位 + 权限位（guest 只认文件/目录/设备三种）
+const GP_MODE_FILE = S_IFREG | MODE_FILE
+const GP_MODE_DIR = S_IFDIR | MODE_DIR
+const GP_SB_BYTE = SB_BLOCK * BLOCK_SIZE   // 超级块在盘上的绝对字节偏移
 
 export const GUEST_POLICY_SOURCE = `
 .text
@@ -31,12 +25,6 @@ gp_fail:
 
 gp_ret_fail:
     mov r0, 65535
-    ret
-
-gp_use_vdev:
-    mov r4, 0
-    ldw r5, [r4+0x0040]
-    stw [r4+0x0046], r5
     ret
 
 ; ---- credentials and permission decisions live here and only here ----
@@ -82,26 +70,19 @@ vfs_may:
     mov r4, 0
     stw [r4+0x00B6], r0
     ldw r1, [r4+0x00B0]
-    mul r1, 2
-    add r1, ${SB_UID}
-    call vfs_u16
+    call vfs_uid
     cmp r0, 65535
     je vfs_may_no
     mov r4, 0
-    stw [r4+0x00AC], r0
+    stw [r4+0x00BA], r0
     ldw r1, [r4+0x00B0]
-    call vfs_inode
-    cmp r0, 65280
-    je vfs_may_no
-    mov r1, r0
-    add r1, ${I_FLAGS}
-    call vfs_u8
+    call vfs_perms        ; i_mode 的低 12 位就是权限位
     cmp r0, 65535
     je vfs_may_no
     mov r4, 0
     mov r6, r0
     ldw r1, [r4+0x00B6]
-    ldw r2, [r4+0x00AC]
+    ldw r2, [r4+0x00BA]
     ldw r3, [r4+0x00B2]
     ldw r7, [r4+0x00B4]
     call gp_bit_decide
@@ -114,56 +95,44 @@ vfs_may_no:
     mov r0, 65535
     ret
 
-; may_write_ino: 写许可，走 sda 直读视图（crfs_*）。
+; may_write_ino: 写许可。r1 = inode → r0 = 0 允许 / 0xffff 拒绝。
+; root 直接放行；其他人看 i_uid 与 i_mode 的属主写位。暂存字 0x00B0/0x00B6/0x00BA
+; 归策略层（ext2 层只用 0x009C–0x00AE 与 0x00B8/0x00BC/0x00BE）。
 may_write_ino:
-    push r1
     call ino_in_range
     cmp r0, 0
-    jne may_pop_no
+    jne may_no
+    mov r4, 0
+    stw [r4+0x00B0], r1    ; inode
     call current_euid
     cmp r0, ${UID_ROOT}
-    je may_pop_yes
+    je may_yes
     mov r4, 0
-    stw [r4+0x00B6], r0
-    pop r1
-    push r1
-    mul r1, 2
-    add r1, ${SB_UID}
-    call crfs_u16
+    stw [r4+0x00B6], r0    ; euid
+    ldw r1, [r4+0x00B0]
+    call vfs_uid
     cmp r0, 65535
     je may_no
     mov r4, 0
-    stw [r4+0x00BA], r0
-    pop r1
-    push r1
-    mul r1, ${INODE_SIZE}
-    add r1, ${ITABLE_BYTE + I_FLAGS}
-    call crfs_u8
-    mov r3, r0
-may_flag_have:
+    stw [r4+0x00BA], r0    ; 文件属主
+    ldw r1, [r4+0x00B0]
+    call vfs_perms
+    cmp r0, 65535
+    je may_no
     mov r4, 0
-    pop r1
-    mov r6, r3
-    ldw r1, [r4+0x00B6]
-    ldw r2, [r4+0x00BA]
+    mov r6, r0             ; i_mode 低 12 位
+    ldw r1, [r4+0x00BA]    ; 文件属主
+    ldw r2, [r4+0x00B6]    ; euid
     mov r3, ${M_WRITE}
     mov r7, ${M_OWRITE}
     call gp_bit_decide
     cmp r0, 0
     jne may_no
-    jmp may_yes
-may_pop_yes:
-    pop r1
-    mov r0, 0
-    ret
-may_pop_no:
-    pop r1
-    jmp may_no
-may_no:
-    mov r0, 65535
-    ret
 may_yes:
     mov r0, 0
+    ret
+may_no:
+    mov r0, 65535
     ret
 
 ; gp_perm_ok: r1 = 权限字母 (108 l / 109 m / 98 b / 107 k)。
@@ -292,385 +261,42 @@ gp_split_rel:
     call vfs_resolve
     ret
 
-; r1 = user name. 0 if 1..14 bytes and not "." / "..".
-gp_name_ok:
-    uldb r3, [r1+0]
-    cmp r3, 0
-    je gp_ret_fail
-    cmp r3, 46
-    jne gp_name_len
-    uldb r3, [r1+1]
-    cmp r3, 0
-    je gp_ret_fail
-    cmp r3, 46
-    jne gp_name_len
-    uldb r3, [r1+2]
-    cmp r3, 0
-    je gp_ret_fail
+; r1 = 用户态名字（以 NUL 结尾）→ r0 = 长度（1..14），非法（空、超长、. 或 ..）时 0xffff。
 gp_name_len:
     mov r0, 0
+    mov r2, r1
 gp_name_len_loop:
-    uldb r3, [r1+0]
+    uldb r3, [r2+0]
     cmp r3, 0
     je gp_name_len_done
     add r0, 1
-    add r1, 1
+    add r2, 1
     cmp r0, 14
     jgt gp_ret_fail
     jmp gp_name_len_loop
 gp_name_len_done:
-    mov r0, 0
-    ret
-
-; Allocate an inode on the device selected by 0x0046. Returns inode or 65535.
-gp_alloc_ino:
-    mov r1, 0
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r4, 0
-    mov r1, 0x0D00
-    ldw r0, [r1+8]
-    mov r4, 0
-    stw [r4+0x00AC], r0
-    mov r1, 2
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r4, 1
-gp_ino_scan:
-    mov r5, 0
-    ldw r7, [r5+0x00AC]
-    cmp r4, r7
-    je gp_ret_fail
-    mov r5, r4
-    div r5, 8
-    mov r6, r4
-    mod r6, 8
-    mov r7, 1
-    shl r7, r6
-    add r5, 0x0D00
-    ldb r0, [r5+0]
-    mov r1, r0
-    and r1, r7
-    cmp r1, 0
-    je gp_ino_found
-    add r4, 1
-    jmp gp_ino_scan
-gp_ino_found:
-    or r0, r7
-    stb [r5+0], r0
-    mov r6, 0
-    stw [r6+0x0064], r4
-    mov r1, 2
-    call sda_write_block
-    cmp r0, 0
-    jne gp_ret_fail
-    ; A reused slot still holds the previous size and block pointers.
-    mov r4, 0
-    ldw r1, [r4+0x0064]
-    mul r1, 48
-    add r1, 768
-    mov r5, r1
-    div r5, 256
-    mov r6, r1
-    mod r6, 256
-    stw [r4+0x0066], r5
-    stw [r4+0x0068], r6
-    mov r1, r5
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r4, 0
-    ldw r6, [r4+0x0068]
-    add r6, 0x0D00
-    mov r7, 0
-    mov r3, 0
-gp_ino_zero:
-    cmp r3, 48
-    je gp_ino_zero_write
-    cmp r6, 0x0E00
-    je gp_ino_zero_write
-    stb [r6+0], r7
-    add r6, 1
-    add r3, 1
-    jmp gp_ino_zero
-gp_ino_zero_write:
-    mov r4, 0
-    ldw r1, [r4+0x0066]
-    push r3
-    call sda_write_block
-    pop r3
-    cmp r0, 0
-    jne gp_ret_fail
-    cmp r3, 48
-    je gp_ino_zero_done
-    mov r4, 0
-    ldw r1, [r4+0x0066]
-    add r1, 1
-    stw [r4+0x0066], r1
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r6, 0x0D00
-    mov r7, 0
-gp_ino_zero_tail:
-    cmp r3, 48
-    je gp_ino_zero_write
-    stb [r6+0], r7
-    add r6, 1
-    add r3, 1
-    jmp gp_ino_zero_tail
-gp_ino_zero_done:
-    mov r6, 0
-    ldw r0, [r6+0x0064]
-    ret
-
-; r1 = block number. Metadata blocks are left alone.
-gp_free_block:
-    cmp r1, 15
-    jlt gp_free_skip
-    mov r4, 0
-    stw [r4+0x0066], r1
-    mov r1, 1
-    call sda_read_block
-    cmp r0, 0
-    jne gp_free_skip
-    mov r4, 0
-    ldw r1, [r4+0x0066]
-    mov r5, r1
-    div r5, 8
-    mov r6, r1
-    mod r6, 8
-    mov r7, 1
-    shl r7, r6
-    xor r7, 65535
-    add r5, 0x0D00
-    ldb r0, [r5+0]
-    and r0, r7
-    stb [r5+0], r0
-    mov r1, 1
-    call sda_write_block
-gp_free_skip:
-    ret
-
-; r1 = inode. Drops data blocks and the inode bitmap bit. Override must be set.
-gp_destroy_ino:
-    mov r4, 0
-    stw [r4+0x0068], r1
-    mov r6, 0
-gp_destroy_ptr:
-    cmp r6, 20
-    je gp_destroy_bit
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 768
-    add r1, 8
-    mov r5, r6
-    mul r5, 2
-    add r1, r5
-    push r6
-    call crfs_u16
-    pop r6
-    cmp r0, 0
-    je gp_destroy_next
-    cmp r0, 65535
-    je gp_destroy_next
-    push r6
-    mov r1, r0
-    call gp_free_block
-    pop r6
-gp_destroy_next:
-    add r6, 1
-    jmp gp_destroy_ptr
-gp_destroy_bit:
-    mov r1, 2
-    call sda_read_block
-    cmp r0, 0
-    jne gp_free_skip
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mov r5, r1
-    div r5, 8
-    mov r6, r1
-    mod r6, 8
-    mov r7, 1
-    shl r7, r6
-    xor r7, 65535
-    add r5, 0x0D00
-    ldb r0, [r5+0]
-    and r0, r7
-    stb [r5+0], r0
-    mov r1, 2
-    call sda_write_block
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 768
-    mov r2, 0
-    call crfs_write_u8
-    ret
-
-; r1 = inode. Truncate to zero. Override must be set.
-gp_trunc:
-    mov r4, 0
-    stw [r4+0x0068], r1
-    mov r6, 0
-gp_trunc_loop:
-    cmp r6, 20
-    je gp_trunc_size
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 768
-    add r1, 8
-    mov r5, r6
-    mul r5, 2
-    add r1, r5
-    push r6
-    call crfs_u16
-    pop r6
-    cmp r0, 0
-    je gp_trunc_clear
-    cmp r0, 65535
-    je gp_trunc_next
-    push r6
-    mov r1, r0
-    call gp_free_block
-    pop r6
-gp_trunc_clear:
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    mov r5, r6
-    mul r5, 2
-    add r1, r5
-    mov r2, 0
-    push r6
-    call crfs_write_u16
-    pop r6
-gp_trunc_next:
-    add r6, 1
-    jmp gp_trunc_loop
-gp_trunc_size:
-    mov r4, 0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 770
-    mov r2, 0
-    call crfs_write_u16
-    ret
-
-; r1 = dir inode, r2 = child inode, r3 = user name. Override must be set.
-gp_dir_append:
-    mov r4, 0
-    stw [r4+0x0068], r1
-    stw [r4+0x006A], r2
-    stw [r4+0x006C], r3
-    mov r1, r1
-    mul r1, 48
-    add r1, 770
-    call crfs_u16
-    cmp r0, 65535
-    je gp_ret_fail
-    cmp r0, 5120
-    jlt gp_dir_size_ok
-    jmp gp_ret_fail
-gp_dir_size_ok:
-    mov r4, 0
-    stw [r4+0x006E], r0
-    mov r5, r0
-    div r5, 256
-    mov r6, r0
-    mod r6, 256
-    stw [r4+0x0070], r5
-    stw [r4+0x0072], r6
-    cmp r6, 0
-    jne gp_dir_old
-    call crfs_alloc_block
-    cmp r0, 65535
-    je gp_ret_fail
-    mov r4, 0
-    stw [r4+0x0066], r0
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    ldw r5, [r4+0x0070]
-    mul r5, 2
-    add r1, r5
-    ldw r2, [r4+0x0066]
-    call crfs_write_u16
-    cmp r0, 0
-    jne gp_ret_fail
-    jmp gp_dir_fill
-gp_dir_old:
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    ldw r5, [r4+0x0070]
-    mul r5, 2
-    add r1, r5
-    call crfs_u16
     cmp r0, 0
     je gp_ret_fail
-    cmp r0, 65535
+    cmp r0, 1
+    jne gp_nl_two
+    uldb r3, [r1+0]
+    cmp r3, 46
     je gp_ret_fail
-    mov r4, 0
-    stw [r4+0x0066], r0
-gp_dir_fill:
-    mov r4, 0
-    ldw r1, [r4+0x0066]
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r4, 0
-    ldw r4, [r4+0x0072]
-    add r4, 0x0D00
-    mov r6, 0
-    ldw r2, [r6+0x006A]
-    stw [r4+0], r2
-    ldw r3, [r6+0x006C]
-    mov r5, 0
-gp_dir_name:
-    cmp r5, 14
-    je gp_dir_commit
-    uldb r7, [r3+0]
-    mov r0, r4
-    add r0, 2
-    add r0, r5
-    stb [r0+0], r7
-    cmp r7, 0
-    je gp_dir_pad
-    add r3, 1
-    add r5, 1
-    jmp gp_dir_name
-gp_dir_pad:
-    add r5, 1
-    cmp r5, 14
-    je gp_dir_commit
-    mov r7, 0
-    mov r0, r4
-    add r0, 2
-    add r0, r5
-    stb [r0+0], r7
-    jmp gp_dir_pad
-gp_dir_commit:
-    mov r6, 0
-    ldw r1, [r6+0x0066]
-    call sda_write_block
-    cmp r0, 0
-    jne gp_ret_fail
-    ldw r1, [r6+0x0068]
-    mul r1, 48
-    add r1, 770
-    ldw r2, [r6+0x006E]
-    add r2, 16
-    call crfs_write_u16
+gp_nl_two:
+    cmp r0, 2
+    jne gp_nl_ok
+    uldb r3, [r1+0]
+    cmp r3, 46
+    jne gp_nl_ok
+    uldb r3, [r1+1]
+    cmp r3, 46
+    je gp_ret_fail
+gp_nl_ok:
     ret
 
-; r1 = user path, r2 = type. Creates the inode and links it. 0 or 65535.
+
+; r1 = user path, r2 = 类型（1 文件 / 2 目录）。0 = 建好，65535 = 失败。
+; 暂存字：0x0060 类型、0x0062 父目录、0x0064 新 inode、0x0070 名字长度。
 gp_create:
     mov r4, 0
     stw [r4+0x0060], r2
@@ -680,17 +306,10 @@ gp_create:
     mov r4, 0
     stw [r4+0x0062], r0
     ldw r5, [r4+0x0040]
-    cmp r5, 254
+    cmp r5, 254             ; rom 只读
     je gp_ret_fail
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_ret_fail
-    mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_ret_fail
-    mov r1, r0
-    call vfs_u8
+    ldw r1, [r4+0x0062]
+    call vfs_type
     cmp r0, 2
     jne gp_ret_fail
     mov r4, 0
@@ -701,61 +320,60 @@ gp_create:
     cmp r0, 0
     jne gp_ret_fail
     ldw r1, [r4+0x0052]
-    call gp_name_ok
-    cmp r0, 0
-    jne gp_ret_fail
+    call gp_name_len
+    cmp r0, 65535
+    je gp_ret_fail
+    mov r4, 0
+    stw [r4+0x0070], r0
     ldw r1, [r4+0x0062]
     ldw r2, [r4+0x0052]
-    call vfs_lookup
+    call vfs_lookup         ; 重名就不建
     cmp r0, 65535
     jne gp_ret_fail
-    call gp_use_vdev
-    call gp_alloc_ino
+    call vfs_alloc_inode
     cmp r0, 65535
     je gp_ret_fail
     mov r4, 0
     stw [r4+0x0064], r0
-    mov r1, r0
-    mul r1, 48
-    add r1, 768
-    ldw r2, [r4+0x0060]
-    call crfs_write_u8
+    mov r2, ${GP_MODE_FILE}
+    ldw r1, [r4+0x0060]
+    cmp r1, 2
+    jne gp_create_mode
+    mov r2, ${GP_MODE_DIR}
+gp_create_mode:
+    mov r4, 0
+    ldw r1, [r4+0x0064]
+    call vfs_set_mode
     cmp r0, 0
     jne gp_ret_fail
-    mov r4, 0
-    ldw r1, [r4+0x0064]
-    mul r1, 48
-    add r1, 769
-    mov r2, 14
-    ldw r3, [r4+0x0060]
-    cmp r3, 2
-    jne gp_create_file
-    mov r2, 143
-    jmp gp_create_store
-gp_create_file:
-gp_create_store:
-    ldw r1, [r4+0x0064]
-    mul r1, 48
-    add r1, 769
-    call crfs_write_u8
-    mov r4, 0
-    ldw r1, [r4+0x0064]
-    mul r1, 48
-    add r1, 772
-    ldw r2, [r4+0x0062]
-    call crfs_write_u16
     call current_euid
-    mov r2, r0
     mov r4, 0
     ldw r1, [r4+0x0064]
-    mul r1, 2
-    add r1, ${SB_UID}
-    call crfs_write_u16
+    mov r2, r0
+    call vfs_set_uid
+    cmp r0, 0
+    jne gp_ret_fail
+    ldw r1, [r4+0x0060]
+    cmp r1, 2
+    jne gp_create_link
+    ldw r1, [r4+0x0064]     ; 目录：先写 “.” 与 “..”
+    ldw r2, [r4+0x0062]
+    call vfs_dir_init
+    cmp r0, 0
+    jne gp_ret_fail
+gp_create_link:
     mov r4, 0
+    ldw r1, [r4+0x0064]
+    stw [r4+0x00B8], r1     ; 子 inode
+    ldw r1, [r4+0x0060]
+    stw [r4+0x00BC], r1     ; 盘上类型（目录会给父目录链接数 +1）
     ldw r1, [r4+0x0062]
-    ldw r2, [r4+0x0064]
-    ldw r3, [r4+0x0052]
-    call gp_dir_append
+    ldw r2, [r4+0x0052]
+    ldw r3, [r4+0x0070]
+    call vfs_add_dirent
+    cmp r0, 0
+    jne gp_ret_fail
+    mov r0, 0
     ret
 
 gp_open:
@@ -783,13 +401,9 @@ gp_open_found:
     mov r4, 0
     stw [r4+0x0056], r0
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 2
-    je gp_fail
+    je gp_fail               ; 目录不能当文件打开
     cmp r0, 3
     je gp_open_dev
     mov r4, 0
@@ -810,32 +424,26 @@ gp_open_write:
     ldw r5, [r4+0x0040]
     cmp r5, 254
     je gp_fail
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_fail
     ldw r1, [r4+0x0056]
     mov r2, ${M_WRITE}
     mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
-    call gp_use_vdev
     ldw r2, [r4+0x0054]
     cmp r2, 1
     jne gp_open_append
     ldw r1, [r4+0x0056]
-    call gp_trunc
+    call vfs_trunc
+    cmp r0, 0
+    jne gp_fail
     mov r7, 0
-    jmp gp_open_wflags
 gp_open_append:
     mov r4, 0
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
+    call vfs_size
+    cmp r0, 65535
     je gp_fail
-    add r0, 2
-    mov r1, r0
-    call vfs_u16
     mov r7, r0
 gp_open_wflags:
     mov r4, 0
@@ -872,16 +480,8 @@ gp_open_dev_w:
 gp_open_dev_kind:
     mov r4, 0
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    add r0, 6
-    mov r1, r0
-    call vfs_u8
+    call vfs_ldev            ; i_block[0] 低字节 = 驱动号（1 tty / 2 null）
     mov r6, 5
-    cmp r0, 1
-    jne gp_open_install
-    mov r6, 4
 gp_open_install:
     mov r4, 3
 gp_open_scan:
@@ -935,35 +535,24 @@ gp_chmod:
     ldw r5, [r4+0x0040]
     cmp r5, 254
     je gp_fail
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_fail
     call current_euid
     cmp r0, ${UID_ROOT}
     je gp_chmod_apply
+    mov r4, 0
     stw [r4+0x0058], r0
     ldw r1, [r4+0x0056]
-    mul r1, 2
-    add r1, ${SB_UID}
-    call vfs_u16
+    call vfs_uid
     mov r4, 0
     ldw r5, [r4+0x0058]
     cmp r0, r5
-    jne gp_fail
+    jne gp_fail             ; 非 root 只有属主能改
 gp_chmod_apply:
-    call gp_use_vdev
     mov r4, 0
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    add r0, 1
-    stw [r4+0x005A], r0
-    mov r1, r0
-    call crfs_u8
+    call vfs_mode
     cmp r0, 65535
     je gp_fail
-    mov r6, r0
+    mov r6, r0              ; 旧 i_mode（含类型位）
     call current_euid
     mov r4, 0
     ldw r2, [r4+0x0052]
@@ -971,24 +560,27 @@ gp_chmod_apply:
     je gp_chmod_or
     mov r3, ${M_SETUID}
     xor r3, 65535
-    and r2, r3
+    and r2, r3              ; 非 root 改不了 setuid 位
 gp_chmod_or:
     mov r0, r6
+    and r0, 4095            ; 旧权限位（含 setuid/sticky）
     or r0, r2
     ldw r2, [r4+0x0054]
+    and r2, 4095
     xor r2, 65535
     and r0, r2
-    and r0, 255
+    mov r2, r6
+    and r2, 61440           ; 类型位原样保留
+    or r0, r2
     stw [r4+0x005C], r0
-gp_chmod_store:
-    mov r4, 0
-    ldw r2, [r4+0x005C]
-    ldw r1, [r4+0x005A]
-    call crfs_write_u8
+    ldw r1, [r4+0x0056]
+    mov r2, r0
+    call vfs_set_mode
     cmp r0, 0
     jne gp_fail
     mov r0, 0
     iret
+
 
 gp_chdir:
     call vfs_resolve
@@ -997,28 +589,9 @@ gp_chdir:
     mov r4, 0
     stw [r4+0x0056], r0
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 2
     jne gp_fail
-    mov r4, 0
-    ldw r1, [r4+0x0056]
-    mov r2, ${M_EXEC}
-    mov r3, ${M_OEXEC}
-    call vfs_may
-    cmp r0, 0
-    jne gp_fail
-    call current_pcb
-    mov r4, 0
-    ldw r6, [r4+0x0040]
-    stb [r5+22], r6
-    ldw r6, [r4+0x0056]
-    stb [r5+23], r6
-    mov r0, 0
-    iret
 
 gp_mkdir:
     mov r2, 2
@@ -1029,38 +602,45 @@ gp_mkdir:
     iret
 
 ; r1 = parent, r2 = child. Copies the child's directory name to gp_slot.
+; r1 = 父目录, r2 = 子 inode。把子项的名字拷到 gp_slot。0 / 0xffff。
+; 暂存字：0x0068 目录、0x006A 子 inode、0x006C 遍历偏移、0x006E 目录字节数。
 gp_copy_name:
     mov r4, 0
     stw [r4+0x0068], r1
     stw [r4+0x006A], r2
-    mov r1, r1
-    call vfs_count
+    stw [r4+0x006C], r4
+    ldw r1, [r4+0x0068]
+    call vfs_size
     cmp r0, 65535
     je gp_ret_fail
     mov r4, 0
-    stw [r4+0x006C], r0
-    mov r6, 0
+    stw [r4+0x006E], r0
 gp_copy_scan:
     mov r4, 0
-    ldw r3, [r4+0x006C]
-    cmp r6, r3
+    ldw r2, [r4+0x006C]
+    ldw r3, [r4+0x006E]
+    cmp r2, r3
+    jgt gp_ret_fail
     je gp_ret_fail
     ldw r1, [r4+0x0068]
-    mov r3, r6
-    push r6
     call vfs_dirent
-    pop r6
+    cmp r0, 65535
+    je gp_ret_fail
+    cmp r7, 0
+    je gp_ret_fail
     mov r4, 0
+    stw [r4+0x006C], r7
+    cmp r0, 0
+    je gp_copy_scan
     ldw r2, [r4+0x006A]
     cmp r0, r2
-    je gp_copy_hit
-    add r6, 1
-    jmp gp_copy_scan
-gp_copy_hit:
+    jne gp_copy_scan
     mov r1, gp_slot
     mov r7, 0
 gp_copy_bytes:
     cmp r7, 14
+    je gp_copy_nul
+    cmp r7, r6
     je gp_copy_nul
     ldb r0, [r5+0]
     stb [r1+0], r0
@@ -1081,83 +661,142 @@ gp_unlink:
     mov r0, 0
     iret
 
+; r1 = 用户路径。删文件或空目录。0 = 成功，65535 = 失败。
+; 暂存字：0x0050 路径、0x0056 inode、0x0060 类型、0x0062 父目录、0x0070 名字长度。
 gp_do_unlink:
     mov r4, 0
-    stw [r4+0x0050], r1
+    stw [r4+0x0050], r1     ; 路径
     call vfs_resolve
     cmp r0, 65535
     je gp_ret_fail
     mov r4, 0
-    stw [r4+0x0056], r0
-    cmp r0, 1
-    je gp_ret_fail
+    stw [r4+0x0056], r0     ; 目标 inode
+    cmp r0, ${ROOT_INO}
+    je gp_ret_fail          ; 根目录不能删
     ldw r5, [r4+0x0040]
     cmp r5, 254
-    je gp_ret_fail
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_ret_fail
+    jne gp_ul_notrom
+    jmp gp_ret_fail         ; rom 固件只读
+gp_ul_notrom:
     call gp_is_mount
     cmp r0, 0
-    je gp_ret_fail
+    je gp_ret_fail          ; 挂载点不能删
     mov r4, 0
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_ret_fail
-    mov r1, r0
-    call vfs_u8
-    cmp r0, 3
-    je gp_ret_fail
-    cmp r0, 2
-    jne gp_unlink_parent
+    call vfs_type
     mov r4, 0
-    ldw r1, [r4+0x0056]
-    call vfs_count
-    cmp r0, 0
-    jne gp_ret_fail
-gp_unlink_parent:
-    mov r4, 0
+    stw [r4+0x0060], r0     ; 1 文件 / 2 目录
     ldw r1, [r4+0x0050]
-    call gp_split
+    call gp_split           ; 拆出父目录 inode 与最后一段名字
     cmp r0, 65535
     je gp_ret_fail
     mov r4, 0
-    stw [r4+0x0062], r0
-    ldw r1, [r4+0x0062]
-    call vfs_inode
-    cmp r0, 65280
+    stw [r4+0x0062], r0     ; 父目录 inode
+    ldw r1, [r4+0x0052]
+    call gp_name_len
+    cmp r0, 65535
     je gp_ret_fail
-    add r0, 1
-    mov r1, r0
-    call vfs_u8
-    and r0, 64
+    mov r4, 0
+    stw [r4+0x0070], r0     ; 名字长度
+    ldw r1, [r4+0x0062]
+    mov r2, ${M_WRITE}
+    mov r3, ${M_OWRITE}
+    call vfs_may
     cmp r0, 0
-    je gp_unlink_do
-    call current_euid
-    cmp r0, ${UID_ROOT}
-    je gp_unlink_do
+    jne gp_ret_fail         ; 父目录要可写
     mov r4, 0
-    stw [r4+0x0058], r0
+    ldw r1, [r4+0x0060]
+    cmp r1, 2
+    jne gp_unlink_link
     ldw r1, [r4+0x0056]
-    mul r1, 2
-    add r1, ${SB_UID}
-    call vfs_u16
-    mov r4, 0
-    ldw r5, [r4+0x0058]
-    cmp r0, r5
-    jne gp_ret_fail
-gp_unlink_do:
-    call gp_use_vdev
+    call gp_dir_empty
+    cmp r0, 0
+    jne gp_ret_fail         ; 目录必须先清空
+gp_unlink_link:
     mov r4, 0
     ldw r1, [r4+0x0062]
     ldw r2, [r4+0x0052]
-    call gp_dir_remove
+    ldw r3, [r4+0x0070]
+    call vfs_del_dirent     ; 先摘掉目录项
     cmp r0, 0
     jne gp_ret_fail
     mov r4, 0
+    ldw r1, [r4+0x0060]
+    cmp r1, 2
+    je gp_unlink_dir
     ldw r1, [r4+0x0056]
-    call gp_destroy_ino
+    call vfs_unlink_ino     ; 文件：链接数 -1，减到 0 就释放
+    ret
+gp_unlink_dir:
+    mov r4, 0
+    ldw r1, [r4+0x0056]
+    call vfs_free_ino       ; 目录：“.” 还占着一笔链接数，直接释放
+    cmp r0, 0
+    jne gp_ret_fail
+    mov r4, 0
+    ldw r1, [r4+0x0062]
+    call vfs_links          ; 父目录少了这个子目录的 “..”，链接数 -1
+    cmp r0, 65535
+    je gp_ret_fail
+    cmp r0, 0
+    je gp_ret_fail
+    sub r0, 1
+    mov r2, r0
+    mov r4, 0
+    ldw r1, [r4+0x0062]
+    call vfs_set_links
+    cmp r0, 0
+    jne gp_ret_fail
+    mov r0, 0
+    ret
+
+; r1 = 目录 inode → r0 = 0 表示只有 “.” 与 “..”。暂存字：0x0068/0x006C/0x006E。
+gp_dir_empty:
+    mov r4, 0
+    stw [r4+0x0068], r1
+    stw [r4+0x006C], r4
+    ldw r1, [r4+0x0068]
+    call vfs_size
+    cmp r0, 65535
+    je gp_ret_fail
+    mov r4, 0
+    stw [r4+0x006E], r0
+gp_de_scan:
+    mov r4, 0
+    ldw r2, [r4+0x006C]
+    ldw r3, [r4+0x006E]
+    cmp r2, r3
+    jgt gp_de_ok
+    je gp_de_ok
+    ldw r1, [r4+0x0068]
+    call vfs_dirent
+    cmp r0, 65535
+    je gp_ret_fail
+    cmp r7, 0
+    je gp_de_ok
+    mov r4, 0
+    stw [r4+0x006C], r7
+    cmp r0, 0
+    je gp_de_scan
+    cmp r6, 1               ; “.” 长度 1，“..” 长度 2，都要跳过
+    je gp_de_dot
+    cmp r6, 2
+    jne gp_de_full
+    ldb r1, [r5+0]
+    cmp r1, 46
+    jne gp_de_full
+    ldb r1, [r5+1]
+    cmp r1, 46
+    je gp_de_scan
+    jmp gp_de_full
+gp_de_dot:
+    ldb r1, [r5+0]
+    cmp r1, 46
+    je gp_de_scan
+gp_de_full:
+    mov r0, 65535
+    ret
+gp_de_ok:
     mov r0, 0
     ret
 
@@ -1186,149 +825,6 @@ gp_mnt_no:
     mov r0, 1
     ret
 
-; r1 = dir, r2 = user name. Removes that directory entry. Override must be set.
-gp_dir_remove:
-    mov r4, 0
-    stw [r4+0x0068], r1
-    stw [r4+0x006C], r2
-    mov r1, r1
-    call vfs_count
-    cmp r0, 65535
-    je gp_ret_fail
-    mov r4, 0
-    stw [r4+0x006E], r0
-    mov r6, 0
-gp_rm_scan:
-    ldw r3, [r4+0x006E]
-    cmp r6, r3
-    je gp_ret_fail
-    ldw r1, [r4+0x0068]
-    mov r3, r6
-    push r6
-    call vfs_dirent
-    pop r6
-    mov r4, 0
-    stw [r4+0x0066], r0
-    ldw r1, [r4+0x006C]
-    mov r2, r5
-    push r6
-    call gp_user_kern_eq
-    pop r6
-    cmp r0, 0
-    je gp_rm_hit
-    mov r4, 0
-    add r6, 1
-    jmp gp_rm_scan
-gp_rm_hit:
-    mov r4, 0
-    stw [r4+0x0070], r6
-    ldw r3, [r4+0x006E]
-    sub r3, 1
-    cmp r6, r3
-    je gp_rm_shrink
-    stw [r4+0x0072], r3
-    ldw r1, [r4+0x0068]
-    mov r3, r3
-    call vfs_dirent
-    mov r1, gp_ent
-    mov r7, r5
-    sub r7, 2
-    mov r6, 0
-gp_rm_save:
-    cmp r6, 16
-    je gp_rm_write
-    ldb r0, [r7+0]
-    stb [r1+0], r0
-    add r7, 1
-    add r1, 1
-    add r6, 1
-    jmp gp_rm_save
-gp_rm_write:
-    mov r4, 0
-    ldw r1, [r4+0x0070]
-    mul r1, 16
-    mov r5, r1
-    div r5, 256
-    mov r6, r1
-    mod r6, 256
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    mul r5, 2
-    add r1, r5
-    call crfs_u16
-    cmp r0, 0
-    je gp_ret_fail
-    mov r4, 0
-    stw [r4+0x0066], r0
-    mov r1, r0
-    call sda_read_block
-    cmp r0, 0
-    jne gp_ret_fail
-    mov r4, 0
-    ldw r6, [r4+0x0070]
-    mul r6, 16
-    mod r6, 256
-    add r6, 0x0D00
-    mov r1, gp_ent
-    mov r7, 0
-gp_rm_put:
-    cmp r7, 16
-    je gp_rm_commit
-    ldb r0, [r1+0]
-    stb [r6+0], r0
-    add r1, 1
-    add r6, 1
-    add r7, 1
-    jmp gp_rm_put
-gp_rm_commit:
-    mov r4, 0
-    ldw r1, [r4+0x0066]
-    call sda_write_block
-gp_rm_shrink:
-    mov r4, 0
-    ldw r2, [r4+0x006E]
-    sub r2, 1
-    mul r2, 16
-    stw [r4+0x0072], r2
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 770
-    call crfs_write_u16
-    mov r4, 0
-    ldw r2, [r4+0x0072]
-    mov r5, r2
-    mod r5, 256
-    cmp r5, 0
-    jne gp_rm_ok
-    mov r5, r2
-    div r5, 256
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    mul r5, 2
-    add r1, r5
-    call crfs_u16
-    cmp r0, 0
-    je gp_rm_ok
-    cmp r0, 65535
-    je gp_rm_ok
-    mov r1, r0
-    call gp_free_block
-    mov r4, 0
-    ldw r2, [r4+0x0072]
-    div r2, 256
-    ldw r1, [r4+0x0068]
-    mul r1, 48
-    add r1, 776
-    mul r2, 2
-    add r1, r2
-    mov r2, 0
-    call crfs_write_u16
-gp_rm_ok:
-    mov r0, 0
-    ret
-
 ; r1 = kernel string, r2 = kernel string. 0 if equal up to NUL.
 gp_kern_kern_eq:
     mov r7, 0
@@ -1349,8 +845,9 @@ gp_kke_yes:
     mov r0, 0
     ret
 
-; init and login are singleton system processes. Refuse a second live instance;
-; a zombie is allowed so init can reap it before starting its replacement.
+; init 与「控制台登录循环」是单例系统进程：拒绝第二个活着的实例，僵尸允许
+; （init 要先收尸再补一个新的）。判据是 login 不带账户名——带账户名的是 su 拉起的
+; 一次性登录，它要和控制台循环并存。
 gp_singleton:
     mov r1, spawn_req
     add r1, 8
@@ -1364,6 +861,11 @@ gp_singleton:
     call gp_kern_kern_eq
     cmp r0, 0
     jne gp_singleton_clear
+    mov r1, spawn_req
+    add r1, 6
+    ldw r1, [r1+0]          ; 本次 spawn 的参数个数
+    cmp r1, 0
+    jne gp_singleton_clear  ; 带账户名：一次性 login，不当单例
     mov r2, singleton_login
     jmp gp_singleton_scan_setup
 gp_singleton_init:
@@ -1407,183 +909,132 @@ gp_singleton_clear:
     mov r0, 0
     ret
 
-; r1 = user string, r2 = kernel string. 0 if equal up to NUL.
-gp_user_kern_eq:
-    mov r7, 0
-gp_uke_loop:
-    cmp r7, 14
-    je gp_uke_end
-    uldb r3, [r1+0]
-    ldb r4, [r2+0]
-    cmp r3, 0
-    je gp_uke_user0
-    cmp r3, r4
-    jne gp_ret_fail
-    add r1, 1
-    add r2, 1
-    add r7, 1
-    jmp gp_uke_loop
-gp_uke_user0:
-    cmp r4, 0
-    jne gp_ret_fail
-    mov r0, 0
-    ret
-gp_uke_end:
-    uldb r3, [r1+0]
-    cmp r3, 0
-    jne gp_ret_fail
-    mov r0, 0
-    ret
-
+; rename(旧路径, 新路径)：同一设备内换名字，目标存在就覆盖（目录除外）。
+; 暂存字：0x0050 旧路径、0x0064 inode、0x0066 旧父、0x006A 旧名、0x0072 旧名长度、
+; 0x0074 新父、0x0076 新名、0x0078 新名长度、0x007A 类型、0x007C 设备、0x007E 新路径。
 gp_rename:
     mov r4, 0
     stw [r4+0x0050], r1
-    stw [r4+0x0052], r2
-    stw [r4+0x0074], r2 ; gp_split overwrites 0x0052 with the source basename
+    stw [r4+0x007E], r2
     call vfs_resolve
     cmp r0, 65535
     je gp_fail
     mov r4, 0
-    stw [r4+0x0056], r0
-    ldw r6, [r4+0x0040]
-    stw [r4+0x0058], r6
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_fail
-    cmp r6, 254
-    je gp_fail
-    ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
+    stw [r4+0x0064], r0
+    ldw r5, [r4+0x0040]
+    stw [r4+0x007C], r5
+    cmp r5, 254
     je gp_fail
     mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 3
-    je gp_fail
-    mov r4, 0           ; vfs_sector leaves r4 at the block MMIO page
+    je gp_fail              ; 设备节点不改名
+    mov r4, 0
+    stw [r4+0x007A], r0
     ldw r1, [r4+0x0050]
     call gp_split
     cmp r0, 65535
     je gp_fail
     mov r4, 0
-    stw [r4+0x0062], r0
-    ldw r1, [r4+0x0074]
+    stw [r4+0x0066], r0
+    ldw r5, [r4+0x0052]
+    stw [r4+0x006A], r5
+    mov r1, r5
+    call gp_name_len
+    cmp r0, 65535
+    je gp_fail
+    mov r4, 0
+    stw [r4+0x0072], r0
+    ldw r1, [r4+0x007E]
     call gp_split
     cmp r0, 65535
     je gp_fail
     mov r4, 0
-    stw [r4+0x0060], r0
+    stw [r4+0x0074], r0
+    ldw r5, [r4+0x0052]
+    stw [r4+0x0076], r5
+    mov r1, r5
+    call gp_name_len
+    cmp r0, 65535
+    je gp_fail
+    mov r4, 0
+    stw [r4+0x0078], r0
     ldw r5, [r4+0x0040]
-    ldw r6, [r4+0x0058]
+    ldw r6, [r4+0x007C]
     cmp r5, r6
-    jne gp_fail
-    ldw r1, [r4+0x0062]
+    jne gp_fail             ; 跨设备不行
+    ldw r1, [r4+0x0066]
     mov r2, ${M_WRITE}
     mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
     mov r4, 0
-    ldw r1, [r4+0x0060]
+    ldw r1, [r4+0x0074]
     mov r2, ${M_WRITE}
     mov r3, ${M_OWRITE}
     call vfs_may
     cmp r0, 0
     jne gp_fail
     mov r4, 0
-    ldw r1, [r4+0x0062]
-    ldw r2, [r4+0x0056]
-    call gp_copy_name
-    cmp r0, 0
-    jne gp_fail
+    ldw r5, [r4+0x007A]
+    cmp r5, 2
+    jne gp_ren_target
+    ldw r5, [r4+0x0066]
+    ldw r6, [r4+0x0074]
+    cmp r5, r6
+    jne gp_fail             ; 目录只在原目录里改名（“..” 不会过期）
+gp_ren_target:
     mov r4, 0
-    ldw r1, [r4+0x0060]
-    ldw r2, [r4+0x0052]
+    ldw r1, [r4+0x0074]
+    ldw r2, [r4+0x0076]
     call vfs_lookup
     cmp r0, 65535
     je gp_ren_link
-    ldw r1, [r4+0x0056]
-    cmp r0, r1
-    je gp_ren_ok
-    stw [r4+0x0074], r0
-    ldw r5, [r4+0x0056]
-    stw [r4+0x0076], r5
-    ldw r5, [r4+0x0062]
-    stw [r4+0x0078], r5
-    ldw r5, [r4+0x0060]
-    stw [r4+0x007A], r5
-    ldw r5, [r4+0x0052]
-    stw [r4+0x007C], r5
-    ldw r5, [r4+0x0058]
-    stw [r4+0x007E], r5
-    ldw r1, [r4+0x0052]
-    call gp_do_unlink
+    ldw r5, [r4+0x0064]
+    cmp r0, r5
+    je gp_ren_ok            ; 目标就是它自己
+    ldw r1, [r4+0x007E]
+    call gp_do_unlink       ; 目标另有其人：先删掉
     cmp r0, 0
     jne gp_fail
-    mov r4, 0
-    ldw r5, [r4+0x0076]
-    stw [r4+0x0056], r5
-    ldw r5, [r4+0x0078]
-    stw [r4+0x0062], r5
-    ldw r5, [r4+0x007A]
-    stw [r4+0x0060], r5
-    ldw r5, [r4+0x007C]
-    stw [r4+0x0052], r5
-    ldw r5, [r4+0x007E]
-    mov r1, r5
-    call vfs_setdev
 gp_ren_link:
-    call gp_use_vdev
     mov r4, 0
-    ldw r1, [r4+0x0062]
-    ldw r2, [r4+0x0056]
-    call gp_dir_remove_ino
+    ldw r1, [r4+0x0066]
+    ldw r2, [r4+0x006A]
+    ldw r3, [r4+0x0072]
+    call vfs_del_dirent
     cmp r0, 0
     jne gp_fail
     mov r4, 0
-    ldw r1, [r4+0x0060]
-    ldw r2, [r4+0x0056]
-    ldw r3, [r4+0x0052]
-    call gp_dir_append
+    ldw r5, [r4+0x0064]
+    stw [r4+0x00B8], r5     ; 子 inode
+    ldw r5, [r4+0x007A]
+    stw [r4+0x00BC], r5     ; 盘上类型
+    ldw r1, [r4+0x0074]
+    ldw r2, [r4+0x0076]
+    ldw r3, [r4+0x0078]
+    call vfs_add_dirent
     cmp r0, 0
     jne gp_fail
     mov r4, 0
-    ldw r1, [r4+0x0056]
-    mul r1, 48
-    add r1, 772
-    ldw r2, [r4+0x0060]
-    call crfs_write_u16
+    ldw r5, [r4+0x007A]
+    cmp r5, 2
+    jne gp_ren_ok
+    ldw r1, [r4+0x0074]     ; 目录：抵掉 add_dirent 给父目录加的链接数
+    call vfs_links
+    cmp r0, 65535
+    je gp_fail
+    cmp r0, 0
+    je gp_fail
+    sub r0, 1
+    mov r2, r0
+    mov r4, 0
+    ldw r1, [r4+0x0074]
+    call vfs_set_links
 gp_ren_ok:
     mov r0, 0
     iret
-
-; r1 = dir, r2 = child inode. Removes the entry whose inode matches.
-gp_dir_remove_ino:
-    mov r4, 0
-    stw [r4+0x0068], r1
-    stw [r4+0x006A], r2
-    mov r1, r1
-    call vfs_count
-    cmp r0, 65535
-    je gp_ret_fail
-    mov r4, 0
-    stw [r4+0x006E], r0
-    mov r6, 0
-gp_rmi_scan:
-    ldw r3, [r4+0x006E]
-    cmp r6, r3
-    je gp_ret_fail
-    ldw r1, [r4+0x0068]
-    mov r3, r6
-    push r6
-    call vfs_dirent
-    pop r6
-    mov r4, 0
-    ldw r2, [r4+0x006A]
-    cmp r0, r2
-    je gp_rm_hit
-    add r6, 1
-    jmp gp_rmi_scan
 
 gp_getcwd:
     mov r4, 0
@@ -1594,38 +1045,41 @@ gp_getcwd:
     mov r4, 0
     stw [r4+0x0056], r6
     call vfs_setdev
-    mov r7, 0
+    mov r4, 0
+    stw [r4+0x0096], r4       ; 深度（r7 会被 vfs_dirent 写，不能当计数器）
 gp_cwd_walk:
     mov r4, 0
     ldw r1, [r4+0x0056]
-    cmp r1, 1
+    cmp r1, ${ROOT_INO}
     je gp_cwd_mount
-    cmp r7, 8
+    ldw r3, [r4+0x0096]
+    cmp r3, 8
     je gp_cwd_mount
-    call vfs_inode
-    cmp r0, 65280
-    je gp_cwd_emit
-    add r0, 4
-    mov r1, r0
-    call vfs_u16
-    cmp r0, 0
-    je gp_cwd_emit
-    cmp r0, 65535
-    je gp_cwd_emit
-    mov r2, r0
+    call vfs_type
+    cmp r0, 2
+    jne gp_cwd_emit
     mov r4, 0
     ldw r1, [r4+0x0056]
-    stw [r4+0x006A], r1
-    mov r1, r2
-    stw [r4+0x0056], r2
-    ldw r2, [r4+0x006A]
-    push r7
+    mov r2, gp_dotdot         ; “..” 就是父目录
+    mov r5, 1
+    stb [r4+0x0048], r5       ; 这一串在内核段落里
+    call vfs_lookup
+    push r0
+    mov r5, 0
+    stb [r5+0x0048], r5       ; 恢复用户指针模式
+    pop r0
+    cmp r0, 65535
+    je gp_cwd_emit
+    mov r4, 0
+    ldw r2, [r4+0x0056]       ; 子（当前目录）
+    stw [r4+0x0056], r0       ; 继续往上走
+    mov r1, r0
     call gp_copy_name
-    pop r7
     cmp r0, 0
     jne gp_cwd_emit
+    mov r4, 0
     mov r1, gp_names
-    mov r3, r7
+    ldw r3, [r4+0x0096]
     mul r3, 16
     add r1, r3
     mov r2, gp_slot
@@ -1640,7 +1094,10 @@ gp_cwd_store:
     add r6, 1
     jmp gp_cwd_store
 gp_cwd_stored:
-    add r7, 1
+    mov r4, 0
+    ldw r3, [r4+0x0096]
+    add r3, 1
+    stw [r4+0x0096], r3
     jmp gp_cwd_walk
 gp_cwd_mount:
     mov r4, 0
@@ -1672,6 +1129,7 @@ gp_cwd_mhit:
 gp_cwd_emit:
     mov r4, 0
     ldw r2, [r4+0x0050]
+    ldw r7, [r4+0x0096]       ; 深度放进 r7 供输出循环倒着走
     mov r0, 47
     ustb [r2+0], r0
     add r2, 1
@@ -1958,11 +1416,7 @@ gp_spawn_check:
     ldw r5, [r4+0x0040]
     stw [r4+0x0058], r5
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 1
     jne gp_fail
     mov r4, 0
@@ -2037,11 +1491,7 @@ gp_sa_check:
     ldw r5, [r4+0x0040]
     stw [r4+0x0058], r5
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 1
     jne gp_fail
     mov r4, 0
@@ -2097,20 +1547,9 @@ gp_chown:
     ldw r5, [r4+0x0040]
     cmp r5, 254
     je gp_fail
-    ldw r5, [r4+0x0042]
-    cmp r5, 1
-    jne gp_fail
-    call gp_use_vdev
     ldw r1, [r4+0x0056]
-    mul r1, 2
-    add r1, ${SB_UID}
     ldw r2, [r4+0x0052]
-    call crfs_write_u16
-    cmp r0, 0
-    jne gp_fail
-    mov r0, 0
-    iret
-
+    call vfs_set_uid
 gp_req_zero:
     mov r1, spawn_req
     mov r2, 0
@@ -2231,47 +1670,35 @@ gp_setuid_from:
     stw [r4+0x005A], r6
     stw [r4+0x005C], r7
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
+    call vfs_mode
+    cmp r0, 65535
     je gp_setuid_done
-    mov r1, r0
-    add r1, 1
-    call vfs_u8
     and r0, ${M_SETUID}
     cmp r0, 0
     je gp_setuid_done
     mov r4, 0
     ldw r1, [r4+0x0056]
-    mul r1, 2
-    add r1, ${SB_UID}
-    call vfs_u16
-    mov r4, 0
-    stw [r4+0x005C], r0
+    call vfs_uid
 gp_setuid_done:
     ret
 
 ; Reads the first sector. r0 = 1 CRX, 2 shebang, 0 neither.
+; r0 = 1 CRX 可执行 / 2 #! 脚本 / 0 不认识的格式。inode 在 0x0056。
+; 读第 0 个逻辑块到暂存区，看开头的 4 字节（CRX）或 2 字节（#!）。
 gp_read_head:
     mov r4, 0
     ldw r1, [r4+0x0056]
-    call vfs_inode
-    cmp r0, 65280
-    je gp_head_no
-    add r0, 8
-    mov r1, r0
-    call vfs_u16
-    cmp r0, 0
-    je gp_head_no
+    mov r2, 0               ; 第 0 个逻辑块
+    call vfs_ptr
     cmp r0, 65535
     je gp_head_no
+    cmp r0, 0
+    je gp_head_no
     mov r1, r0
-    mov r4, 0
-    ldw r5, [r4+0x0042]
-    mul r1, r5
-    call vfs_sector
+    call ext2_block          ; 整块读进暂存区
     cmp r0, 0
     jne gp_head_no
-    mov r1, 0x0D00
+    mov r1, ${SCRATCH_BASE}
     ldb r0, [r1+0]
     cmp r0, 127
     jne gp_head_bang
@@ -2287,10 +1714,10 @@ gp_read_head:
     mov r0, 1
     ret
 gp_head_bang:
-    cmp r0, 35
+    cmp r0, 35               ; '#'
     jne gp_head_no
     ldb r0, [r1+1]
-    cmp r0, 33
+    cmp r0, 33               ; '!'
     jne gp_head_no
     mov r0, 2
     ret
@@ -2299,7 +1726,8 @@ gp_head_no:
     ret
 
 gp_shebang:
-    mov r1, 0x0D02
+    mov r1, ${SCRATCH_BASE}
+    add r1, 2
 gp_bang_sp:
     ldb r0, [r1+0]
     cmp r0, 32
@@ -2466,11 +1894,7 @@ gp_assemble:
     ldw r5, [r4+0x0040]
     stw [r4+0x0058], r5
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 1
     jne gp_fail
     mov r4, 0
@@ -2542,17 +1966,10 @@ gp_mount:
     stw [r4+0x0056], r0
     mov r1, r0
     call vfs_setdev
-    mov r1, 0
-    call vfs_sector
-    cmp r0, 0
-    jne gp_fail
-    mov r1, 0x0D00
-    ldb r0, [r1+0]
-    cmp r0, 67
-    jne gp_fail
-    ldb r0, [r1+1]
-    cmp r0, 82
-    jne gp_fail
+    mov r1, ${GP_SB_BYTE + SB_MAGIC}
+    call vfs_u16
+    cmp r0, ${EXT2_MAGIC}
+    jne gp_fail             ; 只有真 ext2 卷能挂
     mov r4, 0
     ldw r1, [r4+0x0052]
     call vfs_resolve
@@ -2562,11 +1979,7 @@ gp_mount:
     ldw r5, [r4+0x0040]
     stw [r4+0x0062], r5
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 2
     jne gp_fail
     call gp_is_mount
@@ -2594,8 +2007,8 @@ gp_mount_slot:
     call vfs_setdev
     mov r6, 0
     ldw r4, [r6+0x0064]
-    ldw r5, [r6+0x0042]
-    stb [r4+3], r5
+    mov r5, 0
+    stb [r4+3], r5          ; 第 4 字节保留
     mov r0, 42
     svc
     mov r0, 0
@@ -2968,109 +2381,6 @@ gp_view_done:
     sub r0, r1
     iret
 
-gp_read_wide:
-    mov r4, 0
-    stw [r4+0x0050], r5
-    stw [r4+0x0052], r2
-    stw [r4+0x0054], r3
-    ldw r6, [r5+4]
-    stw [r4+0x0056], r6
-    ldb r1, [r5+1]
-    call vfs_setdev
-    mov r4, 0
-    ldw r5, [r4+0x0050]
-    ldb r1, [r5+2]
-    call ino_in_range
-    cmp r0, 0
-    jne read_failed
-    call vfs_inode
-    cmp r0, 65280
-    je read_failed
-    mov r4, 0
-    stw [r4+0x005A], r0
-    mov r1, r0
-    add r1, 2
-    call vfs_u16
-    cmp r0, 65535
-    je read_failed
-    mov r4, 0
-    stw [r4+0x0058], r0
-    ldw r6, [r4+0x0056]
-    cmp r6, r0
-    jlt gp_wide_have
-    jmp read_eof
-gp_wide_have:
-    mov r7, r0
-    sub r7, r6
-    ldw r3, [r4+0x0054]
-    cmp r3, 0
-    jne gp_wide_max
-    mov r3, r7
-gp_wide_max:
-    cmp r3, r7
-    jlt gp_wide_cnt
-    mov r3, r7
-gp_wide_cnt:
-    ldw r5, [r4+0x0042]
-    mul r5, 256
-    mov r1, r6
-    div r1, r5
-    mov r2, r6
-    mod r2, r5
-    stw [r4+0x005C], r1
-    stw [r4+0x005E], r2
-    mov r7, r2
-    mod r7, 256
-    mov r0, 256
-    sub r0, r7
-    cmp r3, r0
-    jlt gp_wide_ok
-    mov r3, r0
-gp_wide_ok:
-    stw [r4+0x0060], r3
-    ldw r1, [r4+0x005A]
-    add r1, 8
-    ldw r2, [r4+0x005C]
-    mul r2, 2
-    add r1, r2
-    call vfs_u16
-    cmp r0, 0
-    je read_failed
-    cmp r0, 65535
-    je read_failed
-    mov r1, r0
-    mov r4, 0
-    ldw r5, [r4+0x0042]
-    mul r1, r5
-    ldw r2, [r4+0x005E]
-    div r2, 256
-    add r1, r2
-    call vfs_sector
-    cmp r0, 0
-    jne read_failed
-    mov r4, 0
-    ldw r2, [r4+0x0052]
-    ldw r3, [r4+0x0060]
-    ldw r6, [r4+0x005E]
-    mod r6, 256
-    add r6, 0x0D00
-    mov r7, 0
-gp_wide_copy:
-    cmp r7, r3
-    je gp_wide_update
-    ldb r1, [r6+0]
-    ustb [r2+0], r1
-    add r6, 1
-    add r2, 1
-    add r7, 1
-    jmp gp_wide_copy
-gp_wide_update:
-    ldw r5, [r4+0x0050]
-    ldw r6, [r4+0x0056]
-    add r6, r3
-    stw [r5+4], r6
-    mov r0, r3
-    iret
 
 ; r1 = physical address, r2 = count. Copies raw bytes into the view buffer.
 gp_ncopy:
@@ -3088,7 +2398,7 @@ gp_ncopy:
 gp_ncopy_done:
     ret
 
-; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
+; Device catalog at DEVINFO_BASE, 8 records of 64 bytes. Host publishes facts only.
 ; lsblk is the single storage inspector: no selector prints the short device
 ; list, -a every device and filesystem field, -d device data, -f filesystem usage.
 gp_lsblk:
@@ -3120,7 +2430,7 @@ gp_lsblk_basic_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0x1200
+    add r5, ${DEVINFO_BASE}
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_lsblk_basic_next
@@ -3135,8 +2445,8 @@ gp_lsblk_basic_loop:
     pop r5
     push r5
     mov r1, r5
-    add r1, 27          ; size in bytes, 6 chars, right aligned by the host
-    mov r2, 6
+    add r1, 27          ; size in bytes, 8 chars, right aligned by the host
+    mov r2, 8
     call gp_ncopy
     mov r0, 32
     call view_putc
@@ -3159,7 +2469,7 @@ gp_basic_type:
     call view_pad
     pop r5
     mov r1, r5
-    add r1, 44
+    add r1, 47
     call gp_puts
     mov r0, 10
     call view_putc
@@ -3183,7 +2493,7 @@ gp_lsblk_all_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0x1200
+    add r5, ${DEVINFO_BASE}
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_lsblk_all_next
@@ -3205,7 +2515,7 @@ gp_lsblk_all_loop:
     call view_pad
     pop r5
     push r5
-    ldw r1, [r5+40]
+    ldw r1, [r5+43]
     mov r2, 6
     mov r3, 0
     call view_num
@@ -3213,7 +2523,7 @@ gp_lsblk_all_loop:
     call view_putc
     pop r5
     push r5
-    ldw r1, [r5+42]
+    ldw r1, [r5+45]
     mov r2, 5
     mov r3, 0
     call view_num
@@ -3221,8 +2531,8 @@ gp_lsblk_all_loop:
     call view_putc
     pop r5
     push r5
-    ldw r1, [r5+40]
-    ldw r2, [r5+42]
+    ldw r1, [r5+43]
+    ldw r2, [r5+45]
     sub r1, r2
     mov r2, 5
     mov r3, 0
@@ -3231,7 +2541,7 @@ gp_lsblk_all_loop:
     call view_putc
     pop r5
     push r5
-    ldb r1, [r5+39]
+    ldb r1, [r5+42]
     mov r2, 3
     mov r3, 0
     call view_num
@@ -3270,7 +2580,7 @@ gp_lsblk_all_loop:
     call view_putc
     pop r5
     mov r1, r5
-    add r1, 44
+    add r1, 47
     call gp_puts
     mov r0, 10
     call view_putc
@@ -3279,7 +2589,7 @@ gp_lsblk_all_next:
     add r6, 1
     jmp gp_lsblk_all_loop
 
-; Device catalog at 0x1200, 8 records of 64 bytes. Host publishes facts only.
+; Device catalog at DEVINFO_BASE, 8 records of 64 bytes. Host publishes facts only.
 gp_lsblk_dev:
     mov r1, gp_lsblk_hdr
     call gp_puts
@@ -3289,7 +2599,7 @@ gp_lsblk_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0x1200
+    add r5, ${DEVINFO_BASE}
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_lsblk_next
@@ -3313,14 +2623,14 @@ gp_lsblk_loop:
     push r5
     mov r1, r5
     add r1, 27
-    mov r2, 6
+    mov r2, 8
     call gp_ncopy
     mov r0, 32
     call view_putc
     pop r5
     push r5
     mov r1, r5
-    add r1, 33
+    add r1, 35
     mov r2, 6
     call gp_ncopy
     mov r0, 32
@@ -3356,7 +2666,7 @@ gp_lsblk_loop:
     call view_putc
     pop r5
     mov r1, r5
-    add r1, 44
+    add r1, 47
     call gp_puts
     mov r0, 10
     call view_putc
@@ -3374,7 +2684,7 @@ gp_df_loop:
     je gp_view_done
     mov r5, r6
     mul r5, 64
-    add r5, 0x1200
+    add r5, ${DEVINFO_BASE}
     ldb r0, [r5+0]
     cmp r0, 1
     jne gp_df_next
@@ -3388,7 +2698,7 @@ gp_df_loop:
     call view_pad
     pop r5
     push r5
-    ldw r1, [r5+40]
+    ldw r1, [r5+43]
     mov r2, 6
     mov r3, 0
     call view_num
@@ -3396,7 +2706,7 @@ gp_df_loop:
     call view_putc
     pop r5
     push r5
-    ldw r1, [r5+42]
+    ldw r1, [r5+45]
     mov r2, 5
     mov r3, 0
     call view_num
@@ -3404,8 +2714,8 @@ gp_df_loop:
     call view_putc
     pop r5
     push r5
-    ldw r1, [r5+40]
-    ldw r2, [r5+42]
+    ldw r1, [r5+43]
+    ldw r2, [r5+45]
     sub r1, r2
     mov r2, 5
     mov r3, 0
@@ -3414,7 +2724,7 @@ gp_df_loop:
     call view_putc
     pop r5
     push r5
-    ldb r1, [r5+39]
+    ldb r1, [r5+42]
     mov r2, 3
     mov r3, 0
     call view_num
@@ -3424,7 +2734,7 @@ gp_df_loop:
     call view_putc
     pop r5
     mov r1, r5
-    add r1, 44
+    add r1, 47
     call gp_puts
     mov r0, 10
     call view_putc
@@ -3433,11 +2743,12 @@ gp_df_next:
     add r6, 1
     jmp gp_df_loop
 
-; kmsg lives at 0x0E00: u16 length, then text. The host only appends events.
+; kmsg lives at KMSG_BASE: u16 length, then text. The host only appends events.
 gp_dmesg:
-    mov r4, 0x0E00
+    mov r4, ${KMSG_BASE}
     ldw r6, [r4+0]
-    mov r5, 0x0E02
+    mov r5, ${KMSG_BASE}
+    add r5, 2
     mov r7, 0
 gp_dmesg_loop:
     cmp r7, r6
@@ -3456,7 +2767,7 @@ gp_dmesg_loop:
     add r7, 1
     jmp gp_dmesg_loop
 
-; hexdump: resolve, require a regular file and read permission, format 256 B.
+; hexdump：解析路径、要求普通文件与读权限，按 1 KiB 块转储前 1024 字节。
 gp_hex:
     mov r4, 0
     ldw r1, [r4+0x0090]
@@ -3465,15 +2776,9 @@ gp_hex:
     je gp_fail
     mov r4, 0
     stw [r4+0x0060], r0
-    mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    stw [r4+0x0066], r0
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 1
-    jne gp_fail
+    jne gp_fail             ; 只转储普通文件
     mov r4, 0
     ldw r1, [r4+0x0060]
     mov r2, ${M_READ}
@@ -3481,31 +2786,28 @@ gp_hex:
     call vfs_may
     cmp r0, 0
     jne gp_fail
-    ldw r1, [r4+0x0066]
-    add r1, 2
-    call vfs_u16
+    mov r4, 0
+    ldw r1, [r4+0x0060]
+    call vfs_size
     cmp r0, 65535
     je gp_fail
-    cmp r0, 256
+    cmp r0, 1024
     jlt gp_hex_size
-    mov r0, 256
+    mov r0, 1024
 gp_hex_size:
     mov r4, 0
     stw [r4+0x0062], r0
     cmp r0, 0
     je gp_view_done
-    ldw r1, [r4+0x0066]
-    add r1, 8
-    call vfs_u16
+    ldw r1, [r4+0x0060]
+    mov r2, 0
+    call vfs_ptr             ; 第 0 个逻辑块
     cmp r0, 0
     je gp_fail
     cmp r0, 65535
     je gp_fail
     mov r1, r0
-    mov r4, 0
-    ldw r2, [r4+0x0042]
-    mul r1, r2
-    call vfs_sector
+    call ext2_block          ; 盘块读进暂存区 SCRATCH_BASE
     cmp r0, 0
     jne gp_fail
     mov r4, 0
@@ -3561,7 +2863,7 @@ gp_hex_h:
     call view_putc
     jmp gp_hex_hn
 gp_hex_hb:
-    add r6, 0x0D00
+    add r6, ${SCRATCH_BASE}
     ldb r0, [r6+0]
     call gp_hexbyte
     mov r0, 32
@@ -3590,7 +2892,7 @@ gp_hex_a:
     jlt gp_hex_ac
     jmp gp_hex_end
 gp_hex_ac:
-    add r6, 0x0D00
+    add r6, ${SCRATCH_BASE}
     ldb r0, [r6+0]
     cmp r0, 32
     jlt gp_hex_dot
@@ -3644,11 +2946,7 @@ gp_od:
     mov r4, 0
     stw [r4+0x0060], r0
     mov r1, r0
-    call vfs_inode
-    cmp r0, 65280
-    je gp_fail
-    mov r1, r0
-    call vfs_u8
+    call vfs_type
     cmp r0, 1
     jne gp_fail
     mov r4, 0
@@ -3676,10 +2974,12 @@ gp_od:
 .data
 pathbuf:
     .space 80
+gp_digits:
+    .space 24                 ; view_num 的数字缓冲（13 位足够；绝不能拿 KCB 当草稿纸）
 gp_slot:
     .space 16
-gp_ent:
-    .space 16
+gp_dotdot:
+    .asciz ".."
 gp_names:
     .space 128
 spawn_req:

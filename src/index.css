@@ -44,10 +44,6 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.grid-cols-16 {
-  grid-template-columns: repeat(16, minmax(0, 1fr));
-}
-
 .grid-cols-32 {
   grid-template-columns: repeat(32, minmax(0, 1fr));
 }

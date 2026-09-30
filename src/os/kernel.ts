@@ -18,20 +18,8 @@ import {
 } from './blockdev'
 import { factoryAccounts, parsePasswd, serializePasswd } from './accounts'
 import type { Account } from './accounts'
-import {
-  applySystemPolicy,
-  CRFS,
-  lookupAbs,
-  M_OEXEC,
-  M_SETUID,
-  MODE_DIR,
-  MODE_FILE,
-  MODE_TMP,
-  T_DIR,
-  T_FILE,
-  UID_ROOT,
-  VFS,
-} from './fs'
+import { FS, lookupAbs, M_SETUID, MODE_DIR, MODE_FILE, T_DIR, T_FILE, UID_ROOT, VFS } from './fs'
+import { ROOT_INO } from './ext2'
 import {
   DEVINFO_BASE,
   DEVINFO_SLOTS,
@@ -46,6 +34,8 @@ import {
   RAM_SIZE,
   RESERVED_FRAME,
   RESERVED_FRAMES,
+  SCRATCH_BASE,
+  SCRATCH_SIZE,
   USER_FRAME_START,
 } from './memory'
 import { assemble, disassemble, loadExe } from './isa'
@@ -55,7 +45,7 @@ import { GUEST_POLICY_SOURCE } from './guestpolicy'
 import { OS_VERSION } from '../utils/config'
 import { Fault, NO_IRQ, runExe, VECTOR_TIMER, VECTOR_TTY } from './vm'
 import type { Bus } from './vm'
-import { deviceCode, deviceName, MAX_PROCS, PCB_BASE, PCB_SIZE, Process } from './process'
+import { deviceCode, deviceName, MAX_PAGES, MAX_PROCS, PCB_BASE, PCB_MODE, PCB_SIZE, Process } from './process'
 import type { VfsHooks } from './process'
 import { buildRootImage } from './rootimg'
 import { isErr } from './types'
@@ -74,7 +64,6 @@ const MMIO_TTY_STATUS = 0xff10
 const MMIO_TTY_DATA = 0xff11
 const MMIO_TTY_MODE = 0xff12 // 0 = 关闭回显（密码输入），非 0 = 恢复
 const MMIO_BLOCK = 0xfe00
-const SECTOR_SIZE = 256
 // 挂载表：8 项 x 4 字节，CRX 内核的只读 VFS 靠它跨越挂载点
 const KCB_MOUNTS = 0x00c0
 const KCB_MOUNT_SLOTS = 8
@@ -107,11 +96,13 @@ export class Kernel {
   readonly mem = new Memory()
   readonly vfs = new VFS()
   private readonly devs = new Map<string, BlockDev>()
-  private readonly fss = new Map<string, CRFS>()
+  private readonly fss = new Map<string, FS>()
   private readonly procs = new Map<number, Process>()
   private readonly binErrors: string[] = []
   private kernelIvt = 0
   private nextPid = 0
+  // 页表缓存纪元：PCB 页表字节被改写就递增，各进程的 MMU 缓存在下次访存时重建
+  private xlateEpoch = 0
 
   ticks = 0
   instructions = 0
@@ -139,7 +130,7 @@ export class Kernel {
     err: new TextDecoder('utf-8', { fatal: false }),
   }
   // Block controller registers (big-endian u16): command, device, block,
-  // buffer, status. TypeScript implements DMA only; CRFS remains unknown here.
+  // buffer, status. TypeScript implements DMA only; the on-disk layout stays the guest's business.
   private readonly blockRegs = new Uint8Array(10)
   private readonly klog: { tick: number; msg: string }[] = []
 
@@ -192,7 +183,7 @@ export class Kernel {
     this.vfs.mount('/', sdafs)
     const compiled = this.installPrograms(sdafs)
     stamp(`bin: ${compiled} programs installed on /dev/sda`)
-    this.ensureCreds('sda')
+    this.ensureAccounts('sda')
     stamp(
       restored
         ? `sda: superblock valid, ${sdafs.usedInodes()} inodes, ${sdafs.usedBlocks()}/${sda.blockCount} blocks in use`
@@ -238,7 +229,7 @@ export class Kernel {
       if (!fs || !fs.inodeUsed(ino)) return '/'
       const parts: string[] = []
       let cur = ino
-      for (let guard = 0; guard < 32 && cur !== 1; guard++) {
+      for (let guard = 0; guard < 32 && cur !== ROOT_INO; guard++) {
         const parent = fs.iparent(cur)
         const entry = fs.entries(parent).find((e) => e.ino === cur)
         if (!entry) break
@@ -259,26 +250,24 @@ export class Kernel {
   private makeDev(name: string, spec = SPECS[name]): BlockDev {
     const dev = new BlockDev(spec)
     this.devs.set(name, dev)
-    this.fss.set(name, new CRFS(dev))
+    this.fss.set(name, new FS(dev))
     return dev
   }
 
   // 烧写 ROM：/bin 里只接受汇编后的 CRX 映像
-  private installPrograms(fs: CRFS): number {
+  private installPrograms(fs: FS): number {
     let compiled = 0
-    let bin = fs.lookup(1, 'bin')
-    if (typeof bin !== 'number') {
-      const made = fs.create(1, 'bin', T_DIR)
+    let bin = fs.lookup(ROOT_INO, 'bin')
+    if (!bin) {
+      const made = fs.create(ROOT_INO, 'bin', T_DIR)
       if (typeof made !== 'number') {
         this.binErrors.push(`cannot create /bin: ${made.err}`)
         return 0
       }
       bin = made
     }
-    for (const e of fs.entries(bin)) {
-      fs.unlink(bin, e.name)
-      fs.destroy(e.ino)
-    }
+    // 每次上电重烧 /bin：unlink 顺手把 inode 与其数据块还回位图
+    for (const e of fs.entries(bin)) fs.unlink(bin, e.name)
     for (const [name, source] of Object.entries(ASM_PROGRAMS)) {
       const r = assemble(source)
       if (r.errors.length) {
@@ -290,10 +279,9 @@ export class Kernel {
       const ino = fs.create(bin, name, T_FILE)
       if (typeof ino !== 'number') continue
       fs.writeBytes(ino, r.bytes)
-      fs.setExec(ino, true)
       // login/passwd 需要以 root 的有效身份写 /etc/passwd、启动登录会话
       const setuid = name === 'login' || name === 'passwd' ? M_SETUID : 0
-      fs.setFlags(ino, fs.iflags(ino) | M_OEXEC | setuid)
+      fs.setFlags(ino, MODE_DIR | setuid) // 0755（可执行）
       compiled++
     }
     return compiled
@@ -414,8 +402,13 @@ export class Kernel {
   processes(): Process[] {
     return [...this.procs.values()]
   }
-  filesystem(name: string): CRFS | undefined {
+  filesystem(name: string): FS | undefined {
     return this.fss.get(name)
+  }
+  /** 整盘字节的副本。验收脚本靠它把 guest 写过的盘交给 e2fsck；界面也可用来导出镜像。 */
+  diskImage(name: string): Uint8Array | null {
+    const dev = this.devs.get(name)
+    return dev ? dev.bytes.slice() : null
   }
   consoleLines(): Line[] {
     return this.lines
@@ -571,29 +564,43 @@ export class Kernel {
 
   private makeBus(p: Process): Bus {
     const mem = this.mem
-    const translate = (va: number, forceUser = false): number => {
-      const vpn = va >>> 8
-      const pte = p.pteAt(vpn)
-      if (va < 0) throw new Fault(va, 'page fault')
-
-      // Kernel instructions use a physical direct map. The sole exception is
-      // the per-process supervisor stack at VPN 15. Access to user virtual
-      // memory must use ULDB/USTB (forceUser=true), never an ordinary load.
-      if (!forceUser && p.cpu?.mode === 'kernel') {
-        if (pte?.supervisor) return pte.pfn * PAGE_SIZE + (va & 0xff)
-        if (va < RAM_SIZE) return va
-        throw new Fault(va, 'kernel address fault')
-      }
-
-      if (pte !== null) {
-        if (pte.supervisor) throw new Fault(va, 'supervisor page fault')
-        return pte.pfn * PAGE_SIZE + (va & 0xff)
-      }
-      throw new Fault(va, 'page fault')
+    const bytes = mem.bytes
+    const pcbBase = p.base
+    // 每进程页表缓存：vpn → (pfn | supervisor<<15)，未映射为 -1。
+    // 只有 PCB 的页表字节被写过时才重建（写路径递增 xlateEpoch）。
+    const xlate = new Int32Array(MAX_PAGES)
+    let xlateEpoch = -1
+    const syncXlate = () => {
+      for (let vpn = 0; vpn < MAX_PAGES; vpn++) xlate[vpn] = p.pteBits(vpn)
+      xlateEpoch = this.xlateEpoch
     }
-    const readMem = (va: number, forceUser = false) => mem.bytes[translate(va, forceUser)]
+    const userAddr = (va: number): number => {
+      if (xlateEpoch !== this.xlateEpoch) syncXlate()
+      const raw = xlate[va >>> 8]
+      if (raw < 0) throw new Fault(va, 'page fault')
+      if (raw & 0x8000) throw new Fault(va, 'supervisor page fault')
+      return ((raw & 0x7fff) << 8) + (va & 0xff)
+    }
+    // Kernel instructions use a physical direct map. The sole exception is
+    // the per-process supervisor stack at VPN 15. Access to user virtual
+    // memory must use ULDB/USTB (forceUser=true), never an ordinary load.
+    const kernelAddr = (va: number): number => {
+      if (xlateEpoch !== this.xlateEpoch) syncXlate()
+      const raw = xlate[va >>> 8]
+      if (raw >= 0 && raw & 0x8000) return ((raw & 0x7fff) << 8) + (va & 0xff)
+      if (va < RAM_SIZE) return va
+      throw new Fault(va, 'kernel address fault')
+    }
+    const inKernel = () => bytes[pcbBase + PCB_MODE] !== 0
+    const addr = (va: number, forceUser: boolean): number =>
+      forceUser || !inKernel() ? userAddr(va) : kernelAddr(va)
+    const readMem = (va: number, forceUser = false) => bytes[addr(va, forceUser)]
     const writeMem = (va: number, b: number, forceUser = false) => {
-      mem.bytes[translate(va, forceUser)] = b & 0xff
+      bytes[addr(va, forceUser)] = b & 0xff
+    }
+    // PCB 页表字节被改写后，缓存必须在下次访存前失效
+    const noteWrite = (pa: number) => {
+      if ((pa - PCB_BASE) >>> 0 < MAX_PROCS * PCB_SIZE) this.xlateEpoch++
     }
     const reg16 = (off: number) => (this.blockRegs[off] << 8) | this.blockRegs[off + 1]
     const setReg16 = (off: number, value: number) => {
@@ -655,21 +662,9 @@ export class Kernel {
         setReg16(8, 0xffff)
         return
       }
-      // 命令 4/5/6 只服务内核自己的暂存页。用户可控的缓冲区不能从这里写进物理内存。
-      if ((command === 4 || command === 5 || command === 6) && buffer !== 0x0d00) {
+      // 命令 4/5 只服务内核自己的暂存区。用户可控的缓冲区不能从这里写进物理内存。
+      if ((command === 4 || command === 5) && buffer !== SCRATCH_BASE) {
         setReg16(8, 0xffff)
-        return
-      }
-      // 命令 6：按 256 B 扇区读到内核物理缓冲区。块大小不同的设备（ROM 是 1 KiB）
-      // 也能逐扇区读进内核那一页暂存区；怎么解析这些字节由 CRX 内核决定。
-      if (command === 6) {
-        const at = block * SECTOR_SIZE
-        if (!dev || at + SECTOR_SIZE > dev.size) {
-          setReg16(8, 0xffff)
-          return
-        }
-        for (let i = 0; i < SECTOR_SIZE; i++) writeMem(buffer + i, dev.bytes[at + i], false)
-        setReg16(8, 1)
         return
       }
       if (!dev || block >= dev.blockCount) {
@@ -678,6 +673,10 @@ export class Kernel {
       }
       try {
         const bytes = dev.block(block)
+        if (bytes.length > SCRATCH_SIZE) {
+          setReg16(8, 0xffff)
+          return
+        }
         // 命令 4 是内核读，ROM 可以读。用户态块读写和内核写都不能改固件。
         if ((command === 1 || command === 2 || command === 5) && name === 'rom') {
           setReg16(8, 0xffff)
@@ -701,31 +700,44 @@ export class Kernel {
     }
     return {
       get limit() {
-        return p.cpu?.mode === 'kernel' ? RAM_SIZE : p.addressLimit
+        return inKernel() ? RAM_SIZE : p.addressLimit
       },
       read: (va) => {
-        if (p.cpu?.mode === 'kernel' && va === MMIO_TTY_STATUS) return ttyStatus()
-        if (p.cpu?.mode === 'kernel' && va === MMIO_TTY_DATA) return ttyData()
-        if (p.cpu?.mode === 'kernel' && va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
+        if (!inKernel()) return bytes[userAddr(va)]
+        if (va === MMIO_TTY_STATUS) return ttyStatus()
+        if (va === MMIO_TTY_DATA) return ttyData()
+        if (va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
           return this.blockRegs[va - MMIO_BLOCK]
         }
-        if (p.cpu?.mode === 'kernel' && va >= 0xff00) return 0
-        return readMem(va)
+        if (va >= 0xff00) return 0
+        return bytes[kernelAddr(va)]
       },
-      readUser: (va) => readMem(va, true),
-      writeUser: (va, b) => writeMem(va, b, true),
+      readUser: (va) => bytes[userAddr(va)],
+      writeUser: (va, b) => {
+        const pa = userAddr(va)
+        bytes[pa] = b & 0xff
+        noteWrite(pa)
+      },
       write: (va, b) => {
-        if (p.cpu?.mode === 'kernel' && va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
+        if (!inKernel()) {
+          const pa = userAddr(va)
+          bytes[pa] = b & 0xff
+          noteWrite(pa)
+          return
+        }
+        if (va >= MMIO_BLOCK && va < MMIO_BLOCK + this.blockRegs.length) {
           const off = va - MMIO_BLOCK
           this.blockRegs[off] = b & 0xff
           if (off === 1) runBlockCommand()
           return
         }
-        if (p.cpu?.mode === 'kernel' && va >= 0xff00) {
+        if (va >= 0xff00) {
           this.mmioWrite(va, b)
           return
         }
-        writeMem(va, b)
+        const pa = kernelAddr(va)
+        bytes[pa] = b & 0xff
+        noteWrite(pa)
       },
     }
   }
@@ -877,6 +889,12 @@ export class Kernel {
     this.mem.setU16(0x003c, QUANTUM)
     this.mem.setU16(0x003e, USER_FRAME_START) // first allocatable user PFN
     this.mem.setU16(0x001e, KERNEL_TEXT_FRAME) // page_scan 的上界，标语区用不到这一字
+    // ext2 几何：inode 表的字节偏移与 inode 总数。CRX 内核据此算 inode 偏移，
+    // 但盘上结构仍然是它自己按字节解析的——宿主只发布事实。
+    const root = this.fss.get('sda')
+    const layout = root?.layout()
+    this.mem.setU16(0x004a, layout ? layout.inodeTableByte : 0)
+    this.mem.setU16(0x004c, layout ? layout.inodeCount : 0)
     this.writeMountTable()
     this.publishDevinfo()
   }
@@ -892,9 +910,9 @@ export class Kernel {
         .filter((h) => h !== m && (h.path === '/' || m.path.startsWith(h.path + '/')))
         .sort((a, b) => b.path.length - a.path.length)[0]
       if (!host) continue
-      let ino = 1
+      let ino = ROOT_INO
       for (const seg of m.path.slice(host.path === '/' ? 0 : host.path.length).split('/').filter(Boolean)) {
-        ino = host.fs.lookup(ino, seg) ?? 0
+        ino = host.fs.lookup(ino, seg)
         if (!ino) break
       }
       if (!ino) continue
@@ -902,7 +920,7 @@ export class Kernel {
       this.mem.bytes[at] = deviceCode(host.fs.dev.spec.name)
       this.mem.bytes[at + 1] = ino
       this.mem.bytes[at + 2] = deviceCode(m.fs.dev.spec.name)
-      this.mem.bytes[at + 3] = m.fs.dev.blockSize / SECTOR_SIZE
+      this.mem.bytes[at + 3] = 0 // 保留：块控制器现在整块搬运，不再按 256 B 扇区寻址
     }
   }
 
@@ -936,8 +954,11 @@ export class Kernel {
     }
   }
 
-  private singletonBusy(name: string): boolean {
+  // init 与控制台登录循环是单例。控制台循环的判据是 login 不带账户名：
+  // su 拉起的一次性 login 带账户名，必须能和控制台循环并存。
+  private singletonBusy(name: string, args: string[]): boolean {
     if (name !== 'init' && name !== 'login') return false
+    if (name === 'login' && args.length > 0) return false
     return [...this.procs.values()].some((p) => p.name === name && p.state !== 'zombie')
   }
 
@@ -966,7 +987,7 @@ export class Kernel {
     const cwdDev = b[at + 266] ?? 0
     const cwdIno = b[at + 267] ?? 0
     const flags = b[at + 268] ?? 0
-    if (this.singletonBusy(name)) return { err: 'EAGAIN' }
+    if (this.singletonBusy(name, args)) return { err: 'EAGAIN' }
     const fs = this.fss.get(deviceName(dev))
     if (!fs || !fs.inodeUsed(ino)) return { err: 'ENOENT' }
     const exe = loadExe(String.fromCharCode(...fs.readBytes(ino)))
@@ -1051,7 +1072,10 @@ export class Kernel {
       }
       const fs = this.fss.get(name)
       if (!fs) continue
-      this.ensureCreds(name)
+      if (!this.geometryOk(name)) {
+        this.log(`${name}: refused, unsupported ext2 geometry (CRX kernel reads one fixed layout)`)
+        continue
+      }
       this.vfs.mount(path, fs)
       this.mounts.set(name, path)
       this.log(`${name}: mounted on ${path}, label "${fs.label()}"`)
@@ -1096,38 +1120,18 @@ export class Kernel {
     return this.procs.get(pid)?.euid ?? null
   }
 
-  // 旧盘没有 uid 表时补一次。已标记的盘不动，避免把用户文件改回 root。
-  private ensureCreds(name: string) {
-    const fs = this.fss.get(name)
-    if (!fs || !fs.valid()) return
-    if (!fs.credsReady()) {
-      fs.seedModes()
-      applySystemPolicy(fs)
-      fs.markCreds()
-      this.dirty = true
-      this.log(`${name}: credential table written`)
-    }
-    this.ensureAccounts(name)
-  }
-
-  // 账户表只住在根盘。新盘写回出厂账户（只有 root，空密码）；
-  // 老盘把 /home/user 的属主保留为 user 账户，免得旧文件变成无主孤儿。
+  // 账户表只住在根盘。ext2 的盘出厂就带 /etc/passwd（由 rootimg 写进镜像），
+  // 这里只处理"导入的镜像里没有这张表"的情况。
   private ensureAccounts(name: string) {
     if (name !== 'sda') return
     const fs = this.fss.get(name)
     if (!fs || !fs.valid() || fs.accountsReady()) return
-    if (fs.iflags(1) === MODE_TMP) fs.setFlags(1, MODE_DIR) // 根目录不该是 1777
     for (const dir of ['home', 'root', 'etc', 'tmp']) {
       if (lookupAbs(fs, `/${dir}`)) continue
-      const made = fs.create(1, dir, T_DIR)
+      const made = fs.create(ROOT_INO, dir, T_DIR)
       if (typeof made !== 'number') this.log(`accounts: cannot create /${dir}: ${made.err}`)
     }
     const accounts = factoryAccounts()
-    const home = lookupAbs(fs, '/home')
-    if (home && fs.itype(home) === T_DIR && typeof fs.lookup(home, 'user') === 'number') {
-      // 旧盘迁移：遗留的 user 账户保持原有普通权限，不获得管理权限 a
-      accounts.push({ name: 'user', uid: 1, hash: '-', perms: 'lmbk' })
-    }
     let ino = lookupAbs(fs, '/etc/passwd')
     if (!ino) {
       const etc = lookupAbs(fs, '/etc')
@@ -1141,7 +1145,6 @@ export class Kernel {
     }
     fs.write(ino, serializePasswd(accounts))
     fs.setFlags(ino, MODE_FILE) // 0644：哈希很弱，这是教学系统
-    fs.markAccounts()
     this.dirty = true
     this.log(`accounts: ${accounts.length} account${accounts.length > 1 ? 's' : ''} in /etc/passwd (${accounts.map((a) => a.name).join(', ')})`)
   }
@@ -1197,7 +1200,24 @@ export class Kernel {
 
   // ---------- 设备与持久化 ----------
 
-  private fsOf(name: string): CRFS {
+  /**
+   * ext2 的几何必须与本机根盘一致：CRX 机器码是按固定布局汇编的
+   * （inode 表在哪、位图在哪、块总数多少都是常量），别的布局它读不了。
+   */
+  private geometryOk(name: string): boolean {
+    const fs = this.fss.get(name)
+    const ref = this.fss.get('sda')
+    if (!fs || !ref) return false
+    const a = fs.layout()
+    const b = ref.layout()
+    if (!a || !b) return false
+    for (const k of Object.keys(b) as (keyof typeof b)[]) {
+      if (a[k] !== b[k]) return false
+    }
+    return true
+  }
+
+  private fsOf(name: string): FS {
     return this.fss.get(name)!
   }
 
@@ -1291,7 +1311,6 @@ export class Kernel {
       this.fss.delete(name)
       return { err: 'EINVAL' }
     }
-    this.ensureCreds(name)
     if (this.persist) {
       saveDev(dev)
       rememberDisk(name)
@@ -1314,16 +1333,6 @@ export class Kernel {
     return 0
   }
 
-  wipeRoot() {
-    this.persist = false
-    this.storageOk = false
-    for (const name of this.devs.keys()) {
-      if (name !== 'rom') dropDev(name)
-    }
-    this.log('sda: persistent store cleared, writes are volatile until reboot')
-    this.emit()
-  }
-
   // ---------- 系统调用 ----------
 
   private dispatch(p: Process, sc: Syscall) {
@@ -1336,9 +1345,10 @@ export class Kernel {
         this.doExit(p, sc.code)
         return
       case 'kill': {
+        // 目标可能已经退出：没有这个 pid 就是 ESRCH，不是内核崩溃
         const t = this.procs.get(sc.pid)
-        this.killSig(t, sc.sig)
-        result = 0
+        if (t) this.killSig(t, sc.sig)
+        result = t ? 0 : 0xffff
         break
       }
       case 'hwexec':
@@ -1537,8 +1547,8 @@ export class Kernel {
 
   // Hardware facts for the merged lsblk views (-a/-d/-f). CRX formats the text;
   // this only fills the table.
-  // Record: present, removable, name[3], bs_len, model[17], bs[4], size[6],
-  // used[6], pct, blocks u16, usedBlocks u16, mount[20].
+  // Record: present, removable, name[3], bs_len, model[17], bs[4], size[8],
+  // used[7], pct, blocks u16, usedBlocks u16, mount[16].
   private publishDevinfo() {
     for (let pfn = RESERVED_FRAME; pfn < RESERVED_FRAME + RESERVED_FRAMES; pfn++) this.mem.hold(pfn)
     const base = DEVINFO_BASE
@@ -1556,17 +1566,15 @@ export class Kernel {
       const model = d.model.padEnd(17).slice(0, 17)
       for (let i = 0; i < 17; i++) b[at + 6 + i] = model.charCodeAt(i)
       for (let i = 0; i < b[at + 5]; i++) b[at + 23 + i] = bs.charCodeAt(i)
-      const size = String(d.size).padStart(6).slice(-6)
-      const used = String(d.used).padStart(6).slice(-6)
-      for (let i = 0; i < 6; i++) {
-        b[at + 27 + i] = size.charCodeAt(i)
-        b[at + 33 + i] = used.charCodeAt(i)
-      }
-      b[at + 39] = d.blocks ? Math.round((d.usedBlocks / d.blocks) * 100) : 0
-      this.mem.setU16(at + 40, d.blocks)
-      this.mem.setU16(at + 42, d.usedBlocks)
+      const size = String(d.size).padStart(8).slice(-8)
+      const used = String(d.used).padStart(7).slice(-7)
+      for (let i = 0; i < 8; i++) b[at + 27 + i] = size.charCodeAt(i)
+      for (let i = 0; i < 7; i++) b[at + 35 + i] = used.charCodeAt(i)
+      b[at + 42] = d.blocks ? Math.round((d.usedBlocks / d.blocks) * 100) : 0
+      this.mem.setU16(at + 43, d.blocks)
+      this.mem.setU16(at + 45, d.usedBlocks)
       const mount = d.present ? (d.mountpoint ?? '-') : '(no medium)'
-      for (let i = 0; i < mount.length && i < 19; i++) b[at + 44 + i] = mount.charCodeAt(i)
+      for (let i = 0; i < mount.length && i < 16; i++) b[at + 47 + i] = mount.charCodeAt(i)
     }
   }
 

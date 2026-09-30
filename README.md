@@ -25,7 +25,9 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 ## Filesystem
 
 sda is the system disk, in the way C: is the system disk on Windows. It
-holds the root tree and every program that ships with the OS.
+holds the root tree and every program that ships with the OS, and it is a
+real ext2 volume: export it from the Storage panel and e2fsck, debugfs or
+mount -o loop on Linux will read it as-is.
 
     /bin        system programs, installed on sda at power-on
     /usr/man    these manuals
@@ -126,3 +128,14 @@ sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有�
 
 英文版：man README、man asm，以此类推。
 ```
+
+## Development
+
+    npm ci          # install dependencies
+    npm run dev     # plain build on http://localhost:5173
+    npm run check   # tsc --noEmit + a headless smoke test that boots the OS and runs a session
+
+The transparent build is produced by CI, which rewrites `src/App.tsx` to point at
+`src/app/Transparent.tsx`. For local work on the control panel, change that line by hand.
+
+Notes on performance work and the measurements behind them: `docs/optimization.md`.

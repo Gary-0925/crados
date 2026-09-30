@@ -1,49 +1,55 @@
 # storage
 
 A disk is an array of bytes. Every structure below is a field inside those
-bytes; no copy of the tree exists anywhere else.
+bytes; no copy of the tree exists anywhere else. What sda carries is real
+**ext2**: export the image and Linux's e2fsck, debugfs and mount -o loop
+read it directly. Nothing on the disk is an invention of this machine.
 
 ## On-disk format
 
-    block 0        superblock: magic "CRFS", block size, block count,
-                   inode count, inode table start, data start, label
-    block 1        block bitmap, one bit per block
-    block 2        inode bitmap, one bit per inode
-    block 3..k     inode table, 48 bytes per inode
-    block k+1..    data blocks
+    sda: 1024 blocks of 1024 bytes, 1 MiB total; 256 inodes of 128 bytes
 
-An inode is laid out as
+    byte 1024     superblock (s_inodes_count, s_blocks_count, s_magic 0xEF53)
+    byte 2048     group descriptor table (where the bitmaps and table are)
+    block 3       block bitmap, one bit per block, bit n is block n + 1
+    block 4       inode bitmap, one bit per inode
+    block 5..36   inode table, inode n sits at (n-1) * 128 inside it
+    block 37..1023  data blocks
 
-    offset 0   type    1 file, 2 directory, 3 device
-    offset 1   flags   bit0 owner exec, bit1 owner read, bit2 owner write,
-                       bit3 other read, bit4 other write, bit5 setuid,
-                       bit6 sticky, bit7 other exec. Shown as rwxrwxst.
-                       chmod [u|o|a][+|-][rwxst] file. x follows u/o/a.
-                       Owner or root only. Non-root cannot set setuid.
-    offset 2   size    16-bit length in bytes
-    offset 4   parent  inode number of the containing directory
-    offset 6   driver  device node minor number
-    offset 8   ptr[20] twenty direct block pointers
+Every multi-byte field on the disk is little endian. The fields that matter
+in an inode:
 
-Owner uids live in the superblock, at byte 32 plus inode*2, one big-endian
-u16 each. A login shell runs with the uid of its account; uid 0 bypasses
-every check, and permission is checked against ownership, so /bin is off
-limits to non-root users. block_read and block_write need the 'b'
-permission letter (every account has it by default). A file is owned by
-the euid that created it. /tmp is 1777 with the sticky bit, so accounts
-cannot delete each other's scratch files; each /home/<name> directory
-belongs to its account, and mv needs write permission on both
-directories. A check reads only the file's own flags: a child may have
-any mode independently of its parent, while parent flags still control
-traversal and directory-entry operations. A fresh disk starts with a
-sticky, world-writable root (1777); the factory image then tightens the
-system directories. PATH searches /bin before /usr/bin, so a program
-there cannot shadow ls.
+    0x00  i_mode    top 4 bits S_IFMT: 0x8000 file, 0x4000 directory,
+                    0x2000 device. Low 12 bits are the mode: setuid 0x800,
+                    owner rwx, other rwx, sticky 0x200. Shown as rwxrwxst.
+                    chmod [u|o|a][+|-][rwxst] file; x follows u/o/a.
+                    Owner or root only. Non-root cannot set setuid.
+    0x02  i_uid     owner
+    0x04  i_size    length in bytes
+    0x14  i_dtime   deletion timestamp, non-zero on a deleted inode
+    0x1a  i_links_count
+    0x1c  i_blocks  sectors of 512 bytes, two per 1 KiB block
+    0x28  i_block[15] twelve direct blocks, one single indirect, reserved
+
+A directory is an ordinary file: its data is a run of variable-length
+records, each an 8-byte header (ino@0, rec_len@4, name_len@6, file_type@7)
+followed by the name, chained by rec_len up to i_size.
+
+A login shell runs with the uid of its account; uid 0 bypasses every check,
+and permission is checked against ownership, so /bin is off limits to
+non-root users. block_read and block_write need the 'b' permission letter
+(every account has it by default). A file is owned by the euid that created
+it. /tmp is 1777 with the sticky bit, so accounts cannot delete each other's
+scratch files; each /home/<name> directory belongs to its account, and mv
+needs write permission on both directories. A check reads only the file's
+own mode bits: a child may have any mode independently of its parent, while
+parent modes still control traversal and directory-entry operations. PATH
+searches /bin before /usr/bin, so a program there cannot shadow ls.
 
 ls -l shows the mode, the owner, the size and the name of each entry. The
-owner comes from that uid table: uid 0 prints as root, every other uid as
-a number. The line is readview kind 8, so ls only needs search permission
-on the directories along the way.
+owner comes from i_uid: 0 prints as root, every other uid as a number. The
+line is readview kind 8, so ls only needs search permission on the
+directories along the way.
 
 Both calls ls makes, getdents and readview kind 8, run entirely in the
 CRX kernel; its read-only VFS walks inodes and directory blocks on any
@@ -54,25 +60,21 @@ header row on top. A bare ls, ps or lsblk prints the short form; -a and
 friends widen it with memory and filesystem details. objdump checks the
 path itself, then asks the host to decode instructions.
 
-    -rwxr-x--  root     464  cat
-    drwxrwx-t  root       0  tmp/
+    -rwxr-x--  root     262  as
+    drwxrwx-t  root    1024  tmp/
 
 ## Where a file starts and ends
 
 The block pointers say which blocks hold the file; they need not be
-adjacent. The size field says how far into the last block the file runs.
-Nothing is stored inline and no terminator is used: extent is the pointer
-list, end is size. A file is therefore capped at 20 blocks, 5120 bytes on
-a 256 B disk. There are no indirect blocks; growing past the limit returns
-EFBIG, as a real filesystem does when it runs out of addressing depth.
-
-A directory is an ordinary file whose data is a run of 16-byte records,
-each holding a 2-byte inode number and a 14-byte name. Deleting a name
-rewrites that run.
+adjacent. i_size says how far into the last block the file runs. Nothing is
+stored inline and no terminator is used: extent is the pointer list, end is
+size. The CRX kernel writes the twelve direct blocks (12 KiB) and reads one
+indirect level as well, so a file can be 12 + 256 = 268 blocks long; longer
+files have to come from a real ext2 tool on the host side.
 
 ## Devices
 
-    /dev/sda   system disk, 2048 blocks x 256 B (512 KiB), mounted at /
+    /dev/sda   system disk, 1024 blocks x 1 KiB (1 MiB), mounted at /
     /dev/sdb   first imported or created disk, then sdc, sdd, ...
 
 Only sda exists at boot, holding the root tree and the installed programs;
@@ -94,6 +96,11 @@ Unmount before removing a disk: the kernel refuses a busy device with
 EBUSY. Writes past the end of a disk fail with ENOSPC, and a rename
 across devices fails with EXDEV — use cp for that.
 
+Before mounting, the host checks the geometry: block size, inode size and
+count, bitmap and inode-table positions must match this machine, because
+the CRX machine code holds those numbers as constants. A foreign layout is
+refused rather than half-read.
+
 ## Writeback
 
 There is no sync command. The kernel tracks a dirty flag and flushes
@@ -104,6 +111,7 @@ sync(2) still exists as call 17.
 ## Host transfer
 
 The Storage panel saves a device as <name>.img, a byte-for-byte copy with
-the superblock first, so sda exports as sda.img. Importing never overwrites
-a device: the image attaches as the next free name, and mismatching
-superblocks are refused.
+the superblock first, so sda exports as sda.img — a real ext2 image that
+e2fsck -fn, debugfs and loop mounts accept on Linux. Importing never
+overwrites a device: the image attaches as the next free name, and
+mismatching images (wrong magic, different block size) are refused.

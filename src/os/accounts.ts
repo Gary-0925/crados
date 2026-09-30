@@ -15,6 +15,7 @@
 //
 // 哈希只有 16 位，挡不住任何认真的攻击——这是教学系统，账户表的意义
 // 在于把"密码"和"权限"变成真实的盘上字段，而不是提供真正的安全。
+// 校验与写入都在 CRX 系统程序里（见 asmsrc.ts 的 hash_pass），宿主只认字段格式。
 
 export interface Account {
   name: string
@@ -24,29 +25,7 @@ export interface Account {
 }
 
 export const ROOT_NAME = 'root'
-export const MAX_ACCOUNTS = 24
 export const PERM_LETTERS = 'lmbka'
-
-export const accountNameOk = (name: string): boolean =>
-  /^[a-z][a-z0-9_-]{0,7}$/.test(name)
-
-export const sanitizePerms = (raw: string): string => {
-  let out = ''
-  for (const ch of raw) {
-    if (PERM_LETTERS.includes(ch) && !out.includes(ch)) out += ch
-  }
-  return out || '-'
-}
-
-// djb2 的 16 位变体：h = h*33 ^ c，模 2^16。空密码没有哈希。
-export const hashPassword = (pass: string): string => {
-  if (!pass) return '-'
-  let h = 5381
-  for (let i = 0; i < pass.length; i++) {
-    h = ((h * 33) ^ pass.charCodeAt(i)) & 0xffff
-  }
-  return String(h)
-}
 
 export const parsePasswd = (text: string): Account[] => {
   const out: Account[] = []

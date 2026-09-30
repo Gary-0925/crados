@@ -12,10 +12,11 @@ export interface DevSpec {
 
 export const SDA_INODES = 256
 
+// 盘上格式是 ext2：块大小 1 KiB（s_log_block_size = 0），sda 正好 1 MiB / 1024 块。
+// 一张块位图（1 KiB = 8192 位）覆盖整个块组，因此 8192 块是这套实现的自然上限。
 export const SPECS: Record<string, DevSpec> = {
   rom: { name: 'rom', model: 'CRADOS-FIRMWARE', blockSize: 1024, blockCount: 256, inodeCount: 64, removable: false },
-  // 一个 256 B 的块位图可寻址 2048 个块，因此 512 KiB 是当前 CRFS v1 的自然上限。
-  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 256, blockCount: 2048, inodeCount: SDA_INODES, removable: false },
+  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 1024, blockCount: 1024, inodeCount: SDA_INODES, removable: false },
 }
 
 // 导入的镜像按 sdb、sdc、sdd… 顺序占位，容量与根盘一致，便于整盘互换
@@ -42,11 +43,14 @@ export class BlockDev {
   readonly bytes: Uint8Array
   readonly blockSize: number
   readonly blockCount: number
+  /** 上一次持久化时的内容：回写时只写变化的块，不必每次重写整盘 */
+  readonly shadow: Uint8Array
 
   constructor(readonly spec: DevSpec) {
     this.blockSize = spec.blockSize
     this.blockCount = spec.blockCount
     this.bytes = new Uint8Array(spec.blockSize * spec.blockCount)
+    this.shadow = new Uint8Array(this.bytes.length)
   }
 
   get size(): number {
@@ -83,15 +87,20 @@ export class BlockDev {
   }
 }
 
-// ---------- 持久化：整盘字节以 base64 存入浏览器 ----------
+// ---------- 持久化：整盘按 16 KiB 分块存进浏览器 ----------
+//
+// ext2 的 sda 是 1 MiB，整盘 base64 之后约 1.37 MB；每秒重写一遍既浪费又容易顶到配额。
+// 因此按块存储 + 只写变化的分块：一次 sync 通常只碰几个分块。
 
-const KEY = (name: string) => `crados.dev.${name}`
-const INDEX_KEY = 'crados.disks'
+const CHUNK = 16 * 1024
+const KEY = (name: string, chunk: number) => `crados.dev.${name}.${chunk}`
+const INDEX_KEY = (name: string) => `crados.dev.${name}.chunks`
+const DISKS_KEY = 'crados.disks'
 
 // 记录曾经持久化过哪些可移动设备，重启后据此重新装载
 export function listStoredDisks(): string[] {
   try {
-    const raw = localStorage.getItem(INDEX_KEY)
+    const raw = localStorage.getItem(DISKS_KEY)
     const list = raw ? (JSON.parse(raw) as unknown) : []
     return Array.isArray(list) ? list.filter((n): n is string => typeof n === 'string') : []
   } catch {
@@ -101,7 +110,7 @@ export function listStoredDisks(): string[] {
 
 function setStoredDisks(names: string[]) {
   try {
-    localStorage.setItem(INDEX_KEY, JSON.stringify(names))
+    localStorage.setItem(DISKS_KEY, JSON.stringify(names))
   } catch {}
 }
 
@@ -127,20 +136,45 @@ const fromB64 = (s: string): Uint8Array => {
   return out
 }
 
+const chunkCount = (dev: BlockDev) => Math.ceil(dev.bytes.length / CHUNK)
+
 export function saveDev(dev: BlockDev): boolean {
+  const name = dev.spec.name
   try {
-    localStorage.setItem(KEY(dev.spec.name), toB64(dev.bytes))
+    const total = chunkCount(dev)
+    let written = 0
+    for (let c = 0; c < total; c++) {
+      const from = c * CHUNK
+      const to = Math.min(from + CHUNK, dev.bytes.length)
+      if (!differs(dev.bytes, dev.shadow, from, to)) continue
+      localStorage.setItem(KEY(name, c), toB64(dev.bytes.subarray(from, to)))
+      dev.shadow.set(dev.bytes.subarray(from, to), from)
+      written++
+    }
+    if (written) localStorage.setItem(INDEX_KEY(name), String(total))
+    if (written || total) rememberDisk(name)
     return true
   } catch {
     return false
   }
 }
 
+function differs(a: Uint8Array, b: Uint8Array, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (a[i] !== b[i]) return true
+  return false
+}
+
 export function loadDev(dev: BlockDev): boolean {
+  const name = dev.spec.name
   try {
-    const raw = localStorage.getItem(KEY(dev.spec.name))
-    if (!raw) return false
-    dev.load(fromB64(raw))
+    const total = Number(localStorage.getItem(INDEX_KEY(name)))
+    if (!Number.isInteger(total) || total <= 0) return false
+    for (let c = 0; c < total; c++) {
+      const raw = localStorage.getItem(KEY(name, c))
+      if (!raw) return false
+      dev.bytes.set(fromB64(raw), c * CHUNK)
+    }
+    dev.shadow.set(dev.bytes)
     return true
   } catch {
     return false
@@ -149,7 +183,9 @@ export function loadDev(dev: BlockDev): boolean {
 
 export function dropDev(name: string) {
   try {
-    localStorage.removeItem(KEY(name))
+    const total = Number(localStorage.getItem(INDEX_KEY(name))) || 0
+    for (let c = 0; c < total; c++) localStorage.removeItem(KEY(name, c))
+    localStorage.removeItem(INDEX_KEY(name))
   } catch {}
   forgetDisk(name)
 }

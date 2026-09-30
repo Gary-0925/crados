@@ -16,7 +16,8 @@ execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才�
 ## 文件系统
 
 sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有随系统
-发行的程序都在这块盘上。
+发行的程序都在这块盘上。它是一块**真的 ext2 卷**：从存储面板导出镜像，
+Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
 
     /bin        系统程序，每次上电安装到 sda
     /usr/man    本手册

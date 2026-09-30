@@ -29,6 +29,7 @@ export const MAX_PAGES = 16
 export const MAX_FDS = 8
 
 export const PCB_UID = 176
+export const PCB_MODE = 164 // CPU 模式字节（0 = 用户态，1 = 内核态）
 export const PCB_EUID = 178
 
 const O_STATE = 1
@@ -483,6 +484,24 @@ export class Process {
     return MAX_PAGES * PAGE_SIZE
   }
 
+  // 无分配版 PTE 读取：返回 (pfn | supervisor<<15)，未映射返回 -1。
+  // MMU 热路径用它代替 pteAt()，避免每次访存都新建一个对象。
+  pteBits(vpn: number): number {
+    if (vpn < 0 || vpn >= MAX_PAGES) return -1
+    const b = this.mem.bytes
+    const base = this.base
+    const raw = b[base + O_PAGES + vpn]
+    if (!(raw & PTE_VALID)) return -1
+    let pfn = raw & PTE_PFN
+    // 只有分配过 pfn >= 64 的页时才需要读两个高位掩码
+    if (b[base + O_PFN6] | b[base + O_PFN6 + 1] | b[base + O_PFN7] | b[base + O_PFN7 + 1]) {
+      const bit = 1 << vpn
+      if (this.u16(O_PFN6) & bit) pfn |= 64
+      if (this.u16(O_PFN7) & bit) pfn |= 128
+    }
+    return pfn | (raw & PTE_SUPERVISOR ? 0x8000 : 0)
+  }
+
   pteAt(vpn: number): { pfn: number; supervisor: boolean } | null {
     if (vpn < 0 || vpn >= MAX_PAGES) return null
     const raw = this.u8(O_PAGES + vpn)
@@ -492,13 +511,26 @@ export class Process {
 
   // 构造无状态访问器。Object 本身只承担总线接口，所有值都落在 Memory.bytes。
   createCpuState(): CpuState {
+    // 热路径：闭包直接捕获字节数组与本进程 PCB 基址。
+    // 访问器仍然只做 u16/u8 读写，但省掉 this.mem.bytes 这一层跳转。
+    const bytes = this.mem.bytes
+    const base = this.base
+    const rd16 = (off: number) => (bytes[base + off] << 8) | bytes[base + off + 1]
+    const wr16 = (off: number, v: number) => {
+      bytes[base + off] = (v >> 8) & 0xff
+      bytes[base + off + 1] = v & 0xff
+    }
+    const rd8 = (off: number) => bytes[base + off]
+    const wr8 = (off: number, v: number) => {
+      bytes[base + off] = v & 0xff
+    }
     const regs = {} as RegisterFile
     for (let i = 0; i < 8; i++) {
       const off = O_RBANK + i * 2
       Object.defineProperty(regs, i, {
         enumerable: true,
-        get: () => this.u16(off),
-        set: (v: number) => this.setU16(off, v & 0xffff),
+        get: () => rd16(off),
+        set: (v: number) => wr16(off, v & 0xffff),
       })
     }
 
@@ -506,61 +538,61 @@ export class Process {
     Object.defineProperties(state, {
       pc: {
         enumerable: true,
-        get: () => this.u16(O_PC),
-        set: (v: number) => this.setU16(O_PC, v & 0xffff),
+        get: () => rd16(O_PC),
+        set: (v: number) => wr16(O_PC, v & 0xffff),
       },
       sp: {
         enumerable: true,
-        get: () => this.u16(O_SP),
-        set: (v: number) => this.setU16(O_SP, v & 0xffff),
+        get: () => rd16(O_SP),
+        set: (v: number) => wr16(O_SP, v & 0xffff),
       },
       flag: {
         enumerable: true,
         get: () => {
-          const v = this.u16(O_FLAG)
+          const v = rd16(O_FLAG)
           return v === 0xffff ? -1 : v
         },
-        set: (v: number) => this.setU16(O_FLAG, v < 0 ? 0xffff : v > 0 ? 1 : 0),
+        set: (v: number) => wr16(O_FLAG, v < 0 ? 0xffff : v > 0 ? 1 : 0),
       },
       halted: {
         enumerable: true,
-        get: () => this.u8(O_HALTED) !== 0,
-        set: (v: boolean) => this.setU8(O_HALTED, v ? 1 : 0),
+        get: () => rd8(O_HALTED) !== 0,
+        set: (v: boolean) => wr8(O_HALTED, v ? 1 : 0),
       },
       mode: {
         enumerable: true,
-        get: () => (this.u8(O_MODE) ? 'kernel' : 'user'),
-        set: (v: 'user' | 'kernel') => this.setU8(O_MODE, v === 'kernel' ? 1 : 0),
+        get: () => (rd8(O_MODE) ? 'kernel' : 'user'),
+        set: (v: 'user' | 'kernel') => wr8(O_MODE, v === 'kernel' ? 1 : 0),
       },
       irqEnabled: {
         enumerable: true,
-        get: () => this.u8(O_IRQ_ENABLED) !== 0,
-        set: (v: boolean) => this.setU8(O_IRQ_ENABLED, v ? 1 : 0),
+        get: () => rd8(O_IRQ_ENABLED) !== 0,
+        set: (v: boolean) => wr8(O_IRQ_ENABLED, v ? 1 : 0),
       },
       pendingIrq: {
         enumerable: true,
-        get: () => this.u16(O_PENDING_IRQ),
-        set: (v: number) => this.setU16(O_PENDING_IRQ, v),
+        get: () => rd16(O_PENDING_IRQ),
+        set: (v: number) => wr16(O_PENDING_IRQ, v),
       },
       cause: {
         enumerable: true,
-        get: () => this.u16(O_CAUSE),
-        set: (v: number) => this.setU16(O_CAUSE, v),
+        get: () => rd16(O_CAUSE),
+        set: (v: number) => wr16(O_CAUSE, v),
       },
       ivtBase: {
         enumerable: true,
-        get: () => this.u16(O_IVT),
-        set: (v: number) => this.setU16(O_IVT, v),
+        get: () => rd16(O_IVT),
+        set: (v: number) => wr16(O_IVT, v),
       },
       ksp: {
         enumerable: true,
-        get: () => this.u16(O_KSP),
-        set: (v: number) => this.setU16(O_KSP, v),
+        get: () => rd16(O_KSP),
+        set: (v: number) => wr16(O_KSP, v),
       },
       usp: {
         enumerable: true,
-        get: () => this.u16(O_USP),
-        set: (v: number) => this.setU16(O_USP, v),
+        get: () => rd16(O_USP),
+        set: (v: number) => wr16(O_USP, v),
       },
     })
     return state

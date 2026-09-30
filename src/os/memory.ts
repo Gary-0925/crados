@@ -7,24 +7,35 @@ export const FRAME_COUNT = 256
 export const FRAME_BITMAP = 0x00e0
 // 0xFF00..0xFFFF 是 MMIO，内核文本不能伸进这扇窗口。
 export const MMIO_BASE = 0xff00
-export const KERNEL_TEXT_PAGES = 90
+export const KERNEL_TEXT_PAGES = 93   // ext2 层把内核撑大了：21 KiB 正文 + 数据
 // Low physical memory stores KCB/PCBs/device scratch. The CRX kernel lives at
 // the top of RAM, outside every 16-page user virtual address space.
-//   frame 0: KCB and the 32-byte frame bitmap; frame 1..12: 16 PCBs; frame 13: scratch
-//   frame 14..19: host-published tables (kmsg + device catalog)
-//   frame 20..163: user pages; frame 164..253: CRX kernel; frame 254..255: MMIO gap
-// Frames 14..19 are host-published tables the CRX kernel reads directly:
-// kmsg at 0x0E00 (4 pages) and the device catalog at 0x1200 (2 pages).
-export const RESERVED_FRAME = 14
-export const RESERVED_FRAMES = 6
-export const USER_FRAME_START = RESERVED_FRAME + RESERVED_FRAMES
-export const KMSG_BASE = RESERVED_FRAME * PAGE_SIZE
+//   frame 0     : KCB and the 32-byte frame bitmap
+//   frame 1..12 : 16 PCBs
+//   frame 13..15: spare
+//   frame 16..19: device scratch = one ext2 block (1 KiB)   -> 0x1000..0x13FF
+//   frame 20..23: host kmsg (u16 length, then text)         -> 0x1400..0x17FF
+//   frame 24..25: host device catalog (8 x 64 B)            -> 0x1800..0x19FF
+//   frame 26..161: user pages          frame 162..253: CRX kernel text
+//   frame 254..255: MMIO gap
+// 暂存区必须落在 VPN 16 以上：VPN 15 是每个进程的 supervisor 栈页，1 KiB 的块缓冲
+// 一旦压上去，栈上的返回地址就会被块数据冲掉。
+export const SCRATCH_FRAME = 16
+export const SCRATCH_SIZE = 1024
+export const KMSG_FRAME = SCRATCH_FRAME + SCRATCH_SIZE / PAGE_SIZE
+export const KMSG_BASE = KMSG_FRAME * PAGE_SIZE
 export const KMSG_SIZE = 4 * PAGE_SIZE
-export const DEVINFO_BASE = KMSG_BASE + KMSG_SIZE
+export const DEVINFO_FRAME = KMSG_FRAME + KMSG_SIZE / PAGE_SIZE
+export const DEVINFO_BASE = DEVINFO_FRAME * PAGE_SIZE
 export const DEVINFO_SLOTS = 8
 export const DEVINFO_STRIDE = 64
+export const RESERVED_FRAME = SCRATCH_FRAME
+export const RESERVED_FRAMES = DEVINFO_FRAME + (DEVINFO_SLOTS * DEVINFO_STRIDE) / PAGE_SIZE - SCRATCH_FRAME
+export const USER_FRAME_START = RESERVED_FRAME + RESERVED_FRAMES
 export const KERNEL_TEXT_FRAME = MMIO_BASE / PAGE_SIZE - KERNEL_TEXT_PAGES - 1
 export const RAM_SIZE = PAGE_SIZE * FRAME_COUNT
+/** 块控制器每次搬运一个设备块，落在这个物理地址上 */
+export const SCRATCH_BASE = SCRATCH_FRAME * PAGE_SIZE
 
 const enc = new TextEncoder()
 
