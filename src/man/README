@@ -16,7 +16,9 @@ page frames, and only then starts the CPU. Watch it in dmesg.
 ## Filesystem
 
 sda is the system disk, in the way C: is the system disk on Windows. It
-holds the root tree and every program that ships with the OS.
+holds the root tree and every program that ships with the OS, and it is a
+real ext2 volume: export it from the Storage panel and e2fsck, debugfs or
+mount -o loop on Linux will read it as-is.
 
     /bin        system programs, installed on sda at power-on
     /usr/man    these manuals

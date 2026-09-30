@@ -95,6 +95,33 @@ const TYPE_NAME: Record<number, 'dir' | 'file' | 'dev'> = { 1: 'file', 2: 'dir',
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s)
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: false })
 
+// 大文件不能再用 String.fromCharCode(...raw) 展开：参数一多就会爆栈。
+const CHUNK = 0x2000
+const latin1 = (raw: Uint8Array): string => {
+  let s = ''
+  for (let i = 0; i < raw.length; i += CHUNK) s += String.fromCharCode(...raw.subarray(i, i + CHUNK))
+  return s
+}
+
+// FNV-1a：用来判断文件内容是否真的变了，避免每帧重算反汇编
+const hashBytes = (b: Uint8Array): number => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < b.length; i++) {
+    h ^= b[i]
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
+
+// 目录树整棵重建的间隔（毫秒）。面板失效（invalidate）会立刻重建。
+const TREE_TTL_MS = 400
+
+interface FileView {
+  hash: number
+  data?: string
+  disasm?: string[]
+}
+
 function formatCall(sc: Syscall): string {
   switch (sc.call) {
     case 'yield': return 'yield()'
@@ -165,6 +192,10 @@ export class ControlPanel {
   private ipsAt = 0
   private ipsCount = 0
   private frame = 0
+  // 观测层的缓存：目录树很贵（每个可执行文件都要反汇编），没有变化就不重建
+  private readonly fileViews = new Map<string, FileView>()
+  private treeCache: FSNode | null = null
+  private treeAt = 0
 
   constructor(private readonly kernel: Kernel) {
     kernel.observer = {
@@ -191,6 +222,7 @@ export class ControlPanel {
   getSnapshot = (): Snapshot => this.snap
 
   invalidate() {
+    this.treeAt = 0 // 内容被改过：下次读取目录树时立刻重建
     this.refresh()
   }
 
@@ -219,6 +251,7 @@ export class ControlPanel {
     if ('err' in node)
       return { ino: 0, name: basename(path), type: 'file', size: 0, blocks: 0, exec: false, uid: 0, mode: '------', disk: '?', path, kids: [] }
     const fs = k.vfs.fsOf(node)
+    const key = `${node.dev.spec.name}:${node.ino}`
     const kids =
       node.type === T_DIR
         ? fs
@@ -228,8 +261,21 @@ export class ControlPanel {
         : []
 
     const raw = node.type === T_FILE && node.size <= fs.maxFileSize() ? fs.readBytes(node.ino) : null
-    const binary = raw ? isExecutable(String.fromCharCode(...raw.subarray(0, 4))) : false
-    const exe = binary && raw ? loadExe(String.fromCharCode(...raw)) : null
+    const binary = raw !== null && raw.length >= 4 && isExecutable(String.fromCharCode(raw[0], raw[1], raw[2], raw[3]))
+    let view: FileView | undefined
+    if (raw) {
+      const hash = hashBytes(raw)
+      view = this.fileViews.get(key)
+      if (!view || view.hash !== hash) {
+        const exe = binary ? loadExe(latin1(raw)) : null
+        view = {
+          hash,
+          data: !binary ? clip(UTF8_DECODER.decode(raw), 1600) : undefined,
+          disasm: exe ? disassemble(exe.image, exe.textLen, 48) : undefined,
+        }
+        this.fileViews.set(key, view)
+      }
+    }
     return {
       ino: node.ino,
       name: path === '/' ? '/' : basename(path),
@@ -241,8 +287,8 @@ export class ControlPanel {
       mode: modeText(node.mode),
       disk: node.dev.spec.name,
       path,
-      data: raw && !binary ? clip(UTF8_DECODER.decode(raw), 1600) : undefined,
-      disasm: exe ? disassemble(exe.image, exe.textLen, 48) : undefined,
+      data: view?.data,
+      disasm: view?.disasm,
       blockList: node.type === T_DEV ? undefined : fs.blocksOf(node.ino),
       kids,
     }
@@ -264,7 +310,7 @@ export class ControlPanel {
         frames[pte.pfn].owner = p.pid
       }
     }
-    return {
+    const snap = {
       currentPid: k.runningPid,
       procs: processes.map((p) => ({
         pid: p.pid,
@@ -298,7 +344,7 @@ export class ControlPanel {
       })),
       frames,
       mem: { total: m.total, used: m.used, free: m.free, framesUsed: m.framesUsed },
-      tree: this.tree('/'),
+
       fs: k.fsStats(),
       disks: k.blockDevices(),
       storageOk: k.storageReady,
@@ -308,6 +354,19 @@ export class ControlPanel {
       kmsgText: k.kmsg(),
       fgPid: k.foregroundPid,
       panic: k.panic,
-    }
+    } as Snapshot
+    // 目录树惰性构建：只有真正打开“存储”面板的渲染才会读到 tree。
+    // 并且在 TREE_TTL_MS 内复用上一次的结果，避免每个动画帧都反汇编整个 /bin。
+    Object.defineProperty(snap, 'tree', {
+      enumerable: true,
+      get: () => {
+        const now = performance.now()
+        if (this.treeCache && now - this.treeAt < TREE_TTL_MS) return this.treeCache
+        this.treeCache = this.tree('/')
+        this.treeAt = now
+        return this.treeCache
+      },
+    })
+    return snap
   }
 }

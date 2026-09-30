@@ -99,7 +99,7 @@ err:
     .asciz "page_alloc failed\\n"
 `
 
-export const BLOCK_S = `; block.s — read the sda superblock through the CRX MMIO driver
+export const BLOCK_S = `; block.s — read the first bytes of the sda superblock through the CRX MMIO driver
 ; block_read needs the 'b' permission letter (all factory accounts have it).
 ; build: as block.s -o block      run: ./block
 .text
@@ -121,8 +121,8 @@ _start:
 
     mov r0, 1
     mov r1, 1
-    mov r2, r4
-    mov r3, 4           ; CRFS magic
+    mov r2, r4          ; 超级块开头是 s_inodes_count
+    mov r3, 4
     sys
     mov r0, 1
     mov r1, 1

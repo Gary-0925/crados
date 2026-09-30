@@ -18,6 +18,7 @@ export interface Bus {
   limit: number
 }
 
+
 export class Fault extends Error {
   constructor(va: number, kind: string) {
     super(`${kind} at virtual address 0x${(va & 0xffff).toString(16).padStart(4, '0')}`)
@@ -44,7 +45,6 @@ export type CpuMode = 'user' | 'kernel'
 // The guest kernel uses compact vector numbers so its IVT fits in one page.
 export const VECTOR_SYSCALL = 0
 export const VECTOR_TIMER = 1
-export const VECTOR_FAULT = 2
 export const VECTOR_TTY = 3
 export const NO_IRQ = 0xffff
 const UTF8_ENCODER = new TextEncoder()
@@ -107,7 +107,18 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
     onRetire?.(retired)
     retired = 0
   }
-  const fetch = (at: number) => [bus.read(at), bus.read(at + 1), bus.read(at + 2), bus.read(at + 3)]
+  // 4 字节定长取指。原来每条指令都要分配一个 4 元素数组，改为复用外层变量：
+  // 定长指令集里没有任何指令会重入 fetch，复用是安全的。
+  let curOp = 0
+  let curRr = 0
+  let curHi = 0
+  let curLo = 0
+  const fetch = (at: number) => {
+    curOp = bus.read(at)
+    curRr = bus.read(at + 1)
+    curHi = bus.read(at + 2)
+    curLo = bus.read(at + 3)
+  }
   const push = (v: number) => {
     cpu.sp -= 2
     bus.write(cpu.sp, (v >> 8) & 0xff)
@@ -118,7 +129,8 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
     cpu.sp += 2
     return v
   }
-  const wrap = (v: number) => ((v % 0x10000) + 0x10000) % 0x10000
+  // 16 位回绕。加减乘和左移的结果按位与 0xffff 与取模等价，但省掉两次除法
+  const wrap = (v: number) => v & 0xffff
 
   const requireKernel = (op: string) => {
     if (cpu.mode !== 'kernel') throw new Fault(cpu.pc - WORD, `${op} privilege fault`)
@@ -183,10 +195,11 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
         enterInterrupt(vector)
       }
       if (cpu.pc < 0 || cpu.pc + WORD > bus.limit) throw new Fault(cpu.pc, 'instruction fetch fault')
-      const [op, rr, hi, lo] = fetch(cpu.pc)
-      const d = (rr >> 4) & 0xf
-      const s = rr & 0xf
-      const imm = (hi << 8) | lo
+      fetch(cpu.pc)
+      const op = curOp
+      const d = (curRr >> 4) & 0xf
+      const s = curRr & 0xf
+      const imm = (curHi << 8) | curLo
       if (d >= REGS || s >= REGS) throw new Fault(cpu.pc, 'invalid register operand')
       cpu.pc += WORD
       retired++
@@ -286,9 +299,11 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
         case OP.LDB:
           cpu.regs[d] = bus.read(wrap(cpu.regs[s] + imm))
           break
-        case OP.STB:
-          bus.write(wrap(cpu.regs[d] + imm), cpu.regs[s] & 0xff)
+        case OP.STB: {
+          const st = wrap(cpu.regs[d] + imm)
+          bus.write(st, cpu.regs[s] & 0xff)
           break
+        }
         case OP.LDW: {
           const at = wrap(cpu.regs[s] + imm)
           cpu.regs[d] = (bus.read(at) << 8) | bus.read(at + 1)
@@ -300,14 +315,16 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
           bus.write(at + 1, cpu.regs[s] & 0xff)
           break
         }
-        case OP.ULDB:
+        case OP.ULDB: {
           requireKernel('uldb')
           cpu.regs[d] = bus.readUser(wrap(cpu.regs[s] + imm))
           break
-        case OP.USTB:
+        }
+        case OP.USTB: {
           requireKernel('ustb')
           bus.writeUser(wrap(cpu.regs[d] + imm), cpu.regs[s] & 0xff)
           break
+        }
         case OP.PUSH:
           push(cpu.regs[d])
           break

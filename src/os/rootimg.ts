@@ -1,7 +1,8 @@
 // Builds the initial sda byte image from a declarative file table.
 
 import { BlockDev, SPECS } from './blockdev'
-import { applySystemPolicy, basename, CRFS, dirname, DRV_NULL, DRV_TTY, MODE_DIR, T_DEV, T_DIR, T_FILE, UID_ROOT } from './fs'
+import { applySystemPolicy, basename, dirname, DRV_NULL, DRV_TTY, FS, T_DEV, T_DIR, T_FILE } from './fs'
+import { ROOT_INO } from './ext2'
 import { serializePasswd, factoryAccounts } from './accounts'
 import { MAN_FILES } from '../man'
 import {
@@ -37,16 +38,14 @@ export interface RootImage {
 
 export function buildRootImage(): RootImage {
   const dev = new BlockDev(SPECS.sda)
-  const fs = new CRFS(dev)
+  const fs = new FS(dev)
   const errors: string[] = []
   fs.format(LABEL)
-  // 系统盘的根目录是 0755：只有 root 能在 / 下建删条目。
-  // （可移动盘 format 保持 1777+sticky，当公共暂存区用。）
-  fs.setFlags(1, MODE_DIR)
-  fs.setOwner(1, UID_ROOT)
+  // ext2 格式化出来的根目录就是 0755 / uid 0：只有 root 能在 / 下建删条目。
+  // （可移动盘 format 会额外把它设成 1777+sticky，当公共暂存区用。）
 
   const mkdirp = (path: string): number => {
-    let ino = 1
+    let ino = ROOT_INO
     for (const seg of path.split('/').filter(Boolean)) {
       const found = fs.lookup(ino, seg)
       if (found) {
@@ -89,6 +88,5 @@ export function buildRootImage(): RootImage {
   }
 
   applySystemPolicy(fs)
-  fs.markAccounts()
   return { bytes: dev.bytes, errors }
 }

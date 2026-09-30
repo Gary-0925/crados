@@ -95,6 +95,7 @@ export interface AsmResult {
   dataLen: number
   entry: number
   symbols: Record<string, number>
+  listing?: { line: number; op: number; d: number; s: number; imm: number | string }[]
   // 需要随映像装载基址调整的 16 位字，偏移相对于去掉 CRX header 后的 image。
   relocations: number[]
   errors: string[]
@@ -336,7 +337,7 @@ export function assemble(source: string): AsmResult {
   bytes.set(text, HEADER_SIZE)
   bytes.set(Uint8Array.from(data), HEADER_SIZE + text.length)
 
-  return { bytes, textLen, dataLen: data.length, entry, symbols, relocations, errors }
+  return { bytes, textLen, dataLen: data.length, entry, symbols, relocations, errors, listing: code }
 }
 
 export function isExecutable(data: string): boolean {

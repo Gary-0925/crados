@@ -2,10 +2,6 @@
 // 用户态程序只能通过 yield 一个 Syscall 对象陷入内核，与真实 CPU 的 int 0x80 对应
 
 export type PState = 'new' | 'ready' | 'running' | 'blocked' | 'zombie'
-export interface ReadBytes {
-  bytes: Uint8Array
-}
-
 export type Syscall =
   | { call: 'yield' }
   | { call: 'write'; fd: number; data: string | Uint8Array }
@@ -109,17 +105,6 @@ export const sys = {
   umount: (target: string): Syscall => ({ call: 'umount', target }),
   sync: (): Syscall => ({ call: 'sync' }),
   time: (): Syscall => ({ call: 'time' }),
-}
-
-export interface ProcInfo {
-  pid: number
-  ppid: number
-  uid: number
-  name: string
-  state: PState
-  cmd: string
-  pages: number
-  ticks: number
 }
 
 export interface BlkInfo {

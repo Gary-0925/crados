@@ -1,27 +1,31 @@
-// CRFS：一个真实的盘上文件系统，全部结构都是设备字节数组里的字段
+// 宿主侧文件系统层：在 ext2 之上提供系统需要的语义（类型、权限、属主、目录、设备节点）。
 //
-// 盘上布局
-//   block 0        超级块
-//   block 1        块位图（每 bit 一个块）
-//   block 2        inode 位图
-//   block 3..k     inode 表（每个 inode 48 字节）
-//   block k+1..    数据块
+// 盘上格式的真相全部在 ext2.ts 里，这里不复制任何一份磁盘结构：
+//   - 类型来自 i_mode 的 S_IFMT 位
+//   - 权限就是 POSIX 位（M_* 现在是 0o755 这种真实掩码）
+//   - 属主来自 i_uid，父目录来自目录里的 '..'
+//   - 设备节点的次设备号放在 i_block[0] 的低字节（和 Linux 的 dev_t 布局一致）
 //
-// 文件的起止怎么标记：inode 里有 12 个直接块指针和一个 16 位 size 字段。
-// 块指针给出文件占用了哪些块（不要求连续），size 给出最后一块用到第几字节。
-// 目录同样是文件，它的数据是一串 16 字节的目录项（inode 号 + 名字）。
+// 这里另外提供一个 VFS：挂载表 + 跨设备路径解析，模拟真实内核的 vfsmount 查找。
 
 import { BlockDev } from './blockdev'
+import {
+  BLOCK_SIZE,
+  Ext2,
+  NDIRECT,
+  NINDIRECT,
+  ROOT_INO,
+  S_IFBLK,
+  S_IFCHR,
+  S_IFDIR,
+  S_IFMT,
+  S_IFREG,
+  formatExt2,
+  modeType,
+} from './ext2'
 import type { Err } from './types'
 
-export const MAGIC = 0x43524653 // "CRFS"
-// inode 48 字节：头部 8 字节 + 20 个 16 位直接块指针，单文件上限 20 × 块大小
-export const INODE_SIZE = 48
-export const NDIRECT = 20
-export const DIRENT_SIZE = 16
-export const NAME_MAX = 14
-
-export const T_FREE = 0
+// 宿主内部使用的类型常量（对应 ext2 的 S_IFMT 类别）
 export const T_FILE = 1
 export const T_DIR = 2
 export const T_DEV = 3
@@ -30,54 +34,28 @@ export const T_DEV = 3
 export const DRV_TTY = 1
 export const DRV_NULL = 2
 
-// 超级块字段偏移
-const SB_MAGIC = 0
-const SB_BSIZE = 4
-const SB_BLOCKS = 6
-const SB_INODES = 8
-const SB_ITABLE = 10
-const SB_DATA = 12
-const SB_LABEL = 16
-const LABEL_MAX = 16
+// POSIX 权限位。原来的 CRFS 用一套自造的扁平标志，现在直接用真实掩码。
+export const M_EXEC = 0o100
+export const M_WRITE = 0o200
+export const M_READ = 0o400
+export const M_GEXEC = 0o010
+export const M_GWRITE = 0o020
+export const M_GREAD = 0o040
+export const M_OEXEC = 0o001
+export const M_OWRITE = 0o002
+export const M_OREAD = 0o004
+export const M_STICKY = 0o1000
+export const M_SETGID = 0o2000
+export const M_SETUID = 0o4000
 
-const I_TYPE = 0
-export const I_FLAGS = 1
-const I_SIZE = 2
-export const I_PARENT = 4
-const I_DRIVER = 6
-const I_PTR = 8
-
-// flags 字节。chmod 按掩码置位或清位。执行位分属主和其他人，显示顺序 rwxrwxst。
-export const M_EXEC = 0x01
-export const M_READ = 0x02
-export const M_WRITE = 0x04
-export const M_OREAD = 0x08
-export const M_OWRITE = 0x10
-export const M_SETUID = 0x20
-export const M_STICKY = 0x40
-export const M_OEXEC = 0x80
-
-export const MODE_FILE = M_READ | M_WRITE | M_OREAD // 0644
-export const MODE_DIR = M_EXEC | M_READ | M_WRITE | M_OREAD | M_OEXEC // 0755
-export const MODE_DEV = M_READ | M_WRITE | M_OREAD | M_OWRITE // 0666
-export const MODE_TMP = MODE_DIR | M_OWRITE | M_STICKY // 1777
+// 常用模式直接写八进制，和 ls -l / chmod 的读法一致，避免位名组合出错
+export const MODE_FILE = 0o644
+export const MODE_DIR = 0o755
+export const MODE_DEV = 0o666
+export const MODE_TMP = 0o1777
 
 export const UID_ROOT = 0
-export const UID_USER = 1
 export const UID_ROOT_NAME = 'root'
-export const UID_USER_NAME = 'user'
-
-// 超级块空闲区：偏移 14 是特性字，偏移 32 起每个 inode 一个大端 uid。
-// 64 × 2 = 128 字节，落在最小的 256 B 超级块里，不占用数据块。
-// 特性位：FEAT_CREDS 表示 inode 模式/属主已初始化；
-// FEAT_ACCOUNTS 表示账户表（/etc/passwd）已就位。
-const SB_FEAT = 14
-const FEAT_CREDS = 0x0001
-const FEAT_ACCOUNTS = 0x0002
-export const SB_UID = 32
-
-export const ITABLE_START = 3
-export const ITABLE_BYTE = ITABLE_START * 256
 
 export interface FNode {
   dev: BlockDev
@@ -94,8 +72,7 @@ export interface FNode {
 
 const _enc = new TextEncoder()
 const _dec = new TextDecoder('utf-8', { fatal: false })
-// 文件内容按 UTF-8 存储：字节与字符长度解耦，与块写入时的字节计数一致
-const enc = (s: string): Uint8Array => _enc.encode(s)
+const encodeText = (s: string): Uint8Array => _enc.encode(s)
 const dec = (b: Uint8Array): string => _dec.decode(b)
 
 export const normalizePath = (path: string, cwd: string): string => {
@@ -114,431 +91,282 @@ export const dirname = (abs: string): string => {
 }
 export const basename = (abs: string): string => abs.slice(abs.lastIndexOf('/') + 1)
 
-// ---------- 单个设备上的文件系统 ----------
+const errCode = (e: unknown): Err => {
+  const msg = e instanceof Error ? e.message : String(e)
+  const code = /^([A-Z]+):/.exec(msg)?.[1]
+  return { err: code ?? 'EINVAL' }
+}
 
-export class CRFS {
-  readonly itableStart: number
-  readonly dataStart: number
-  readonly inodeCount: number
+// ---------- 单个设备上的 ext2 文件系统 ----------
 
-  constructor(readonly dev: BlockDev) {
-    this.inodeCount = dev.spec.inodeCount
-    this.itableStart = ITABLE_START
-    const itableBlocks = Math.ceil((this.inodeCount * INODE_SIZE) / dev.blockSize)
-    this.dataStart = this.itableStart + itableBlocks
+export class FS {
+  private cached: Ext2 | null = null
+
+  constructor(readonly dev: BlockDev) {}
+
+  /**
+   * 空盘或坏盘上构造 ext2 会抛错，所以这里只做尝试；
+   * 所有操作都先过 valid()，没有通过就当设备上没有文件系统。
+   */
+  private tryExt(): Ext2 | null {
+    if (this.cached) return this.cached
+    try {
+      this.cached = new Ext2(this.dev.bytes)
+      return this.cached
+    } catch {
+      return null
+    }
   }
 
-  // mkfs：把设备清零并写入超级块、位图、根目录
-  format(label: string) {
-    this.dev.bytes.fill(0)
-    const d = this.dev
-    d.setU16(SB_MAGIC, MAGIC >>> 16)
-    d.setU16(SB_MAGIC + 2, MAGIC & 0xffff)
-    d.setU16(SB_BSIZE, d.blockSize)
-    d.setU16(SB_BLOCKS, d.blockCount)
-    d.setU16(SB_INODES, this.inodeCount)
-    d.setU16(SB_ITABLE, this.itableStart)
-    d.setU16(SB_DATA, this.dataStart)
-    const name = enc(label.slice(0, LABEL_MAX))
-    d.bytes.set(name, SB_LABEL)
-    for (let b = 0; b < this.dataStart; b++) this.setBlockBit(b, true) // 元数据区预占
-    const root = this.allocInode(T_DIR, 0)
-    if (root !== 1) throw new Error('mkfs: root inode must be 1')
-    this.setFlags(root, MODE_TMP)
-    this.markCreds()
-  }
-
-  // 只接受当前盘上布局。任何旧版容量或元数据布局都由调用方重新 mkfs。
   valid(): boolean {
-    if (((this.dev.u16(SB_MAGIC) << 16) | this.dev.u16(SB_MAGIC + 2)) >>> 0 !== MAGIC) return false
-    return (
-      this.dev.u16(SB_BSIZE) === this.dev.blockSize &&
-      this.dev.u16(SB_BLOCKS) === this.dev.blockCount &&
-      this.dev.u16(SB_INODES) === this.inodeCount &&
-      this.dev.u16(SB_ITABLE) === this.itableStart &&
-      this.dev.u16(SB_DATA) === this.dataStart
-    )
+    return this.tryExt() !== null
+  }
+
+  /** 抹掉这张盘，按 ext2 重新格式化；可移动盘出厂即 1777 的公共暂存区 */
+  format(label: string) {
+    const image = formatExt2({
+      blockCount: this.dev.blockCount,
+      inodeCount: this.dev.spec.inodeCount,
+      label: label || this.dev.spec.name,
+    })
+    if (this.dev.spec.removable) new Ext2(image).chmod(ROOT_INO, MODE_TMP)
+    this.dev.load(image)
+    this.cached = null
+  }
+
+  /**
+   * 盘上几何：CRX 内核要用 inode 表的字节偏移和 inode 总数来算偏移、验 inode 号。
+   * 宿主只发布这些数字，inode 里的字段仍是内核自己按字节读的。
+   */
+  layout(): { blockSize: number; inodeSize: number; inodeCount: number; inodeTableBlock: number; inodeTableByte: number } | null {
+    const e = this.tryExt()
+    if (!e) return null
+    return {
+      blockSize: e.blockSize,
+      inodeSize: e.inodeSize,
+      inodeCount: e.inodeCount,
+      inodeTableBlock: e.inodeTableBlock,
+      inodeTableByte: e.inodeTableBlock * e.blockSize,
+    }
   }
 
   label(): string {
-    return dec(this.dev.bytes.subarray(SB_LABEL, SB_LABEL + LABEL_MAX)).replace(/\0+$/, '')
+    return this.tryExt()?.statfs().label ?? ''
   }
 
-  credsReady(): boolean {
-    return (this.dev.u16(SB_FEAT) & FEAT_CREDS) !== 0
-  }
-  markCreds() {
-    this.dev.setU16(SB_FEAT, this.dev.u16(SB_FEAT) | FEAT_CREDS)
-  }
-  accountsReady(): boolean {
-    return (this.dev.u16(SB_FEAT) & FEAT_ACCOUNTS) !== 0
-  }
-  markAccounts() {
-    this.dev.setU16(SB_FEAT, this.dev.u16(SB_FEAT) | FEAT_ACCOUNTS)
+  get inodeCount(): number {
+    return this.tryExt()?.statfs().inodes ?? this.dev.spec.inodeCount
   }
 
-  // ---------- 位图 ----------
-
-  private bitAt(bitmapBlock: number, idx: number): boolean {
-    const at = bitmapBlock * this.dev.blockSize + (idx >> 3)
-    return (this.dev.u8(at) & (1 << (idx & 7))) !== 0
-  }
-  private setBit(bitmapBlock: number, idx: number, on: boolean) {
-    const at = bitmapBlock * this.dev.blockSize + (idx >> 3)
-    const cur = this.dev.u8(at)
-    this.dev.setU8(at, on ? cur | (1 << (idx & 7)) : cur & ~(1 << (idx & 7)))
-  }
   blockUsed(no: number): boolean {
-    return this.bitAt(1, no)
-  }
-  private setBlockBit(no: number, on: boolean) {
-    this.setBit(1, no, on)
+    return this.tryExt()?.isBlockUsed(no) ?? false
   }
   inodeUsed(ino: number): boolean {
-    return this.bitAt(2, ino)
-  }
-
-  private allocBlock(): number {
-    for (let b = this.dataStart; b < this.dev.blockCount; b++) {
-      if (!this.blockUsed(b)) {
-        this.setBlockBit(b, true)
-        this.dev.block(b).fill(0)
-        return b
-      }
-    }
-    return -1
-  }
-  private freeBlock(no: number) {
-    if (no <= 0) return
-    this.setBlockBit(no, false)
-    this.dev.block(no).fill(0)
-  }
-
-  // ---------- inode ----------
-
-  private inodeAt(ino: number): number {
-    return this.itableStart * this.dev.blockSize + ino * INODE_SIZE
-  }
-
-  private allocInode(type: number, parent: number): number {
-    for (let i = 1; i < this.inodeCount; i++) {
-      if (this.inodeUsed(i)) continue
-      this.setBit(2, i, true)
-      const at = this.inodeAt(i)
-      this.dev.bytes.fill(0, at, at + INODE_SIZE)
-      this.dev.setU8(at + I_TYPE, type)
-      this.dev.setU16(at + I_PARENT, parent)
-      const mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
-      this.dev.setU8(at + I_FLAGS, mode)
-      this.setOwner(i, UID_ROOT)
-      return i
-    }
-    return -1
+    return this.tryExt()?.isInodeUsed(ino) ?? false
   }
 
   itype(ino: number): number {
-    return this.dev.u8(this.inodeAt(ino) + I_TYPE)
+    const e = this.tryExt()
+    if (!e || ino <= 0 || !e.isInodeUsed(ino)) return 0
+    const t = modeType(e.readInode(ino).mode)
+    if (t === S_IFDIR) return T_DIR
+    if (t === S_IFCHR || t === S_IFBLK) return T_DEV
+    return T_FILE
   }
+
   isize(ino: number): number {
-    return this.dev.u16(this.inodeAt(ino) + I_SIZE)
+    const e = this.tryExt()
+    return e && ino > 0 && e.isInodeUsed(ino) ? e.readInode(ino).size : 0
   }
-  private setSize(ino: number, n: number) {
-    this.dev.setU16(this.inodeAt(ino) + I_SIZE, n)
-  }
+
+  /** 权限位（不含类型） */
   iflags(ino: number): number {
-    return this.dev.u8(this.inodeAt(ino) + I_FLAGS)
+    const e = this.tryExt()
+    return e && ino > 0 ? e.readInode(ino).mode & 0o7777 : 0
   }
   setFlags(ino: number, mode: number) {
-    if (!this.inodeOk(ino)) return
-    this.dev.setU8(this.inodeAt(ino) + I_FLAGS, mode & 0xff)
+    this.tryExt()?.chmod(ino, mode)
   }
   iexec(ino: number): boolean {
-    return (this.iflags(ino) & M_EXEC) !== 0
+    return (this.iflags(ino) & 0o111) !== 0
   }
   setExec(ino: number, on: boolean) {
-    const cur = this.iflags(ino)
-    this.setFlags(ino, on ? cur | M_EXEC : cur & ~M_EXEC)
+    const e = this.tryExt()
+    if (!e || ino <= 0) return
+    const mode = e.readInode(ino).mode & 0o7777
+    e.chmod(ino, on ? mode | 0o111 : mode & ~0o111)
   }
+
   iowner(ino: number): number {
-    return this.dev.u16(SB_UID + ino * 2)
+    const e = this.tryExt()
+    return e && ino > 0 && e.isInodeUsed(ino) ? e.readInode(ino).uid : 0
   }
   setOwner(ino: number, uid: number) {
-    if (!this.inodeOk(ino)) return
-    this.dev.setU16(SB_UID + ino * 2, uid)
+    this.tryExt()?.chown(ino, uid, 0)
   }
 
-  private inodeOk(ino: number): boolean {
-    return ino > 0 && ino < this.inodeCount
-  }
-
-  // 旧盘没有 uid 表。按类型补上模式，已有的执行位保留，属主先记为 root。
-  seedModes() {
-    for (let ino = 1; ino < this.inodeCount; ino++) {
-      if (!this.inodeUsed(ino)) continue
-      const type = this.itype(ino)
-      let mode = type === T_DIR ? MODE_DIR : type === T_DEV ? MODE_DEV : MODE_FILE
-      if (ino === 1) mode = MODE_TMP
-      if (this.iexec(ino)) mode |= M_EXEC | M_OEXEC
-      this.setFlags(ino, mode)
-      this.setOwner(ino, UID_ROOT)
-    }
-  }
+  /** ext2 的 inode 里没有父目录字段：父目录就是目录项 '..' */
   iparent(ino: number): number {
-    return this.dev.u16(this.inodeAt(ino) + I_PARENT)
+    const e = this.tryExt()
+    if (!e || ino <= 0 || this.itype(ino) !== T_DIR) return 0
+    return e.lookup(ino, '..')
   }
-  private setParent(ino: number, p: number) {
-    this.dev.setU16(this.inodeAt(ino) + I_PARENT, p)
-  }
+
   idriver(ino: number): number {
-    return this.dev.u8(this.inodeAt(ino) + I_DRIVER)
+    const e = this.tryExt()
+    return e && ino > 0 ? e.readInode(ino).ptr[0] & 0xff : 0
   }
   setDriver(ino: number, d: number) {
-    this.dev.setU8(this.inodeAt(ino) + I_DRIVER, d)
+    this.tryExt()?.setDevice(ino, d)
   }
 
-  ptr(ino: number, k: number): number {
-    return this.dev.u16(this.inodeAt(ino) + I_PTR + k * 2)
-  }
-  private setPtr(ino: number, k: number, b: number) {
-    this.dev.setU16(this.inodeAt(ino) + I_PTR + k * 2, b)
-  }
-
+  /** 该 inode 用到的数据块号（不含间接块自身） */
   blocksOf(ino: number): number[] {
-    const out: number[] = []
-    for (let k = 0; k < NDIRECT; k++) {
-      const b = this.ptr(ino, k)
-      if (b) out.push(b)
-    }
-    return out
+    return this.tryExt()?.dataBlocksOf(ino) ?? []
   }
 
   maxFileSize(): number {
-    return NDIRECT * this.dev.blockSize
+    return (NDIRECT + NINDIRECT) * BLOCK_SIZE
   }
-
-  // ---------- 文件数据：按块读写 ----------
 
   readBytes(ino: number): Uint8Array {
-    const size = this.isize(ino)
-    const out = new Uint8Array(size)
-    let at = 0
-    for (let k = 0; k < NDIRECT && at < size; k++) {
-      const b = this.ptr(ino, k)
-      if (!b) break
-      const chunk = this.dev.block(b)
-      const n = Math.min(chunk.length, size - at)
-      out.set(chunk.subarray(0, n), at)
-      at += n
-    }
-    return out
+    return this.tryExt()?.readFile(ino) ?? new Uint8Array(0)
   }
-
   read(ino: number): string {
     return dec(this.readBytes(ino))
   }
 
   writeBytes(ino: number, data: Uint8Array): number | Err {
+    const e = this.tryExt()
+    if (!e) return { err: 'ENOSPC' }
     if (data.length > this.maxFileSize()) return { err: 'EFBIG' }
-    const bs = this.dev.blockSize
-    const need = Math.ceil(data.length / bs)
-    const blocks = this.blocksOf(ino)
-    const missing = Math.max(0, need - blocks.length)
-    if (missing > this.freeBlocks()) return { err: 'ENOSPC' }
-
-    for (let i = 0; i < missing; i++) {
-      const block = this.allocBlock()
-      if (block < 0) return { err: 'ENOSPC' }
-      blocks.push(block)
+    try {
+      e.writeFile(ino, data)
+      return data.length
+    } catch (err) {
+      return errCode(err)
     }
-    for (let i = need; i < blocks.length; i++) this.freeBlock(blocks[i])
-    for (let i = 0; i < NDIRECT; i++) this.setPtr(ino, i, i < need ? blocks[i] : 0)
-    for (let i = 0; i < need; i++) {
-      this.dev.writeBlock(blocks[i], data.subarray(i * bs, (i + 1) * bs))
-    }
-    this.setSize(ino, data.length)
-    return data.length
   }
-
   write(ino: number, text: string): number | Err {
-    return this.writeBytes(ino, enc(text))
+    return this.writeBytes(ino, encodeText(text))
   }
 
-  readAt(ino: number, pos: number, len: number): Uint8Array {
-    const size = this.isize(ino)
-    const end = Math.min(size, pos + len)
-    if (pos >= end) return new Uint8Array(0)
-    const out = new Uint8Array(end - pos)
-    const bs = this.dev.blockSize
-    for (let at = pos; at < end; ) {
-      const k = Math.floor(at / bs)
-      const b = this.ptr(ino, k)
-      const inBlock = at % bs
-      const n = Math.min(bs - inBlock, end - at)
-      if (b) out.set(this.dev.block(b).subarray(inBlock, inBlock + n), at - pos)
-      at += n
+  /** 目录内容。'.' 与 '..' 不返回：调用方要的是"用户看得见的条目"。 */
+  entries(ino: number): { name: string; ino: number; type: number }[] {
+    const e = this.tryExt()
+    if (!e || this.itype(ino) !== T_DIR) return []
+    try {
+      return e
+        .listDir(ino)
+        .filter((x) => x.name !== '.' && x.name !== '..')
+        .map((x) => ({ name: x.name, ino: x.ino, type: this.itype(x.ino) }))
+    } catch {
+      return []
     }
-    return out
-  }
-
-  writeAt(ino: number, pos: number, data: Uint8Array): number | Err {
-    if (data.length === 0) return 0
-    const bs = this.dev.blockSize
-    const end = pos + data.length
-    if (end > this.maxFileSize()) return { err: 'EFBIG' }
-
-    const lastK = Math.ceil(end / bs) - 1
-    let needed = 0
-    for (let k = 0; k <= lastK; k++) if (!this.ptr(ino, k)) needed++
-    if (needed > this.freeBlocks()) return { err: 'ENOSPC' }
-
-    for (let k = 0; k <= lastK; k++) {
-      if (this.ptr(ino, k)) continue
-      const block = this.allocBlock()
-      if (block < 0) return { err: 'ENOSPC' }
-      this.setPtr(ino, k, block)
-    }
-
-    const oldSize = this.isize(ino)
-    for (let at = oldSize; at < pos; ) {
-      const block = this.ptr(ino, Math.floor(at / bs))
-      const inBlock = at % bs
-      const n = Math.min(bs - inBlock, pos - at)
-      this.dev.block(block).fill(0, inBlock, inBlock + n)
-      at += n
-    }
-
-    for (let at = pos; at < end; ) {
-      const b = this.ptr(ino, Math.floor(at / bs))
-      const inBlock = at % bs
-      const n = Math.min(bs - inBlock, end - at)
-      this.dev.block(b).set(data.subarray(at - pos, at - pos + n), inBlock)
-      at += n
-    }
-    if (end > this.isize(ino)) this.setSize(ino, end)
-    return data.length
-  }
-
-  truncate(ino: number) {
-    for (const b of this.blocksOf(ino)) this.freeBlock(b)
-    for (let k = 0; k < NDIRECT; k++) this.setPtr(ino, k, 0)
-    this.setSize(ino, 0)
-  }
-
-  // ---------- 目录项 ----------
-
-  entries(ino: number): { name: string; ino: number }[] {
-    const raw = this.readBytes(ino)
-    const out: { name: string; ino: number }[] = []
-    for (let at = 0; at + DIRENT_SIZE <= raw.length; at += DIRENT_SIZE) {
-      const child = (raw[at] << 8) | raw[at + 1]
-      if (!child) continue
-      const name = dec(raw.subarray(at + 2, at + DIRENT_SIZE)).replace(/\0+$/, '')
-      if (name) out.push({ name, ino: child })
-    }
-    return out
-  }
-
-  private writeEntries(ino: number, list: { name: string; ino: number }[]): number | Err {
-    const raw = new Uint8Array(list.length * DIRENT_SIZE)
-    list.forEach((e, i) => {
-      const at = i * DIRENT_SIZE
-      raw[at] = (e.ino >> 8) & 0xff
-      raw[at + 1] = e.ino & 0xff
-      raw.set(enc(e.name.slice(0, NAME_MAX)), at + 2)
-    })
-    return this.writeBytes(ino, raw)
   }
 
   lookup(dirIno: number, name: string): number {
-    for (const e of this.entries(dirIno)) if (e.name === name) return e.ino
-    return 0
-  }
-
-  link(dirIno: number, name: string, ino: number): 0 | Err {
-    const list = this.entries(dirIno)
-    if (list.some((e) => e.name === name)) return { err: 'EEXIST' }
-    list.push({ name, ino })
-    const r = this.writeEntries(dirIno, list)
-    return typeof r === 'number' ? 0 : r
-  }
-
-  unlink(dirIno: number, name: string): 0 | Err {
-    const list = this.entries(dirIno).filter((e) => e.name !== name)
-    const r = this.writeEntries(dirIno, list)
-    return typeof r === 'number' ? 0 : r
+    const e = this.tryExt()
+    if (!e || this.itype(dirIno) !== T_DIR) return 0
+    try {
+      return e.lookup(dirIno, name)
+    } catch {
+      return 0
+    }
   }
 
   create(dirIno: number, name: string, type: number): number | Err {
-    if (name.length > NAME_MAX) return { err: 'ENAMETOOLONG' }
-    if (this.lookup(dirIno, name)) return { err: 'EEXIST' }
-    const ino = this.allocInode(type, dirIno)
-    if (ino < 0) return { err: 'ENOSPC' }
-    const r = this.link(dirIno, name, ino)
-    if (r !== 0) {
-      this.setBit(2, ino, false)
-      return r
+    const e = this.tryExt()
+    if (!e) return { err: 'ENOSPC' }
+    try {
+      if (type === T_DIR) return e.mkdir(dirIno, name, MODE_DIR)
+      if (type === T_DEV) return e.create(dirIno, name, S_IFCHR | MODE_DEV)
+      return e.create(dirIno, name, S_IFREG | MODE_FILE)
+    } catch (err) {
+      return errCode(err)
     }
-    return ino
   }
 
-  destroy(ino: number) {
-    for (const b of this.blocksOf(ino)) this.freeBlock(b)
-    const at = this.inodeAt(ino)
-    this.dev.bytes.fill(0, at, at + INODE_SIZE)
-    this.setBit(2, ino, false)
+  unlink(dirIno: number, name: string): 0 | Err {
+    const e = this.tryExt()
+    if (!e) return { err: 'ENOENT' }
+    try {
+      e.unlink(dirIno, name)
+      return 0
+    } catch (err) {
+      return errCode(err)
+    }
   }
 
-  reparent(ino: number, parent: number) {
-    this.setParent(ino, parent)
+  rename(oldDir: number, oldName: string, newDir: number, newName: string): 0 | Err {
+    const e = this.tryExt()
+    if (!e) return { err: 'ENOENT' }
+    try {
+      e.rename(oldDir, oldName, newDir, newName)
+      return 0
+    } catch (err) {
+      return errCode(err)
+    }
   }
-
-  // ---------- 统计 ----------
 
   usedBlocks(): number {
-    let n = 0
-    for (let b = 0; b < this.dev.blockCount; b++) if (this.blockUsed(b)) n++
-    return n
+    const s = this.tryExt()?.statfs()
+    return s ? s.blocks - s.freeBlocks : 0
   }
   freeBlocks(): number {
-    return this.dev.blockCount - this.usedBlocks()
+    return this.tryExt()?.statfs().freeBlocks ?? 0
   }
   usedInodes(): number {
-    let n = 0
-    for (let i = 1; i < this.inodeCount; i++) if (this.inodeUsed(i)) n++
-    return n
+    const s = this.tryExt()?.statfs()
+    return s ? s.inodes - s.freeInodes : 0
   }
 
-  // 块地图：供窥探面板标注每一块的用途
+  /** /etc/passwd 是否已就位（账户表的"已初始化"标志就隐含在这张表本身） */
+  accountsReady(): boolean {
+    const ino = lookupAbs(this, '/etc/passwd')
+    return ino !== 0 && this.isize(ino) > 0
+  }
+
+  /** 存储面板用的块用途图：元数据、位图、inode 表、目录、文件、空闲 */
   blockMap(): { no: number; kind: string; label: string }[] {
-    const map = Array.from({ length: this.dev.blockCount }, (_, no) => ({
-      no,
-      kind: this.blockUsed(no) ? 'data' : 'free',
-      label: this.blockUsed(no) ? 'allocated' : 'free',
-    }))
-    map[0] = { no: 0, kind: 'super', label: 'superblock' }
-    map[1] = { no: 1, kind: 'bitmap', label: 'block bitmap' }
-    map[2] = { no: 2, kind: 'bitmap', label: 'inode bitmap' }
-    for (let b = this.itableStart; b < this.dataStart; b++)
-      map[b] = { no: b, kind: 'itable', label: `inode table ${b - this.itableStart}` }
-    for (let ino = 1; ino < this.inodeCount; ino++) {
-      if (!this.inodeUsed(ino)) continue
-      const type = this.itype(ino)
-      const blocks = this.blocksOf(ino)
-      blocks.forEach((b, k) => {
-        map[b] = {
-          no: b,
-          kind: type === T_DIR ? 'dir' : 'file',
-          label: `inode ${ino} ${type === T_DIR ? 'dirents' : 'data'} block ${k}`,
-        }
-      })
+    const out: { no: number; kind: string; label: string }[] = []
+    for (let b = 0; b < this.dev.blockCount; b++) out.push({ no: b, kind: 'free', label: '' })
+    const e = this.tryExt()
+    if (!e) return out
+    const mark = (no: number, kind: string, label: string) => {
+      if (no >= 0 && no < out.length) out[no] = { no, kind, label }
     }
-    return map
+    mark(0, 'super', 'boot block')
+    mark(1, 'super', 'superblock (s_magic 0xEF53)')
+    mark(2, 'super', 'block group descriptor')
+    mark(e.blockBitmapBlock, 'bitmap', `block bitmap (${e.blockCount} bits)`)
+    mark(e.inodeBitmapBlock, 'bitmap', `inode bitmap (${e.inodeCount} bits)`)
+    for (let b = e.inodeTableBlock; b < e.inodeTableBlock + Math.ceil((e.inodesPerGroup * e.inodeSize) / BLOCK_SIZE); b++) {
+      mark(b, 'itable', 'inode table')
+    }
+    for (let ino = 1; ino <= e.inodeCount; ino++) {
+      if (!e.isInodeUsed(ino)) continue
+      const inode = e.readInode(ino)
+      if (modeType(inode.mode) === S_IFCHR || modeType(inode.mode) === S_IFBLK) continue
+      const kind = modeType(inode.mode) === S_IFDIR ? 'dir' : 'file'
+      const label = `${this.pathOfQuiet(ino)} (inode ${ino})`
+      for (const b of e.dataBlocksOf(ino)) mark(b, kind, label)
+      if (inode.ptr[NDIRECT]) mark(inode.ptr[NDIRECT], 'data', `indirect block for inode ${ino}`)
+    }
+    return out
+  }
+
+  private pathOfQuiet(ino: number): string {
+    try {
+      return this.tryExt()?.pathOf(ino) ?? '?'
+    } catch {
+      return '?'
+    }
   }
 }
 
-// 单设备上的绝对路径。不看挂载表，迁移和造根盘镜像时用。
-export function lookupAbs(fs: CRFS, path: string): number {
-  let ino = 1
+export function lookupAbs(fs: FS, path: string): number {
+  let ino = ROOT_INO
   for (const seg of path.split('/').filter(Boolean)) {
     const next = fs.lookup(ino, seg)
     if (!next) return 0
@@ -547,53 +375,34 @@ export function lookupAbs(fs: CRFS, path: string): number {
   return ino
 }
 
-// 系统盘权限策略：/tmp 对所有人可写（1777 + sticky，sticky 让人删不掉
-// 别人的文件）；/etc 与其下的账户表、根目录之外的系统目录保持 0755。
-// 调用前 inode 模式应已按类型填好。账户的家目录由 useradd 负责创建。
-export function applySystemPolicy(fs: CRFS) {
+/**
+ * 系统盘权限策略。ext2 格式化时目录已经是 0755、文件 0644，这里只补那些
+ * "出厂设置里没有、但语义上必须存在"的例外：/tmp 是 1777 的公共暂存区
+ * （sticky 位让普通用户删不掉别人的文件）。
+ */
+export function applySystemPolicy(fs: FS) {
   const tmp = lookupAbs(fs, '/tmp')
-  if (tmp) {
+  if (tmp && fs.itype(tmp) === T_DIR) {
     fs.setOwner(tmp, UID_ROOT)
     fs.setFlags(tmp, MODE_TMP)
   }
-  const etc = lookupAbs(fs, '/etc')
-  if (etc) {
-    fs.setOwner(etc, UID_ROOT)
-    fs.setFlags(etc, MODE_DIR)
-  }
-  const passwd = lookupAbs(fs, '/etc/passwd')
-  if (passwd) {
-    fs.setOwner(passwd, UID_ROOT)
-    fs.setFlags(passwd, MODE_FILE) // 0644：哈希很弱，这是教学系统
-  }
-  const home = lookupAbs(fs, '/home')
-  if (home) {
-    fs.setOwner(home, UID_ROOT)
-    fs.setFlags(home, MODE_DIR)
-  }
-  const roothome = lookupAbs(fs, '/root')
-  if (roothome) {
-    fs.setOwner(roothome, UID_ROOT)
-    fs.setFlags(roothome, MODE_DIR)
-  }
-  const ubin = lookupAbs(fs, '/usr/bin')
-  if (ubin) {
-    fs.setOwner(ubin, UID_ROOT)
-    fs.setFlags(ubin, MODE_DIR)
-  }
 }
 
+/** 标准 ls -l 风格的 9 字符权限串 */
 export function modeText(mode: number): string {
   const bit = (mask: number, ch: string) => ((mode & mask) !== 0 ? ch : '-')
+  const ownerX = (mode & M_EXEC) !== 0 ? ((mode & M_SETUID) !== 0 ? 's' : 'x') : (mode & M_SETUID) !== 0 ? 'S' : '-'
+  const otherX = (mode & M_OEXEC) !== 0 ? ((mode & M_STICKY) !== 0 ? 't' : 'x') : (mode & M_STICKY) !== 0 ? 'T' : '-'
   return (
     bit(M_READ, 'r') +
     bit(M_WRITE, 'w') +
-    bit(M_EXEC, 'x') +
+    ownerX +
+    bit(M_GREAD, 'r') +
+    bit(M_GWRITE, 'w') +
+    bit(M_GEXEC, 'x') +
     bit(M_OREAD, 'r') +
     bit(M_OWRITE, 'w') +
-    bit(M_OEXEC, 'x') +
-    bit(M_SETUID, 's') +
-    bit(M_STICKY, 't')
+    otherX
   )
 }
 
@@ -601,13 +410,13 @@ export function modeText(mode: number): string {
 
 export interface Mount {
   path: string
-  fs: CRFS
+  fs: FS
 }
 
 export class VFS {
   readonly mounts: Mount[] = []
 
-  mount(path: string, fs: CRFS) {
+  mount(path: string, fs: FS) {
     this.mounts.push({ path, fs })
     this.mounts.sort((a, b) => b.path.length - a.path.length)
   }
@@ -632,7 +441,7 @@ export class VFS {
     const abs = normalizePath(path, cwd)
     const m = this.owner(abs)
     const rel = abs.slice(m.path === '/' ? 0 : m.path.length) || '/'
-    let ino = 1
+    let ino = ROOT_INO
     let name = m.path === '/' ? '/' : basename(m.path)
     if (rel !== '/') {
       for (const seg of rel.slice(1).split('/')) {
@@ -647,7 +456,7 @@ export class VFS {
     return this.node(m.fs, ino, name, abs)
   }
 
-  node(fs: CRFS, ino: number, name: string, path: string): FNode {
+  node(fs: FS, ino: number, name: string, path: string): FNode {
     return {
       dev: fs.dev,
       ino,
@@ -662,11 +471,11 @@ export class VFS {
     }
   }
 
-  fsOf(node: FNode): CRFS {
+  fsOf(node: FNode): FS {
     return this.mounts.find((m) => m.fs.dev === node.dev)!.fs
   }
 
-  fsFor(abs: string): CRFS {
+  fsFor(abs: string): FS {
     return this.owner(abs).fs
   }
 
@@ -675,3 +484,9 @@ export class VFS {
     return this.mounts.some((m) => m.path === abs && m.path !== '/')
   }
 }
+
+// 设备类型判定：面板与内核都用得上
+export const isDevice = (type: number): boolean => type === T_DEV
+export const isDir = (type: number): boolean => type === T_DIR
+export const isFile = (type: number): boolean => type === T_FILE
+export const S_IFMT_MASK = S_IFMT
