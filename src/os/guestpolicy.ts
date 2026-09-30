@@ -587,11 +587,26 @@ gp_chdir:
     cmp r0, 65535
     je gp_fail
     mov r4, 0
-    stw [r4+0x0056], r0
+    stw [r4+0x0056], r0     ; 目标 inode
     mov r1, r0
     call vfs_type
     cmp r0, 2
-    jne gp_fail
+    jne gp_fail             ; 只能进目录
+    mov r4, 0
+    ldw r1, [r4+0x0056]
+    mov r2, ${M_EXEC}
+    mov r3, ${M_OEXEC}
+    call vfs_may
+    cmp r0, 0
+    jne gp_fail             ; 进目录要有搜索权
+    mov r4, 0
+    ldw r6, [r4+0x0056]     ; 新 cwd inode
+    ldw r7, [r4+0x0040]     ; 新 cwd 所在设备
+    call current_pcb
+    stb [r5+22], r7
+    stb [r5+23], r6
+    mov r0, 0
+    iret
 
 gp_mkdir:
     mov r2, 2

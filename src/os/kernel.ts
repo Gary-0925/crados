@@ -471,6 +471,7 @@ export class Kernel {
       }
 
       let cur = this.procs.get(this.currentPid) ?? null
+      this.wakeWaiters(cur)
       // 客户内核的阻塞序列是「先把自己标 BLOCKED，再 do_schedule 更新
       // kCurrentPid」。时间片边界可能正好切进这个窗口：此时 kCurrentPid
       // 仍指向已标 BLOCKED 的当前进程。必须让它继续跑完这段原子序列
@@ -785,9 +786,24 @@ export class Kernel {
     }
   }
 
+  // 找一个空闲 PCB 槽。表满时先回收「没人会再 wait 的僵尸」：后台作业（命令后跟 &）
+  // 的父进程只把自己标回读键盘，永远不会 wait 那个 pid，僵尸就永久占着槽位——攒到
+  // 十几个后台命令之后连 echo 都跑不起来（sh: command not found）。这里只在实在没
+  // 槽位时兜底：正在等这个 pid 的父进程一律不动，避免抢掉 wait 的状态。
   private freeSlot(): number {
     for (let s = 0; s < MAX_PROCS; s++) {
       if (![...this.procs.values()].some((p) => p.slot === s)) return s
+    }
+    for (const z of this.procs.values()) {
+      if (z.state !== 'zombie') continue
+      const parent = this.procs.get(z.ppid)
+      const awaited =
+        !!parent && (parent.waitFor === -1 || parent.waitFor === z.pid) && parent.state === 'blocked' && parent.readStdin === false
+      if (awaited) continue
+      this.log(`sched: reclaiming abandoned zombie pid ${z.pid} (${z.name}) to free a PCB slot`)
+      z.release()
+      this.procs.delete(z.pid)
+      return z.slot
     }
     return -1
   }
@@ -951,6 +967,25 @@ export class Kernel {
     const parent = this.procs.get(child.ppid)
     if (parent && parent.state === 'blocked' && (parent.waitFor === -1 || parent.waitFor === child.pid)) {
       parent.state = 'ready'
+    }
+  }
+
+  // 丢失唤醒补偿（wait）：客户内核在 wait 里的序列是「扫 PCB 表 → 没找到僵尸
+  // 就把自己标 BLOCKED」。如果子进程恰好在这两步之间退出，tryReap 看到的父进程
+  // 还是 RUNNING，唤醒条件不成立；父进程随后睡在一个已经不存在的等待上，永远
+  // 不会醒来（终端只剩回显，提示符再也不出现）。每个时间片扫一遍：阻塞中的进程
+  // 只要有一个已存在的僵尸子进程正好是它等的，就补一次唤醒。
+  private wakeWaiters(current: Process | null): void {
+    for (const p of this.procs.values()) {
+      // 阻塞在读键盘的进程不算在等子进程：它的 waitFor 只是上一次 wait 留下的旧值，
+      // 拿它去唤醒会让读端空转（唤醒→又读不到输入→再阻塞）。
+      if (p === current || p.state !== 'blocked' || p.waitFor === null || p.readStdin) continue
+      for (const c of this.procs.values()) {
+        if (c.state === 'zombie' && c.ppid === p.pid && (p.waitFor === -1 || p.waitFor === c.pid)) {
+          p.state = 'ready'
+          break
+        }
+      }
     }
   }
 

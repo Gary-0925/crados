@@ -84,6 +84,21 @@ const session: Array<[string, RegExp]> = [
   ['ps', /\/bin\/init/],
   ['lsblk', /sda\s+1048576\s+disk\s+\//],
   ['dmesg', /sched: pid \d+ \(\w+\) exited/],
+  // 相对路径与 cd：ino_in_range 一度把 r6（vfs_resolve 的当前 inode）冲掉，
+  // 于是所有相对路径都解析成 inode 0xFFFF，cd 到哪都不动
+  ['mkdir /tmp/rt', /root@crados:\/root\$/],
+  ['cd /tmp/rt', /root@crados:\/tmp\/rt\$/],
+  ['echo hi > rel.txt', /root@crados:\/tmp\/rt\$/],
+  ['cat rel.txt', /(^|\n)hi(\s|$)/],
+  ['mkdir sub', /root@crados:\/tmp\/rt\$/],
+  ['cd sub', /root@crados:\/tmp\/rt\/sub\$/],
+  ['cat ../rel.txt', /(^|\n)hi(\s|$)/],
+  ['ls ..', /rel\.txt/],
+  ['ls .', /\.\./],
+  ['cd ..', /root@crados:\/tmp\/rt\$/],
+  ['pwd', /(^|\n)\/tmp\/rt(\s|$)/],
+  ['cd .', /root@crados:\/tmp\/rt\$/],
+  ['cd /root', /root@crados:\/root\$/],
   // 账户与 su：一次性 login 必须能和控制台登录循环并存（曾经被单例判据挡死）
   ['useradd alice', /root@crados/],
   ['su', /root@crados:\/root\$/],
@@ -110,7 +125,34 @@ for (const [cmd, expect] of session) {
 
 check('会话结束仍然没有 panic', k.panic === null, k.panic ?? '')
 
-// ---------- 3. 观测层 ----------
+// ---------- 3. 后台作业留下的僵尸 ----------
+// 后台命令（尾随 &）没有 wait，僵尸会一直占着 PCB 槽位：攒到十几个之后
+// 进程表满，连 echo 都起不来（sh: command not found）。槽位分配器要能回收
+// 「没人会再 wait」的僵尸。
+for (let i = 0; i < 14; i++) {
+  type('ls /bin &')
+  settle()
+}
+type('echo alive-after-bg')
+settle()
+const bgTail = consoleText().slice(-200)
+check('十几个后台作业之后还能起新进程', /(^|\n)alive-after-bg(\s|$)/.test(bgTail), JSON.stringify(bgTail.slice(-60)))
+
+// 丢失唤醒不变式：阻塞中的进程不该有「已经在等它的僵尸子进程」——
+// 子进程若在「父进程扫完 PCB 表、还没标 BLOCKED」的窗口里退出，唤醒会丢，
+// 父进程（通常就是 shell）会永远停在等待上，提示符再也不出现。
+const alive = k.processes()
+const zombies = alive.filter((p) => p.state === 'zombie')
+const stuck = alive.filter(
+  (p) =>
+    p.state === 'blocked' &&
+    !p.readStdin &&
+    p.waitFor !== null &&
+    zombies.some((z) => z.ppid === p.pid && (p.waitFor === -1 || z.pid === p.waitFor)),
+)
+check('没有进程卡在丢失唤醒的等待上', stuck.length === 0, stuck.map((p) => `${p.pid}:${p.name} 等 ${p.waitFor}`).join(', '))
+
+// ---------- 4. 观测层 ----------
 const cp = new ControlPanel(k)
 const snap = cp.getSnapshot()
 check('快照包含 4 个以上进程', snap.procs.length >= 4, `${snap.procs.length}`)

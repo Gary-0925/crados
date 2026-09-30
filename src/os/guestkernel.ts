@@ -3,7 +3,7 @@
 // 运行在 supervisor 特权模式下。
 // 内存布局 (Physical Memory Layout):
 //   0x0000..0x003F : Kernel Control Block (KCB)
-//     0x0000..0x001D : 引导标语 "crados 3.4\n"
+//     0x0000..0x001D : 引导标语 "crados 4.0\n"
 //     0x001E : k_text_pfn (u16)，用户帧扫描上界
 //     0x0020 : k_current_pid (u16)
 //     0x0022 : k_current_slot (u16)
@@ -834,11 +834,11 @@ vfs_u_fail:
 ino_in_range:
     cmp r1, 2
     jlt ino_in_range_no
-    mov r6, 0
-    ldw r6, [r6+0x004C]
-    cmp r6, 0
+    mov r0, 0
+    ldw r0, [r0+0x004C]     ; inode 总数；借 r0 当临时量：调用方可能正用 r6 存结果
+    cmp r0, 0
     je ino_in_range_no
-    cmp r1, r6
+    cmp r1, r0
     jgt ino_in_range_no
     mov r0, 0
     ret
