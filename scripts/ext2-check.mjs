@@ -3,7 +3,7 @@
 //   npm run ext2
 //
 // 双向验证：
-//   1. 用 src/os/ext2.ts 造一张 1 MiB 的盘 → e2fsck -fn 必须干净、debugfs 能读
+//   1. 用 os/ext2.ts 造一张 1 MiB 的盘 → e2fsck -fn 必须干净、debugfs 能读
 //   2. 用真的 mkfs.ext2 造一张同样的盘 → 我们的解析器必须能读出来（字段、目录、文件）
 //
 // e2fsck/debugfs/mkfs.ext2 来自 e2fsprogs；没装的机器上会跳过对应用例并明确报出来。
@@ -207,7 +207,7 @@ if (has(tools.debugfs)) {
 const binIno = lookupAbs(rootFs, '/bin')
 check('/bin 在出厂镜像里且是目录', binIno !== 0 && rootFs.itype(binIno) === T_DIR, String(binIno))
 for (const e of rootFs.entries(binIno)) rootFs.unlink(binIno, e.name)
-const { assemble } = await bundle('src/os/isa.ts')
+const { assemble } = await bundle('src/hw/isa.ts')
 const asmSrc = await bundle('src/os/asmsrc.ts')
 for (const [name, src] of Object.entries(asmSrc.ASM_PROGRAMS)) {
   const built = assemble(src)
@@ -243,11 +243,11 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
   }
   const guest = new Kernel()
   // 引导异步：现做一张出厂盘就行（这里要验的是 guest 写盘，不是恢复存档）
-  const guestBoot = await guest.boot({ kind: 'fresh' })
+  const guestBoot = await guest.machine.powerOn({ kind: 'blank' })
   if (guestBoot) check('guest 机器启动', false, guestBoot)
   // 控制台安静下来就算跑完：这些命令里有位图扫描，固定 tick 数会白等很久
   const fingerprint = () => {
-    const ls = guest.consoleLines()
+    const ls = guest.machine.console.screen()
     return `${ls.length}|${ls.slice(-2).map((l) => l.segs.map((s) => s.t).join('')).join('\u0001')}`
   }
   const quiet = (quietTicks = 25, max = 20000) => {
@@ -286,7 +286,7 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
     type(cmd)
     quiet()
   }
-  const guestImage = guest.diskImage('sda')
+  const guestImage = guest.machine.disks.image('sda')
   const guestPath = path.join(tmp, 'guest.sda')
   fs.writeFileSync(guestPath, Buffer.from(guestImage))
   check('guest 写盘后能取到整盘字节', guestImage.length === 1024 * 1024, `${guestImage.length} B`)

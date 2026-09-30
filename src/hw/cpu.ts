@@ -1,23 +1,36 @@
-// 用户态 CPU：取指 → 译码 → 执行，取指经页表翻译访问真实物理内存
-// 每次被内核唤醒执行若干条指令，遇到 sys 指令即陷入内核（与原生程序同一 ABI）
+// 虚拟硬件：用户态 CPU。取指 → 译码 → 执行，取指经页表翻译访问真实物理内存。
+//
+// CPU 只产生三种陷出（HwCall），不认识任何调用号的含义——号段是这台机器与操作
+// 系统之间的约定，由 os/kernel.ts 解释：
+//   yield  时间片让出（sched 指令，或一段指令执行完）
+//   halt   hlt 指令：CPU 停机，r1 是退出码
+//   svc    svc 指令：r0 = 调用号，r1..r3 = 参数
+// 恢复执行时宿主把返回值交给生成器的 next()：数字写回 r0，错误对象写 0xFFFF。
 
-import { OP, REGS, WORD } from './isa'
-import { sys } from './types'
-import type { Gen, Syscall } from './types'
+import { OP, REGS, WORD } from '@/hw/isa'
 
 // 一个宿主调度周期内执行足够多的 Guest 指令，使中断处理程序可以在下一次
 // 20Hz timer 到达前完成。原来的 8 条会让数百条指令的 timer handler 永远
 // 追不上硬件时钟，形成 interrupt storm，用户态完全饥饿。
 export const INSTR_PER_SLICE = 2048
 
-export interface Bus {
+/** CPU 陷出：交给这台机器上跑着的软件（操作系统）处理 */
+export type HwCall =
+  | { call: 'yield' }
+  | { call: 'halt'; code: number }
+  | { call: 'svc'; num: number; a1: number; a2: number; a3: number }
+
+/** 一个进程的执行载体：不断陷出、被操作系统唤醒的生成器 */
+export type CpuProgram = Generator<HwCall, unknown, unknown>
+
+/** CPU 眼中的总线：按用户地址空间读写内存，并给出能取指的上界 */
+export interface MemoryBus {
   read(va: number): number
   write(va: number, byte: number): void
   readUser(va: number): number
   writeUser(va: number, byte: number): void
   limit: number
 }
-
 
 export class Fault extends Error {
   constructor(va: number, kind: string) {
@@ -42,12 +55,12 @@ export interface CpuState {
 
 export type CpuMode = 'user' | 'kernel'
 
-// The guest kernel uses compact vector numbers so its IVT fits in one page.
+// 中断向量是硬连线：syscall 走 0，定时器走 1，键盘/串口走 3，
+// 这样 CRX 内核的中断向量表能装进一页。0xFFFF 表示"没有待处理中断"。
 export const VECTOR_SYSCALL = 0
 export const VECTOR_TIMER = 1
 export const VECTOR_TTY = 3
 export const NO_IRQ = 0xffff
-const UTF8_ENCODER = new TextEncoder()
 
 // 实现可以是 Uint16Array，也可以是 PCB 物理内存上的数字属性访问器。
 export interface RegisterFile {
@@ -56,51 +69,7 @@ export interface RegisterFile {
 
 const isErrVal = (v: unknown): boolean => typeof v === 'object' && v !== null && 'err' in v
 
-const putBytes = (bus: Bus, va: number, bytes: Uint8Array, max: number): number => {
-  const n = Math.min(bytes.length, max > 0 ? max : bytes.length)
-  for (let i = 0; i < n; i++) bus.writeUser(va + i, bytes[i])
-  if (va + n < bus.limit) bus.writeUser(va + n, 0)
-  return n
-}
-
-const putStr = (bus: Bus, va: number, text: string, max: number): number =>
-  putBytes(bus, va, UTF8_ENCODER.encode(text), max)
-
-// Host services only. User syscalls are handled by the CRX kernel; svc from
-// supervisor mode is how that kernel asks for a CPU, a reap, or a toolchain.
-function trap(cpu: CpuState, bus: Bus): Syscall | null {
-  const num = cpu.regs[0]
-  const a1 = cpu.regs[1]
-  const a2 = cpu.regs[2]
-  switch (num) {
-    case 3:
-      return sys.exit(a1)
-    case 22:
-      return sys.kill(a1, a2 || 15)
-    case 40:
-      return { call: 'hwexec', at: a1 }
-    case 41:
-      return { call: 'hwreap', pid: a1 }
-    case 42:
-      return { call: 'hwmount' }
-    case 43:
-      return { call: 'hwacct', op: a1, arg: a2 }
-    case 44:
-      return {
-        call: 'hwassemble',
-        srcDev: bus.read(a1),
-        srcIno: bus.read(a1 + 1),
-        dstDev: bus.read(a1 + 2),
-        dstIno: bus.read(a1 + 3),
-      }
-    case 45:
-      return { call: 'hwdisasm', at: a1 }
-    default:
-      return null
-  }
-}
-
-export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => void): Gen {
+export function* runExe(cpu: CpuState, bus: MemoryBus, onRetire?: (count: number) => void): CpuProgram {
   let retired = 0
   const report = () => {
     if (!retired) return
@@ -164,27 +133,10 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
     cpu.pc = (bus.read(at) << 8) | bus.read(at + 1)
   }
 
-  const finishService = (call: Syscall, ret: unknown) => {
-    if (call.call === 'read') {
-      cpu.regs[0] =
-        ret === null
-          ? 0xffff
-          : ret && typeof ret === 'object' && 'bytes' in ret
-            ? putBytes(bus, cpu.regs[2], (ret as any).bytes, cpu.regs[3])
-            : putStr(bus, cpu.regs[2], String(ret), cpu.regs[3])
-    } else if (call.call === 'getcwd' || call.call === 'getenv') {
-      const buf = call.call === 'getcwd' ? cpu.regs[1] : cpu.regs[2]
-      cpu.regs[0] = isErrVal(ret) ? 0xffff : putStr(bus, buf, String(ret), 0)
-    } else if (call.call === 'time') {
-      cpu.regs[0] = ret && typeof ret === 'object' ? wrap((ret as any).hz) : 20
-    } else if (call.call === 'view') {
-      cpu.regs[0] = isErrVal(ret) ? 0xffff : putStr(bus, cpu.regs[3], String(ret), 1200)
-    } else if (isErrVal(ret)) cpu.regs[0] = 0xffff
+  // svc 的返回值由操作系统给出：数字进 r0，错误对象写 0xFFFF。
+  const finishService = (ret: unknown) => {
+    if (isErrVal(ret)) cpu.regs[0] = 0xffff
     else if (typeof ret === 'number') cpu.regs[0] = wrap(ret)
-    else if (ret && typeof ret === 'object' && 'pid' in ret) {
-      cpu.regs[0] = wrap((ret as any).pid)
-      cpu.regs[1] = wrap((ret as any).code)
-    }
   }
 
   while (!cpu.halted) {
@@ -344,7 +296,7 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
         case OP.HLT:
           cpu.halted = true
           report()
-          yield sys.exit(cpu.regs[1] ?? 0)
+          yield { call: 'halt', code: cpu.regs[1] ?? 0 }
           return
         case OP.SYS:
           if (cpu.mode !== 'user') throw new Fault(cpu.pc - WORD, 'sys from kernel mode')
@@ -352,11 +304,10 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
           break
         case OP.SVC: {
           requireKernel('svc')
-          const call = trap(cpu, bus)
-          if (!call) throw new Fault(cpu.pc - WORD, `unknown system call ${cpu.regs[0]}`)
           report()
-          const ret = yield call
-          finishService(call, ret)
+          // 号段与参数原样交给操作系统，CPU 不解释它们的含义
+          const ret = yield { call: 'svc', num: cpu.regs[0], a1: cpu.regs[1], a2: cpu.regs[2], a3: cpu.regs[3] }
+          finishService(ret)
           break
         }
         case OP.IRET: {
@@ -394,13 +345,13 @@ export function* runExe(cpu: CpuState, bus: Bus, onRetire?: (count: number) => v
         case OP.SCHED:
           requireKernel('sched')
           report()
-          yield sys.yield()
+          yield { call: 'yield' }
           break
         default:
           throw new Fault(cpu.pc - WORD, `illegal opcode 0x${op.toString(16)}`)
       }
     }
     report()
-    yield sys.yield()
+    yield { call: 'yield' }
   }
 }

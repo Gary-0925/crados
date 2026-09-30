@@ -1,100 +1,18 @@
-// 块设备：一块真实的字节数组，所有读写都以块为单位
-// 设备上的内容就是文件系统的全部真相，没有任何 JS 对象在旁边"影子存储"
-
-export interface DevSpec {
-  name: string
-  model: string
-  blockSize: number
-  blockCount: number
-  inodeCount: number
-  removable: boolean
-}
-
-export const SDA_INODES = 256
-
-// 盘上格式是 ext2：块大小 1 KiB（s_log_block_size = 0），sda 正好 1 MiB / 1024 块。
-// 一张块位图（1 KiB = 8192 位）覆盖整个块组，因此 8192 块是这套实现的自然上限。
-export const SPECS: Record<string, DevSpec> = {
-  sda: { name: 'sda', model: 'CRADOS-ROOT', blockSize: 1024, blockCount: 1024, inodeCount: SDA_INODES, removable: false },
-}
-
-// 导入的镜像按 sdb、sdc、sdd… 顺序占位，容量与根盘一致，便于整盘互换
-export const diskSpec = (name: string): DevSpec => ({
-  name,
-  model: 'CRADOS-DISK',
-  blockSize: SPECS.sda.blockSize,
-  blockCount: SPECS.sda.blockCount,
-  inodeCount: SPECS.sda.inodeCount,
-  removable: true,
-})
-
-// sdb 起按字母递增，跳过已占用的名字
-export function nextDiskName(taken: Iterable<string>): string | null {
-  const used = new Set(taken)
-  for (let i = 1; i < 26; i++) {
-    const name = 'sd' + String.fromCharCode(97 + i)
-    if (!used.has(name)) return name
-  }
-  return null
-}
-
-export class BlockDev {
-  readonly bytes: Uint8Array
-  readonly blockSize: number
-  readonly blockCount: number
-  /** 上一次持久化时的内容：回写时只写变化的分块，不必每次重写整盘 */
-  readonly shadow: Uint8Array
-
-  constructor(readonly spec: DevSpec) {
-    this.blockSize = spec.blockSize
-    this.blockCount = spec.blockCount
-    this.bytes = new Uint8Array(spec.blockSize * spec.blockCount)
-    this.shadow = new Uint8Array(this.bytes.length)
-  }
-
-  get size(): number {
-    return this.bytes.length
-  }
-
-  block(no: number): Uint8Array {
-    return this.bytes.subarray(no * this.blockSize, (no + 1) * this.blockSize)
-  }
-
-  writeBlock(no: number, data: Uint8Array) {
-    const dst = this.block(no)
-    dst.fill(0)
-    dst.set(data.subarray(0, dst.length))
-  }
-
-  u8(at: number): number {
-    return this.bytes[at]
-  }
-  setU8(at: number, v: number) {
-    this.bytes[at] = v & 0xff
-  }
-  u16(at: number): number {
-    return (this.bytes[at] << 8) | this.bytes[at + 1]
-  }
-  setU16(at: number, v: number) {
-    this.bytes[at] = (v >> 8) & 0xff
-    this.bytes[at + 1] = v & 0xff
-  }
-
-  load(raw: Uint8Array) {
-    this.bytes.fill(0)
-    this.bytes.set(raw.subarray(0, this.bytes.length))
-  }
-}
-
-// ---------- 持久化：整盘按 16 KiB 分块存进 IndexedDB ----------
+// 虚拟硬件：把磁盘字节存进这台浏览器的持久介质（IndexedDB）。
 //
-// ext2 的 sda 是 1 MiB。localStorage 只能存字符串，整盘 base64 之后又涨三分之一，
-// 还受同源配额限制——历史版本正是这么坏的。IndexedDB 能直接存 Uint8Array，
-// 因此这里按块存放 + 只写变化的分块：一次 sync 通常只碰几个分块。
+// 磁盘在真实机器上是掉电不丢的介质；在浏览器里，扮演这个角色的就是 IndexedDB。
+// 这里只认"设备"和"字节"，不认任何盘上格式——文件系统怎么解释这些字节与硬件无关。
 //
-// 两个 object store：
+// 整盘按 16 KiB 分块存放，且只写变化的分块：
+//
 //   chunks  key = "<设备名>/<分块号>" → Uint8Array(16 KiB)
-//   media   key = "<设备名>"          → { chunks, bytes, savedAt }，登记这台浏览器存过哪些盘
+//   media   key = "<设备名>"          → StoredMedia，登记这台浏览器存过哪些盘
+//
+// 全零分块不落盘（加载时缺的分块一律按零读，那就是一块新盘），落盘时记下哪些
+// 分块真的有内容，其余的按零读——这正是旧版 localStorage 时代「存得下、读不回」
+// 的病根所在。
+
+import type { BlockDev } from './disk'
 
 const DB_NAME = 'crados-disks'
 const DB_VERSION = 1
@@ -117,7 +35,7 @@ const chunkKey = (name: string, index: number) => `${name}/${index}`
 let dbPromise: Promise<IDBDatabase | null> | null = null
 let dbDead = false
 
-/** 这台浏览器能不能落盘。无头环境（Node 冒烟测试）没有 IndexedDB，持久化整体停用。 */
+/** 这台浏览器能不能落盘。无头环境（Node 验收脚本）没有 IndexedDB，持久化整体停用。 */
 export const persistAvailable = (): boolean => typeof indexedDB !== 'undefined' && !dbDead
 
 function openStore(): Promise<IDBDatabase | null> {
@@ -201,6 +119,7 @@ function readMedia(db: IDBDatabase, name: string): Promise<StoredMedia | null> {
   })
 }
 
+/** 这台浏览器存过哪些盘。开机菜单靠它列出"从上次的盘启动"。 */
 export async function listStoredDisks(): Promise<StoredMedia[]> {
   const db = await openStore()
   if (!db) return []
@@ -214,13 +133,10 @@ export async function listStoredDisks(): Promise<StoredMedia[]> {
 }
 
 /**
- * 把一块盘写进 IndexedDB，回到“是否写成”。
+ * 把一块盘写进 IndexedDB，回到"是否写成"。
  *
- * 全零分块根本不落盘（加载时缺的分块一律按零读，那就是一块新盘）；剩下的分块里，
- * 只有内容真改过（与 shadow 不同）的才写。这正是 localStorage 时代「存得下、读不回」
- * 的疑点所在：那时候存的时候跳过全零分块，读的时候却要求每个分块都在，结果整盘读不
- * 回来。现在反过来：落盘时记下哪些分块真的有内容，其余的按零读。shadow 在落盘成功
- * 之后才对齐，失败的话下次 sync 会重写同样的分块。
+ * 全零分块根本不落盘；剩下的分块里，只有内容真改过（与 shadow 不同）的才写。
+ * shadow 在落盘成功之后才对齐，失败的话下次同步会重写同样的分块。
  */
 export async function saveDev(dev: BlockDev): Promise<boolean> {
   const db = await openStore()
@@ -298,7 +214,7 @@ export async function loadDev(dev: BlockDev): Promise<boolean> {
   return true
 }
 
-/** 撤掉一台设备在浏览器里的存档（分离设备时用）。 */
+/** 撤掉一台设备在浏览器里的存档（拔盘时用）。 */
 export async function dropDev(name: string): Promise<void> {
   const db = await openStore()
   if (!db) return
@@ -321,6 +237,7 @@ export async function dropDev(name: string): Promise<void> {
   }).catch(() => {})
 }
 
+/** 导出整盘字节：交给宿主的下载通道写成 .img 文件。 */
 export function downloadDev(dev: BlockDev, filename: string) {
   const blob = new Blob([dev.bytes.slice() as unknown as BlobPart], { type: 'application/octet-stream' })
   const url = URL.createObjectURL(blob)

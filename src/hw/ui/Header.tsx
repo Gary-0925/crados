@@ -1,10 +1,10 @@
 import { Pause, Play, RotateCcw, StepForward } from 'lucide-react'
 import type { Kernel } from '@/os/kernel'
-import { cn } from '@/utils/cn'
+import { cn } from '@/hw/ui/cn'
 
 const SPEEDS: (number | 'max')[] = [1, 5, 20, 60, 'max']
 
-// 机器控制条：只用内核公开的控制与只读接口，不依赖 /cp
+// 机器控制条：频率旋钮与暂停键改的是硬件时钟，经操作系统的控制接口下发，不依赖 /cp
 export function Header({ kernel, onReboot }: { kernel: Kernel; onReboot: () => void }) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-[#30363d] bg-[#010409] px-3">

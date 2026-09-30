@@ -4,7 +4,7 @@ import type { Kernel } from '@/os/kernel'
 import { isErr, strerror } from '@/os/types'
 import type { FSNode, Snapshot } from '@/cp/snapshot'
 import { HexDump } from '@/cp/HexDump'
-import { cn } from '@/utils/cn'
+import { cn } from '@/cp/cn'
 
 const BLOCK_TONE: Record<string, string> = {
   super: '#d29922',
@@ -189,7 +189,10 @@ export function StoragePanel({
               </button>
             ))}
           </div>
-          <IconBtn label={`导出 ${active} 镜像`} onClick={() => void run(kernel.exportDisk(active), 'image saved')}>
+          <IconBtn
+            label={`导出 ${active} 镜像`}
+            onClick={() => void run(kernel.machine.disks.exportImage(active), 'image saved')}
+          >
             <Download size={12} />
           </IconBtn>
           <IconBtn label="导入镜像为新设备" onClick={() => fileRef.current?.click()}>
@@ -347,7 +350,7 @@ export function StoragePanel({
                   base={cur * bs}
                   onByteChange={(address, value) => {
                     layout.bytes[address] = value
-                    void kernel.saveDisk(active).then((ok) => {
+                    void kernel.machine.disks.save(active).then((ok) => {
                       if (!ok) setMsg('error: 存储不可用，改动只留在内存里')
                     })
                     onMutate()

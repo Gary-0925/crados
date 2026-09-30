@@ -39,9 +39,6 @@ export type Syscall =
   | { call: 'sync' }
   | { call: 'time' }
 
-// 进程体：一个不断 yield 系统调用的生成器，内核是它的唯一执行者
-export type Gen = Generator<Syscall, any, any>
-
 export interface Err {
   err: string
 }

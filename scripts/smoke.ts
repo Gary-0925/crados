@@ -9,6 +9,7 @@
 // 任何 panic、断言失败或超时都以非零码退出。由 scripts/smoke.mjs 打包后运行。
 
 import { Kernel } from '@/os/kernel'
+import { OS_VERSION } from '@/os/version'
 import { ControlPanel } from '@/cp/snapshot'
 
 // 观测层用 rAF 合并重绘；Node 里没有这个 API
@@ -19,12 +20,18 @@ if (typeof (globalThis as { requestAnimationFrame?: unknown }).requestAnimationF
 }
 
 const k = new Kernel()
-// 引导是异步的（磁盘可能来自 IndexedDB 或文件）；Node 里没有 IndexedDB，落盘整体停用
-const bootErr = await k.boot({ kind: 'fresh' })
-const consoleText = () => k.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')
+// 上电：固件把一张空盘装进系统盘位，操作系统再往上面装系统。
+// Node 里没有 IndexedDB，落盘整体停用
+const bootErr = await k.machine.powerOn({ kind: 'blank' })
+const screenText = (kernel: Kernel) =>
+  kernel.machine.console
+    .screen()
+    .map((l) => l.segs.map((s) => s.t).join(''))
+    .join('\n')
+const consoleText = () => screenText(k)
 // 廉价的变化指纹：行数 + 最后两行（提示符会在原行上重绘）
 const fingerprint = () => {
-  const ls = k.consoleLines()
+  const ls = k.machine.console.screen()
   return `${ls.length}|${ls.slice(-2).map((l) => l.segs.map((s) => s.t).join('')).join('\u0001')}`
 }
 
@@ -71,42 +78,52 @@ const boot = consoleText()
 check('引导完成且没有 panic', k.panic === null && bootErr === null, bootErr ?? k.panic ?? '')
 check('登录提示出现', /crados login:/.test(boot))
 check('42 个系统程序装进 /bin', boot.includes('42 programs installed on /dev/sda'))
+check('引导标语带的是当前版本', boot.includes(`crados ${OS_VERSION}`), OS_VERSION)
 check('根盘写盘成功', /sda: root image written, \d+ inodes/.test(boot))
 check('引导在 4000 个 tick 内结束', bootTicks < 4000, `${bootTicks} ticks`)
 void bootTicks
 
 // ---------- 2. 启动来源 ----------
 // 三种引导方式覆盖开机菜单的三个选项；这里每种都开一台新机器，跑完就扔
-const sdaImage = k.diskImage('sda')!
+const sdaImage = k.machine.disks.image('sda')!
 check('能取到 sda 整盘字节', sdaImage.length === 1024 * 1024, `${sdaImage.length} B`)
 
 const fromImage = new Kernel()
-const imageErr = await fromImage.boot({ kind: 'image', bytes: sdaImage, filename: 'sda.img' })
+const imageErr = await fromImage.machine.powerOn({ kind: 'image', bytes: sdaImage, filename: 'sda.img' })
 check('从 .img 引导成功', imageErr === null && fromImage.panic === null, imageErr ?? fromImage.panic ?? '')
 check(
   '从 .img 引导后系统程序就位',
-  /bin: \d+ programs installed/.test(fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n')),
+  /bin: \d+ programs installed/.test(screenText(fromImage)),
 )
 check(
   '从 .img 引导后 init 以机器码启动',
   /init: pid 1 started from \/bin\/init as machine code/.test(
-    fromImage.consoleLines().map((l) => l.segs.map((s) => s.t).join('')).join('\n'),
+    screenText(fromImage),
   ),
 )
 await fromImage.destroy()
 
 const shortImage = new Kernel()
-const shortErr = await shortImage.boot({ kind: 'image', bytes: new Uint8Array(4096), filename: 'junk.img' })
-check('长度不对的镜像被拒', typeof shortErr === 'string' && shortErr.length > 0, String(shortErr))
+// 短镜像由盘位按零补齐（与真机一样），随后被操作系统当成非 ext2 盘拒掉
+const shortErr = await shortImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(4096), filename: 'junk.img' })
+check('短镜像被补齐后拒掉（不是 ext2）', typeof shortErr === 'string' && shortErr.length > 0, String(shortErr))
 await shortImage.destroy()
 
 const blankImage = new Kernel()
-const blankErr = await blankImage.boot({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
+const blankErr = await blankImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
 check('全零镜像被拒且给出原因', typeof blankErr === 'string' && blankErr.length > 0, String(blankErr))
 await blankImage.destroy()
 
+// 介质层面的问题由盘位当场说清楚，用不着操作系统出面
+const hugeImage = new Kernel()
+const hugeErr = await hugeImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(1024 * 1024 + 1), filename: 'huge.img' })
+check('比盘还长的镜像被盘位拒收', typeof hugeErr === 'string' && hugeErr.length > 0, String(hugeErr))
+check('被拒收的介质不会留在盘位上', hugeImage.machine.disks.system === null)
+check('机器没上电，操作系统没接管', hugeImage.panic === null)
+await hugeImage.destroy()
+
 const noStore = new Kernel()
-const storeErr = await noStore.boot({ kind: 'stored' })
+const storeErr = await noStore.machine.powerOn({ kind: 'stored' })
 check('没有 IndexedDB 时明确报错', typeof storeErr === 'string' && storeErr.length > 0, String(storeErr))
 await noStore.destroy()
 

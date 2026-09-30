@@ -1,10 +1,10 @@
 // Builds the initial sda byte image from a declarative file table.
 
-import { BlockDev, SPECS } from './blockdev'
+import { BlockDev, SPECS } from '@/hw/disk'
 import { applySystemPolicy, basename, dirname, DRV_NULL, DRV_TTY, FS, T_DEV, T_DIR, T_FILE } from './fs'
 import { ROOT_INO } from './ext2'
 import { serializePasswd, factoryAccounts } from './accounts'
-import { MAN_FILES } from '../man'
+import { MAN_FILES } from './man'
 import {
   COUNT_S,
   BLOCK_S,

@@ -1,7 +1,7 @@
 {
   "name": "react-vite-tailwind",
   "private": true,
-  "version": "4.1",
+  "version": "5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,9 +9,10 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "check": "npm run typecheck && npm run smoke && npm run persist && npm run ext2",
+    "check": "npm run typecheck && npm run parts && npm run smoke && npm run persist && npm run ext2",
     "ext2": "node scripts/ext2-check.mjs",
-    "persist": "node scripts/persist-check.mjs"
+    "persist": "node scripts/persist-check.mjs",
+    "parts": "node scripts/parts-check.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

@@ -4,19 +4,19 @@
 // Snapshot 供面板渲染。开机之前渲染启动菜单，机器就绪后才建观测层。
 
 import { useState, useSyncExternalStore } from 'react'
-import type { BootSource } from '@/os/kernel'
-import { Header } from '@/ui/Header'
-import { PanicOverlay } from '@/ui/PanicOverlay'
-import { Terminal } from '@/ui/Terminal'
-import { BootMenu } from '@/ui/BootMenu'
-import { useBoot } from '@/ui/useBoot'
-import { ControlPanel } from '@/cp/snapshot'
+import type { BootMedium } from '@/hw/boot'
+import { Header } from '@/hw/ui/Header'
+import { PanicOverlay } from '@/hw/ui/PanicOverlay'
+import { Terminal } from '@/hw/ui/Terminal'
+import { BootMenu } from '@/hw/ui/BootMenu'
+import { useBoot } from '@/hw/ui/useBoot'
+import { ControlPanel, PANEL_TAG } from '@/cp/snapshot'
 import type { Snapshot } from '@/cp/snapshot'
 import { ProcessesPanel } from '@/cp/ProcessesPanel'
 import { MemoryPanel } from '@/cp/MemoryPanel'
 import { StoragePanel } from '@/cp/StoragePanel'
 import { KmsgPanel, TracePanel } from '@/cp/StreamsPanel'
-import { cn } from '@/utils/cn'
+import { cn } from '@/cp/cn'
 
 type Tab = 'proc' | 'mem' | 'disk' | 'trace' | 'kmsg'
 
@@ -38,7 +38,7 @@ export default function Transparent() {
   const [tab, setTab] = useState<Tab>('proc')
   const [selPid, setSelPid] = useState(2)
 
-  const start = (source: BootSource) => boot(source, (k) => setCp(new ControlPanel(k)))
+  const start = (medium: BootMedium) => boot(medium, (k) => setCp(new ControlPanel(k)))
   const restart = () => {
     cp?.detach()
     setCp(null)
@@ -59,7 +59,10 @@ export default function Transparent() {
           <Terminal kernel={kernel} />
         </section>
 
-        <aside className="flex min-h-[44vh] flex-col border-t border-[#30363d] bg-[#010409] lg:min-h-0 lg:w-[452px] lg:border-l lg:border-t-0 xl:w-[520px]">
+        <aside
+          data-panel={PANEL_TAG}
+          className="flex min-h-[44vh] flex-col border-t border-[#30363d] bg-[#010409] lg:min-h-0 lg:w-[452px] lg:border-l lg:border-t-0 xl:w-[520px]"
+        >
           <div className="flex h-9 shrink-0 items-stretch gap-1 border-b border-[#30363d] px-1.5">
             {TABS.map((t) => (
               <button

@@ -8,7 +8,7 @@
 //
 // 这里另外提供一个 VFS：挂载表 + 跨设备路径解析，模拟真实内核的 vfsmount 查找。
 
-import { BlockDev, SPECS } from './blockdev'
+import { BlockDev, SPECS } from '@/hw/disk'
 import {
   BLOCK_SIZE,
   Ext2,
