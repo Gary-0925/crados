@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-plain:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +23,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - run: npm run check
+
+  build-plain:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -46,6 +64,7 @@ jobs:
           retention-days: 1
 
   build-transparent:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +72,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -72,7 +92,6 @@ jobs:
           path: dist/transparent.html
           retention-days: 1
 
-  # Pages 每次部署替换整个站点，因此两个版本必须合并成一份产物再发布
   deploy:
     needs: [build-plain, build-transparent]
     runs-on: ubuntu-latest
