@@ -96,11 +96,18 @@ for (const { rel, imports } of files) {
   check(`${rel} 不依赖 cp`, bad.length === 0, bad.join(', '))
 }
 
-// ---------- 5. 纯净版入口不碰面板，透明版入口才装面板 ----------
+// ---------- 5. 上电菜单是固件：操作系统还不存在就要能跑 ----------
+check(
+  '上电菜单不引用操作系统的装载入口',
+  hits('src/hw/ui/BootMenu.tsx', /^src\/os\/kernel$/).length === 0,
+  '菜单只问介质（@/hw/boot），不调 Kernel',
+)
+
+// ---------- 6. 纯净版入口不碰面板，透明版入口才装面板 ----------
 check('纯净版入口不引用面板', hits('src/Plain.tsx', /^src\/cp\//).length === 0)
 check('透明版入口装载面板', hits('src/Transparent.tsx', /^src\/cp\//).length > 0)
 
-// ---------- 6. 三部分各有一个文件夹，且各有自己的入口语义 ----------
+// ---------- 7. 三部分各有一个文件夹，且各有自己的入口语义 ----------
 for (const part of ['src/hw', 'src/os', 'src/cp']) {
   check(`${part}/ 存在且有源码`, files.some((f) => f.rel.startsWith(part + '/') && f.rel !== part + '/index.ts'))
 }

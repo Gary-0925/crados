@@ -2,13 +2,16 @@
 //
 // 机器 = 主存 + 盘位 + 控制台 + 硬件时钟 + 块控制器 + 总线。它单独就能存在：
 // 上电、插盘、敲键盘、接时钟，全都不需要上面跑着什么操作系统。操作系统是后来
-// 装载进来的软件（MachineSoftware），机器只在两件事上找它：
+// 装载进来的软件（MachineSoftware），机器只在这几个口子上找它：
+//   - 上电时把选定的启动介质装进系统盘位，然后把机器交给它（powerOn）
 //   - 每个时钟周期该推进什么（clockEdge）
 //   - 用户态原始块读写要不要放行（rawBlockIOAllowed）
 //
 // 机器不认识文件、进程、权限，也不认识 syscall 号段——那些都在 os/ 里。
+// 连"这块盘上装的是不是操作系统"它也不认识：盘上的内容由操作系统自己检查。
 
 import { DiskBay } from './bay'
+import type { BootMedium } from './boot'
 import { Bus } from './bus'
 import type { AddressSpace } from './bus'
 import { Console } from './console'
@@ -16,6 +19,12 @@ import { Memory, SCRATCH_BASE, SCRATCH_SIZE } from './ram'
 
 /** 装载在这台机器上的操作系统：机器只通过这几个口子找它 */
 export interface MachineSoftware {
+  /**
+   * 上电之后由机器调用：系统盘位上的字节已经就位（见 DiskBay.insertBootMedium），
+   * 操作系统从这块盘上把系统装起来。返回 null 表示已接管；否则是给人看的说明，
+   * 此时机器应当留在上电菜单上。
+   */
+  powerOn(): Promise<string | null>
   /**
    * 一个时钟周期：取指、陷入、调度由操作系统推进。
    * 不限速模式（turbo）下机器会把相邻的几个时钟周期合并成一次 burst 调用，
@@ -53,6 +62,17 @@ export class Machine {
 
   attachSoftware(software: MachineSoftware) {
     this.software = software
+  }
+
+  /**
+   * 上电：把选定的启动介质装进系统盘位，然后把控制权交给装载在这台机器上的软件。
+   * 返回 null 表示操作系统已经接管这台机器；否则是给操作员的错误说明。
+   */
+  async powerOn(medium: BootMedium): Promise<string | null> {
+    const inserted = await this.disks.insertBootMedium(medium)
+    if (typeof inserted === 'string') return inserted
+    if (!this.software) return '这台机器上没有装载操作系统'
+    return this.software.powerOn()
   }
 
   /** 接上时钟：机器开始产生定时器中断 */

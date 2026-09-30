@@ -8,10 +8,12 @@
 //   1. 整盘存取：写进去的字节要原样读回来，shadow 对齐
 //   2. 增量回写：改一个字节只落一个 16 KiB 分块，不是整盘重写
 //   3. 存档登记与撤档：listStoredDisks / dropDev
-//   4. 启动来源：fresh 落档 → stored 原样恢复（连 /tmp 里的文件都在）→ 可移动盘装回
+//   4. 启动介质：空盘落档 → 存档原样恢复（连 /tmp 里的文件都在）→ 可移动盘装回；
+//      固件探测只列介质，不解析盘上的文件系统
 //
 // 由 scripts/persist-check.mjs 打包后运行。
 
+import { probeBootMedia } from '@/hw/boot'
 import { BlockDev, SPECS } from '@/hw/disk'
 import { dropDev, listStoredDisks, loadDev, persistAvailable, saveDev } from '@/hw/store'
 import { Kernel } from '@/os/kernel'
@@ -225,9 +227,10 @@ async function main() {
   check('撤档之后读不到', (await loadDev(new BlockDev(SPECS.sda))) === false)
   check('撤档之后登记为空', (await listStoredDisks()).length === 0)
 
-  // ---------- 4. 启动来源 ----------
+  // ---------- 4. 启动介质 ----------
+  check('新机器上电前系统盘位是空的', new Kernel().machine.disks.system === null)
   const fresh = new Kernel()
-  check('创建空盘并装载系统', (await fresh.boot({ kind: 'fresh' })) === null && fresh.panic === null, fresh.panic ?? '')
+  check('创建空盘并装载系统', (await fresh.machine.powerOn({ kind: 'blank' })) === null && fresh.panic === null, fresh.panic ?? '')
 
   // 在系统盘上留一个只有这台机器有的痕迹
   const fs = fresh.filesystem('sda')!
@@ -247,10 +250,17 @@ async function main() {
   const names = (await listStoredDisks()).map((m) => m.name).sort()
   check('系统盘与新盘都落了档', names.join(',') === 'sda,sdb', names.join(','))
 
+  // 固件探测：上电菜单要的信息全在介质这一层
+  const probe = await probeBootMedia()
+  check('固件探测能落盘', probe.storageOk)
+  check('固件探测到系统盘存档', probe.system?.name === 'sda', JSON.stringify(probe.system?.name))
+  check('固件探测把移动盘单列', probe.removable.map((m) => m.name).join(',') === 'sdb')
+  check('上电后盘位记着介质', fresh.machine.disks.bootMedium?.kind === 'blank')
+
   await fresh.destroy()
 
   const stored = new Kernel()
-  check('从 IndexedDB 加载', (await stored.boot({ kind: 'stored' })) === null && stored.panic === null, stored.panic ?? '')
+  check('从 IndexedDB 加载', (await stored.machine.powerOn({ kind: 'stored' })) === null && stored.panic === null, stored.panic ?? '')
   const marker = stored.vfs.resolve('/tmp/marker', '/')
   check(
     '恢复出来的盘带着上次写的文件',
@@ -268,7 +278,7 @@ async function main() {
   const fromImage = new Kernel()
   check(
     '从 .img 文件加载',
-    (await fromImage.boot({ kind: 'image', bytes: image, filename: 'sda.img' })) === null && fromImage.panic === null,
+    (await fromImage.machine.powerOn({ kind: 'image', bytes: image, filename: 'sda.img' })) === null && fromImage.panic === null,
     fromImage.panic ?? '',
   )
   const marker2 = fromImage.vfs.resolve('/tmp/marker', '/')
@@ -283,13 +293,13 @@ async function main() {
   // 用户选了 .img 却是坏镜像：只好回到菜单换一个选项。
   // 这台没起来的机器一定不能落盘，否则它那份坏字节会把好好存着的旧盘覆盖掉。
   const doomed = new Kernel()
-  const doomedErr = await doomed.boot({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
+  const doomedErr = await doomed.machine.powerOn({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
   check('坏镜像启动失败', typeof doomedErr === 'string')
   await doomed.destroy()
   const survivor = new Kernel()
   check(
     '存档没被失败的启动污染',
-    (await survivor.boot({ kind: 'stored' })) === null && survivor.panic === null,
+    (await survivor.machine.powerOn({ kind: 'stored' })) === null && survivor.panic === null,
   )
   const marker3 = survivor.vfs.resolve('/tmp/marker', '/')
   check(

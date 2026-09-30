@@ -69,15 +69,6 @@ const KCB_MOUNTS = 0x00c0
 const KCB_MOUNT_SLOTS = 8
 const UTF8_ENCODER = new TextEncoder()
 
-/** 系统盘的来源：开机时三选一 */
-export type BootSource =
-  // 这个浏览器里上次保存的 sda
-  | { kind: 'stored' }
-  // 用户提供的整盘镜像，几何必须与本机一致
-  | { kind: 'image'; bytes: Uint8Array; filename: string }
-  // 现做一张空盘，装上出厂目录树与 /bin
-  | { kind: 'fresh' }
-
 /**
  * 观测点：一个可选的通知口，只在有观察者（透明化面板）时才有内容。
  * 操作系统自己的接口，不依赖面板：没有挂观察者时一条追踪数据都不会产生。
@@ -191,13 +182,14 @@ export class Kernel implements MachineSoftware {
   // ---------- 引导 ----------
 
   /**
-   * 启动。机器由装配层先造好（new Kernel(machine)），这里决定系统盘从哪来：
-   * 可能来自浏览器的持久介质，也可能是用户选的 .img，两者都是异步的。
+   * 接管这台机器（MachineSoftware.powerOn）：系统盘位上已经有盘了——启动介质是
+   * 硬件的事，固件在上电时按菜单选择装好了（DiskBay.bootMedium 里记着是哪种）。
+   * 这里做的是操作系统自己的事：检查盘上有没有可用的 ext2 系统，然后建立内核状态。
    *
-   * 返回 null 表示机器已经跑起来；否则是给人的错误说明，此时机器尚未启动
-   * （调用方应当留在启动菜单上）。
+   * 返回 null 表示系统已经跑起来；否则是给人的错误说明，此时机器尚未启动
+   * （调用方应当留在上电菜单上）。
    */
-  async boot(source: BootSource): Promise<string | null> {
+  async powerOn(): Promise<string | null> {
     const stamp = (msg: string) => {
       this.ticks++
       this.log(msg, true)
@@ -211,30 +203,24 @@ export class Kernel implements MachineSoftware {
       return null
     }
 
-    // sda：根盘（相当于 Windows 的 C 盘）。系统程序 /bin/* 也装在这块盘上，
-    // 每次上电重新写入以保证与当前固件一致。
-    const sda = this.machine.disks.insertSystem()
+    // sda：根盘（相当于 Windows 的 C 盘），启动介质已经由固件装上盘位。
+    // 系统程序 /bin/* 也装在这块盘上，每次上电重新写入以保证与当前固件一致。
+    const sda = this.machine.disks.system
+    const medium = this.machine.disks.bootMedium
+    if (!sda || !medium) return '系统盘位上没有盘：机器上电前要先选启动介质'
     const sdafs = this.attachFilesystem(sda)
     let restored = false
-    if (source.kind === 'stored') {
-      if (!(await this.machine.disks.restore(sda))) {
-        return 'IndexedDB 里没有保存过系统盘：请改用 .img 文件，或新建空盘'
-      }
+    if (medium?.kind === 'stored') {
       if (!sdafs.valid() || !sameGeometry(sdafs.layout(), systemGeometry())) {
-        return 'IndexedDB 里的系统盘读不出来（格式或几何不符）：请改用 .img 文件，或新建空盘'
+        return '保存的系统盘读不出来（格式或几何不符）：请改用 .img 文件，或新建空盘'
       }
       restored = true
       stamp('sda: restored from IndexedDB')
-    } else if (source.kind === 'image') {
-      // 系统盘就是固定容量：短于容量的镜像会让后面的块读成零，不如当场拒掉
-      if (source.bytes.length !== sda.size) {
-        return `${source.filename}: ${source.bytes.length} 字节，系统盘镜像必须是 ${sda.size} 字节`
-      }
-      sda.load(source.bytes)
+    } else if (medium?.kind === 'image') {
       if (!sdafs.valid() || !sameGeometry(sdafs.layout(), systemGeometry())) {
-        return `${source.filename}: 不是本机可用的 ext2 系统盘（魔数或盘上几何不符）`
+        return `${medium.filename}: 不是本机可用的 ext2 系统盘（魔数或盘上几何不符）`
       }
-      stamp(`sda: image ${source.filename} loaded, ${source.bytes.length} bytes`)
+      stamp(`sda: image ${medium.filename} loaded, ${medium.bytes.length} bytes`)
     } else {
       const image = buildRootImage()
       sda.load(image.bytes)

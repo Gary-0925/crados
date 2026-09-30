@@ -10,6 +10,7 @@
 //   - 停机（destroy）与 panic
 // 每次只写变化过的 16 KiB 分块（见 store.ts）。
 
+import type { BootMedium } from './boot'
 import { BlockDev, diskSpec, nextDiskName, SPECS } from './disk'
 import type { DevSpec } from './disk'
 import { dropDev, downloadDev, listStoredDisks, loadDev, persistAvailable, saveDev } from './store'
@@ -20,6 +21,8 @@ const AUTOSYNC_MS = 1000
 
 export class DiskBay {
   private readonly devs = new Map<string, BlockDev>()
+  /** 这台机器是从哪种介质上电的（固件在启动菜单里问出来的那个选择） */
+  private booted: BootMedium | null = null
   private storageOk = persistAvailable()
   private dirty = false
   private lastSyncMs = 0
@@ -61,9 +64,38 @@ export class DiskBay {
     return listStoredDisks()
   }
 
-  /** 插上系统盘 sda（固定几何，1 MiB / 1024 块） */
-  insertSystem(): BlockDev {
-    return this.insert(SPECS.sda)
+  /** 这台机器是从哪种介质上电的；还没上电就是 null */
+  get bootMedium(): BootMedium | null {
+    return this.booted
+  }
+
+  /** 系统盘位（sda）上的那块盘；空着的盘位是 null，操作系统自己判断盘上的内容 */
+  get system(): BlockDev | null {
+    return this.devs.get(SPECS.sda.name) ?? null
+  }
+
+  /**
+   * 按选定的启动介质把盘装上系统盘位（上电第一步，只有 sda 能当系统盘）。
+   * 介质层面的问题在这里就说清楚：存档里没有盘中、镜像比盘还长。
+   * 短镜像按零补齐（与真机一样），盘上的字节合不合法由操作系统自己检查。
+   */
+  async insertBootMedium(medium: BootMedium): Promise<BlockDev | string> {
+    this.devs.delete(SPECS.sda.name)
+    const dev = this.insert(SPECS.sda)
+    if (medium.kind === 'stored') {
+      if (!(await this.restore(dev))) {
+        this.devs.delete(dev.spec.name)
+        return '浏览器里没有保存过系统盘：请改用 .img 文件，或新建空盘'
+      }
+    } else if (medium.kind === 'image') {
+      if (medium.bytes.length > dev.size) {
+        this.devs.delete(dev.spec.name)
+        return `${medium.filename}: 整盘镜像 ${medium.bytes.length} 字节，超过系统盘容量 ${dev.size} 字节`
+      }
+      dev.load(medium.bytes)
+    }
+    this.booted = medium
+    return dev
   }
 
   /** 再插一块空的移动盘，名字按 sdb、sdc… 递增；盘位用满返回 null */

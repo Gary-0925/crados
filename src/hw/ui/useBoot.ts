@@ -1,11 +1,15 @@
-// 固件：上电、选启动介质、把操作系统装载到机器上。
+// 固件：上电、选启动介质、把机器交给操作系统。
 //
-// 磁盘可能在浏览器的持久介质里，也可能是用户选的 .img，所以启动是异步的；
-// 操作系统就绪之前，启动菜单（固件界面）接管整个屏幕。纯净版与透明版共用。
+// 启动菜单不是操作系统的界面，是机器自己的固件界面：开机前还没有操作系统，
+// 只有一台装着盘位的机器。菜单选的是介质（见 @/hw/boot），选完由机器上电
+// （machine.powerOn）：装盘、装载操作系统、启动时钟。
+//
+// 启动是异步的（磁盘可能在浏览器持久介质里，也可能在用户选的 .img 里），
+// 操作系统就绪之前，启动菜单接管整个屏幕。纯净版与透明版共用。
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Kernel } from '@/os/kernel'
-import type { BootSource } from '@/os/kernel'
+import type { BootMedium } from '@/hw/boot'
 
 export interface Boot {
   /** 启动完成后才有；为 null 时应当渲染启动菜单 */
@@ -14,10 +18,10 @@ export interface Boot {
   error: string | null
   busy: boolean
   /**
-   * 按指定来源开机。onReady 在机器就绪、界面切换之前同步调用，
+   * 按指定介质上电。onReady 在机器就绪、界面切换之前同步调用，
    * 让调用方有机会把只属于这一机的附属状态（如控制面板）一次备好。
    */
-  boot: (source: BootSource, onReady?: (kernel: Kernel) => void) => void
+  boot: (medium: BootMedium, onReady?: (kernel: Kernel) => void) => void
   /** 回到启动菜单：当前机器停机并落盘 */
   reboot: () => void
 }
@@ -30,7 +34,7 @@ export function useBoot(): Boot {
   // 连点两次只会起一台机器：第二台会带着自己的硬件时钟一起泄漏
   const starting = useRef(false)
 
-  const boot = useCallback((source: BootSource, onReady?: (kernel: Kernel) => void) => {
+  const boot = useCallback((medium: BootMedium, onReady?: (kernel: Kernel) => void) => {
     if (starting.current) return
     starting.current = true
     setBusy(true)
@@ -38,7 +42,7 @@ export function useBoot(): Boot {
     void (async () => {
       const machine = new Kernel()
       try {
-        const failure = await machine.boot(source)
+        const failure = await machine.machine.powerOn(medium)
         if (failure) {
           setError(failure)
           void machine.destroy()

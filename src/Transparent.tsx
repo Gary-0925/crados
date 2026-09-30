@@ -4,7 +4,7 @@
 // Snapshot 供面板渲染。开机之前渲染启动菜单，机器就绪后才建观测层。
 
 import { useState, useSyncExternalStore } from 'react'
-import type { BootSource } from '@/os/kernel'
+import type { BootMedium } from '@/hw/boot'
 import { Header } from '@/hw/ui/Header'
 import { PanicOverlay } from '@/hw/ui/PanicOverlay'
 import { Terminal } from '@/hw/ui/Terminal'
@@ -38,7 +38,7 @@ export default function Transparent() {
   const [tab, setTab] = useState<Tab>('proc')
   const [selPid, setSelPid] = useState(2)
 
-  const start = (source: BootSource) => boot(source, (k) => setCp(new ControlPanel(k)))
+  const start = (medium: BootMedium) => boot(medium, (k) => setCp(new ControlPanel(k)))
   const restart = () => {
     cp?.detach()
     setCp(null)

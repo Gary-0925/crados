@@ -1,12 +1,13 @@
-// 启动菜单：开机前先决定系统盘从哪来。三种来源互斥，选完才开机。
+// 固件的启动菜单：上电前先决定系统盘位上的字节从哪来。
 //
-// 这里只依赖硬件（持久介质里存过哪些盘）与操作系统的启动入口，纯净版与透明版共用。
+// 它问的全是介质的事（probeBootMedia：持久介质能不能用、存过哪些盘），
+// 不解析盘上的文件系统，也不碰操作系统：开机前还没有操作系统。
+// 用户在这里做的选择就是 BootMedium，交给 machine.powerOn() 装上盘位。
 
 import { useEffect, useRef, useState } from 'react'
 import { CircleAlert, Database, FileUp, HardDrive, LoaderCircle } from 'lucide-react'
-import type { BootSource } from '@/os/kernel'
-import { listStoredDisks, persistAvailable } from '@/hw/store'
-import type { StoredMedia } from '@/hw/store'
+import { probeBootMedia } from '@/hw/boot'
+import type { BootMedium, BootProbe } from '@/hw/boot'
 import { OS_VERSION } from '@/os/version'
 import { cn } from '@/hw/ui/cn'
 
@@ -28,25 +29,24 @@ export function BootMenu({
 }: {
   busy: boolean
   error: string | null
-  onBoot: (source: BootSource) => void
+  onBoot: (medium: BootMedium) => void
 }) {
-  const [media, setMedia] = useState<StoredMedia[] | null>(null)
+  const [probe, setProbe] = useState<BootProbe | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     let alive = true
-    void listStoredDisks().then((list) => {
-      if (alive) setMedia(list)
+    void probeBootMedia().then((p) => {
+      if (alive) setProbe(p)
     })
     return () => {
       alive = false
     }
   }, [])
 
-  const stored = media ?? []
-  const sda = stored.find((m) => m.name === 'sda') ?? null
-  const others = stored.filter((m) => m.name !== 'sda')
-  const idbOk = persistAvailable()
+  const sda = probe?.system ?? null
+  const others = probe?.removable ?? []
+  const idbOk = probe?.storageOk ?? true
 
   const pickImage = async (file: File) => {
     if (busy) return
@@ -63,8 +63,8 @@ export function BootMenu({
           <span className="text-[11px] text-[#6e7681]">a transparent OS · 系统盘从哪来</span>
         </div>
         <p className="mt-1 text-[11px] leading-relaxed text-[#8b949e]">
-          这台机器的文件系统就是一块盘上的字节。开机时三选一：接着用这个浏览器里保存的盘、
-          装一份导出的 .img，或者现做一张空盘装上出厂系统。
+          这台机器的文件系统就是一块盘上的字节。上电前固件先问系统盘位上的字节从哪来：
+          接着用这个浏览器里保存的盘、插一份导出的 .img，或者现做一张空盘再往上面装系统。
         </p>
 
         {error && (
@@ -93,7 +93,7 @@ export function BootMenu({
                   </>
                 ) : (
                   <span className="text-[#6e7681]">
-                    {media === null ? '正在读取…' : '没有已保存的系统盘'}
+                    {probe === null ? '正在读取…' : '没有已保存的系统盘'}
                   </span>
                 )
               ) : (
@@ -119,7 +119,7 @@ export function BootMenu({
             desc="格式化一张新盘，写入出厂目录树与 /bin，IndexedDB 里的旧存档被替换"
             meta={<span className="text-[#6e7681]">factory image · 1 MiB</span>}
             disabled={busy}
-            onClick={() => onBoot({ kind: 'fresh' })}
+            onClick={() => onBoot({ kind: 'blank' })}
           />
         </div>
 

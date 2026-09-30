@@ -19,8 +19,9 @@ if (typeof (globalThis as { requestAnimationFrame?: unknown }).requestAnimationF
 }
 
 const k = new Kernel()
-// 引导是异步的（磁盘可能来自 IndexedDB 或文件）；Node 里没有 IndexedDB，落盘整体停用
-const bootErr = await k.boot({ kind: 'fresh' })
+// 上电：固件把一张空盘装进系统盘位，操作系统再往上面装系统。
+// Node 里没有 IndexedDB，落盘整体停用
+const bootErr = await k.machine.powerOn({ kind: 'blank' })
 const screenText = (kernel: Kernel) =>
   kernel.machine.console
     .screen()
@@ -86,7 +87,7 @@ const sdaImage = k.machine.disks.image('sda')!
 check('能取到 sda 整盘字节', sdaImage.length === 1024 * 1024, `${sdaImage.length} B`)
 
 const fromImage = new Kernel()
-const imageErr = await fromImage.boot({ kind: 'image', bytes: sdaImage, filename: 'sda.img' })
+const imageErr = await fromImage.machine.powerOn({ kind: 'image', bytes: sdaImage, filename: 'sda.img' })
 check('从 .img 引导成功', imageErr === null && fromImage.panic === null, imageErr ?? fromImage.panic ?? '')
 check(
   '从 .img 引导后系统程序就位',
@@ -101,17 +102,26 @@ check(
 await fromImage.destroy()
 
 const shortImage = new Kernel()
-const shortErr = await shortImage.boot({ kind: 'image', bytes: new Uint8Array(4096), filename: 'junk.img' })
-check('长度不对的镜像被拒', typeof shortErr === 'string' && shortErr.length > 0, String(shortErr))
+// 短镜像由盘位按零补齐（与真机一样），随后被操作系统当成非 ext2 盘拒掉
+const shortErr = await shortImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(4096), filename: 'junk.img' })
+check('短镜像被补齐后拒掉（不是 ext2）', typeof shortErr === 'string' && shortErr.length > 0, String(shortErr))
 await shortImage.destroy()
 
 const blankImage = new Kernel()
-const blankErr = await blankImage.boot({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
+const blankErr = await blankImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(1024 * 1024), filename: 'blank.img' })
 check('全零镜像被拒且给出原因', typeof blankErr === 'string' && blankErr.length > 0, String(blankErr))
 await blankImage.destroy()
 
+// 介质层面的问题由盘位当场说清楚，用不着操作系统出面
+const hugeImage = new Kernel()
+const hugeErr = await hugeImage.machine.powerOn({ kind: 'image', bytes: new Uint8Array(1024 * 1024 + 1), filename: 'huge.img' })
+check('比盘还长的镜像被盘位拒收', typeof hugeErr === 'string' && hugeErr.length > 0, String(hugeErr))
+check('被拒收的介质不会留在盘位上', hugeImage.machine.disks.system === null)
+check('机器没上电，操作系统没接管', hugeImage.panic === null)
+await hugeImage.destroy()
+
 const noStore = new Kernel()
-const storeErr = await noStore.boot({ kind: 'stored' })
+const storeErr = await noStore.machine.powerOn({ kind: 'stored' })
 check('没有 IndexedDB 时明确报错', typeof storeErr === 'string' && storeErr.length > 0, String(storeErr))
 await noStore.destroy()
 
