@@ -900,7 +900,6 @@ logout:
     call clear_screen
     mov r0, 1
     mov r1, 1
-    mov r2, bye
     mov r3, 0
     sys
     mov r1, 0
@@ -939,7 +938,6 @@ post:   .asciz "$ "
 homeroot: .asciz "/"
 bgmsg:  .asciz "[background]\\n"
 nf:     .asciz "sh: command not found\\n"
-bye:    .asciz "logout\\n"
 sfail:  .asciz "sh: cannot open script\\n"
 rfail:  .asciz "sh: cannot open redirection target\\n"
 clear_seq:
