@@ -64,7 +64,7 @@ Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
     root:0:$2b$12$…:lmbka        名字:uid:bcrypt 散列:权限
 
 新密码以 bcrypt cost 12 散列，并为每次更改生成独立的随机盐；
-密码至少 15 个 Unicode 字符，账户文件权限为 0600。`-` 表示首次
+密码至少 6 个 Unicode 字符，账户文件权限为 0600。`-` 表示首次
 初始化，`!` 表示锁定。出厂 root 首次登录时必须设密码；`useradd`
 创建的账户默认锁定，root 设好密码后才能登录。`userdel` 删除账户，
 `passwd` 修改密码，`users` 只输出非敏感账户信息。普通用户修改密码

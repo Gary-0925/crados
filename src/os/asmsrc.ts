@@ -2519,7 +2519,6 @@ retry:
     mov r1, 1
     hlt
 fail:
-    call clear_screen
     mov r0, 1
     mov r1, 2
     mov r2, badmsg
@@ -2533,7 +2532,6 @@ fail:
     mov r1, 1
     hlt
 spawnfail:
-    call clear_screen
     mov r0, 1
     mov r1, 2
     mov r2, spfail
@@ -3093,7 +3091,7 @@ nouser:
 authmsg:
     .asciz "passwd: authentication failed\\n"
 weakmsg:
-    .asciz "passwd: use at least 15 characters; maximum is 72 UTF-8 bytes\\n"
+    .asciz "passwd: use at least 6 characters; maximum is 72 UTF-8 bytes\\n"
 cryptomsg:
     .asciz "passwd: password service unavailable\\n"
 cancel:

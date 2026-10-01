@@ -68,7 +68,7 @@ The account table lives in `/etc/passwd`, one line per account:
     root:0:$2b$12$…:lmbka        name:uid:bcrypt hash:perms
 
 New passwords use bcrypt with cost 12 and a fresh random salt per account.
-Passwords must contain at least 15 Unicode characters. The account file is
+Passwords must contain at least 6 Unicode characters. The account file is
 mode 0600. `-` marks first-time initialization and `!` marks a locked
 account. The factory root account must set its password at first login;
 accounts created by `useradd` stay locked until root sets a password.

@@ -36,10 +36,10 @@ check('每次散列使用不同随机盐', !!hash && !!secondHash && bcrypt.getS
 check('散列不包含明文', !!hash && !hash.includes(secret))
 check('正确密码可验证', !!hash && passwords.verifyPassword(secret, hash) === 'match')
 check('错误密码不能验证', !!hash && passwords.verifyPassword('incorrect-password', hash) === 'invalid')
-check('15 个 Unicode 字符可通过策略', passwords.passwordPolicy('🔐'.repeat(15)))
-check('短密码被拒绝', !passwords.passwordPolicy('short-password'))
+check('6 个 Unicode 字符可通过策略', passwords.passwordPolicy('🔐'.repeat(6)))
+check('短密码被拒绝', !passwords.passwordPolicy('short'))
 check('超过 bcrypt 输入上限的密码被拒绝', !passwords.passwordPolicy('a'.repeat(73)))
-check('未配对代理项被拒绝', !passwords.passwordPolicy('\ud800'.repeat(15)))
+check('未配对代理项被拒绝', !passwords.passwordPolicy('\ud800'.repeat(6)))
 check('空密码不能生成散列或验证', passwords.hashPassword('') === null && passwords.verifyPassword('', '5381') === 'invalid')
 
 let legacy = 5381
