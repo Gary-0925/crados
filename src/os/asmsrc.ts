@@ -9,8 +9,8 @@
 //   12 getcwd(buf)        13 unlink(path)       14 mkdir(path)
 //   15 chmod(path,set,clr) 16 rename(a,b)        17 sync()       18 getenv(key,buf)
 //   20 mount(dev,dir)     21 umount(target)     22 kill(pid,sig)
-//   35 getuid → r0 uid, r1 euid   36 ttyecho(on)  38 spawnas(path,uid)
-//   39 chown(path,uid)
+//   35 getuid → r0 uid, r1 euid   36 ttyecho(on)  37 password(op, secret, target)
+//   38 spawnas(path,uid)  39 chown(path,uid)
 import { OS_VERSION } from './version'
 
 
@@ -129,15 +129,22 @@ al_copy:
     cmp r7, 0
     je al_loop
     ldb r0, [r1+0]
-    cmp r6, 508
-    je al_skip
+    cmp r6, 636
+    je al_overflow
     stb [r5+0], r0
     add r5, 1
     add r6, 1
-al_skip:
     add r1, 1
     sub r7, 1
     jmp al_copy
+al_overflow:
+    push r4
+    mov r0, 5
+    mov r1, r4
+    sys
+    pop r4
+    mov r0, 65535
+    ret
 al_close:
     push r5
     mov r0, 5
@@ -203,19 +210,28 @@ af_uid_done:
     add r2, 1
     mov r0, 0
     stw [r0+f_uid], r3
-    stw [r0+f_hash], r2
     stw [r0+f_line], r6
-af_skip_hash:
-    ldb r4, [r2+0]
-    cmp r4, 58
-    je af_perms
-    cmp r4, 0
+    mov r4, accthash
+    stw [r0+f_hash], r4
+    mov r7, 0
+af_hash_copy:
+    ldb r3, [r2+0]
+    cmp r3, 58
+    je af_hash_done
+    cmp r3, 0
     je af_next
-    cmp r4, 10
+    cmp r3, 10
     je af_next
+    cmp r7, 60
+    je af_next
+    stb [r4+0], r3
     add r2, 1
-    jmp af_skip_hash
-af_perms:
+    add r4, 1
+    add r7, 1
+    jmp af_hash_copy
+af_hash_done:
+    mov r3, 0
+    stb [r4+0], r3
     add r2, 1
     stw [r0+f_perms], r2
     mov r0, 0
@@ -235,26 +251,6 @@ af_next_line:
     jmp af_line
 af_fail:
     mov r0, 65535
-    ret
-`
-
-// hash_pass: r1 = 密码（NUL 结尾），16 位 djb2 写进 hashval
-const HASH_PASS = `
-hash_pass:
-    mov r7, 5381
-hp_loop:
-    ldb r3, [r1+0]
-    cmp r3, 0
-    je hp_done
-    mov r4, r7
-    mul r4, 33
-    xor r4, r3
-    mov r7, r4
-    add r1, 1
-    jmp hp_loop
-hp_done:
-    mov r4, 0
-    stw [r4+hashval], r7
     ret
 `
 
@@ -378,7 +374,9 @@ const ACCT_DATA = `
 acctpath:
     .asciz "/etc/passwd"
 acctbuf:
-    .space 512
+    .space 640
+accthash:
+    .space 64
 chunk:
     .space 128
 find_tgt:
@@ -390,8 +388,6 @@ f_hash:
 f_perms:
     .word 0
 f_line:
-    .word 0
-hashval:
     .word 0
 aw_src:
     .word 0
@@ -904,7 +900,6 @@ logout:
     call clear_screen
     mov r0, 1
     mov r1, 1
-    mov r2, bye
     mov r3, 0
     sys
     mov r1, 0
@@ -943,7 +938,6 @@ post:   .asciz "$ "
 homeroot: .asciz "/"
 bgmsg:  .asciz "[background]\\n"
 nf:     .asciz "sh: command not found\\n"
-bye:    .asciz "logout\\n"
 sfail:  .asciz "sh: cannot open script\\n"
 rfail:  .asciz "sh: cannot open redirection target\\n"
 clear_seq:
@@ -2386,18 +2380,16 @@ err: .asciz "as: assembly failed\\n"
 use: .asciz "usage: as source.s -o output\\n"
 `,
 
-  login: `; login — console account authentication; init starts this instead of sh.
-; setuid root. No arguments: the console login loop. With an account name:
-; authenticate and hand back one shell, which is what su is built on.
+  login: `
 .text
 _start:
     mov r0, 0
     mov r7, 0
-    stb [r0+mode], r7   ; 0 = console loop
+    stb [r0+mode], r7
     cmp r1, 0
     je ask_name
     mov r7, 1
-    stb [r0+mode], r7   ; 1 = one-shot (su)
+    stb [r0+mode], r7
     mov r5, r2
     jmp target_ready
 ask_name:
@@ -2419,22 +2411,31 @@ ask_name:
 target_ready:
     call acct_find
     cmp r0, 0
-    je found
-    mov r2, badmsg
-    jmp fail
+    jne fail
 found:
-    ; 哈希是 "-"（未设密码）→ 免密码直接登录
     mov r0, 0
     ldw r1, [r0+f_hash]
     ldb r2, [r1+0]
     cmp r2, 45
-    jne chk_su
+    jne check_locked
     ldb r2, [r1+1]
-    cmp r2, 58
-    je do_login
-chk_su:
-    ; 仅 su 模式：真实 uid 0（root 调 su）免密码。控制台登录进程本身恒为
-    ; uid 0，不能套用该豁免，否则任何账户都能免密登录。
+    cmp r2, 0
+    jne fail
+    mov r0, 0
+    ldb r2, [r0+mode]
+    cmp r2, 0
+    jne fail
+    ldw r3, [r0+f_uid]
+    cmp r3, 0
+    jne fail
+    mov r2, setupmsg
+    call start_passwd
+    cmp r0, 0
+    jne spawnfail
+    jmp ask_name
+check_locked:
+    cmp r2, 33
+    je fail
     mov r0, 0
     ldb r2, [r0+mode]
     cmp r2, 0
@@ -2442,7 +2443,7 @@ chk_su:
     mov r0, 35
     sys
     cmp r0, 0
-    je do_login
+    je login_ok
 need_pass:
     mov r0, 1
     mov r1, 1
@@ -2455,7 +2456,7 @@ need_pass:
     mov r0, 2
     mov r1, 0
     mov r2, passbuf
-    mov r3, 31
+    mov r3, 256
     sys
     push r0
     mov r0, 36
@@ -2464,17 +2465,31 @@ need_pass:
     pop r0
     cmp r0, 65535
     je retry
-    mov r1, passbuf
-    call hash_pass
+    mov r4, 0
+    ldw r3, [r4+find_tgt]
+    mov r0, 37
+    mov r1, 2
+    mov r2, passbuf
+    sys
+    push r0
+    call clear_pass
+    pop r0
+    cmp r0, 0
+    je login_ok
+    cmp r0, 1
+    jne fail
     mov r0, 0
-    ldw r5, [r0+f_hash]
-    call atoi
+    ldb r2, [r0+mode]
+    cmp r2, 0
+    jne login_ok
+    mov r2, legacymsg
+    call start_passwd
+    cmp r0, 0
+    jne spawnfail
+    jmp ask_name
+login_ok:
     mov r0, 0
-    ldw r1, [r0+hashval]
-    cmp r4, r1
-    je do_login
-    mov r2, badmsg
-    jmp fail
+    stw [r0+attempts], r0
 do_login:
     call clear_screen
     mov r0, 38
@@ -2502,12 +2517,12 @@ retry:
     mov r1, 1
     hlt
 fail:
-    call clear_screen
     mov r0, 1
     mov r1, 2
     mov r2, badmsg
     mov r3, 0
     sys
+    call login_backoff
     mov r0, 0
     ldb r7, [r0+mode]
     cmp r7, 0
@@ -2515,7 +2530,6 @@ fail:
     mov r1, 1
     hlt
 spawnfail:
-    call clear_screen
     mov r0, 1
     mov r1, 2
     mov r2, spfail
@@ -2527,10 +2541,71 @@ spawnfail:
     je ask_name
     mov r1, 1
     hlt
+start_passwd:
+    mov r0, 1
+    mov r1, 1
+    mov r3, 0
+    sys
+    mov r0, 9
+    mov r1, passwdpath
+    mov r2, namebuf
+    mov r3, 1
+    sys
+    cmp r0, 65535
+    je start_passwd_failed
+    mov r4, r0
+    mov r0, 10
+    mov r1, r4
+    sys
+    mov r0, 0
+    ret
+start_passwd_failed:
+    mov r0, 65535
+    ret
+login_backoff:
+    mov r0, 0
+    ldw r6, [r0+attempts]
+    cmp r6, 5
+    jlt backoff_exp
+    mov r7, 30
+    jmp backoff_sleep
+backoff_exp:
+    mov r7, 1
+backoff_loop:
+    cmp r6, 0
+    je backoff_sleep
+    add r7, r7
+    sub r6, 1
+    jmp backoff_loop
+backoff_sleep:
+    mov r0, 34
+    mov r1, r7
+    sys
+    mov r0, 0
+    ldw r6, [r0+attempts]
+    cmp r6, 5
+    jlt backoff_increment
+    jmp backoff_done
+backoff_increment:
+    add r6, 1
+    stw [r0+attempts], r6
+backoff_done:
+    ret
+clear_pass:
+    mov r1, passbuf
+    mov r6, 0
+clear_pass_loop:
+    cmp r6, 257
+    je clear_pass_done
+    mov r7, 0
+    stb [r1+0], r7
+    add r1, 1
+    add r6, 1
+    jmp clear_pass_loop
+clear_pass_done:
+    ret
 ${ACCT_LOAD}
 ${ACCT_FIND}
-${HASH_PASS}
-${ATOI}
 ${CLEAR_SCREEN}
 .data
 ${ACCT_DATA}
@@ -2541,18 +2616,26 @@ nprompt:
     .asciz "crados login: "
 pprompt:
     .asciz "Password: "
+setupmsg:
+    .asciz "Set an initial password for root.\\n"
+legacymsg:
+    .asciz "Password storage needs an upgrade. Set a new password.\\n"
 badmsg:
     .asciz "login incorrect\\n"
 spfail:
     .asciz "login: cannot start shell\\n"
 shpath:
     .asciz "/bin/sh"
+passwdpath:
+    .asciz "/bin/passwd"
 namebuf:
     .space 32
 passbuf:
-    .space 32
+    .space 257
 mode:
     .byte 0
+attempts:
+    .word 0
 `,
 
   su: `; su — switch account; delegates to the setuid login program
@@ -2737,9 +2820,7 @@ err:
     .asciz "users: cannot read /etc/passwd\\n"
 `,
 
-  passwd: `; passwd — change an account's password. setuid root.
-; passwd [name]: real uid 0 may change any account; everyone else only their own.
-; With no argument changes $USER. An empty new password clears the password.
+  passwd: `
 .text
 _start:
     mov r4, r1
@@ -2749,13 +2830,19 @@ _start:
     mov r6, 0
     stw [r6+ruid], r0
     cmp r4, 0
-    jgt have_target
+    je current_user
+    cmp r4, 1
+    jne usage
+    mov r6, 0
+    stw [r6+target_name], r5
+    jmp check_current
+current_user:
     mov r0, 18
     mov r1, userkey
     mov r2, tgtbuf
     sys
     cmp r0, 0
-    jgt target_ready
+    jgt use_environment
     mov r0, 1
     mov r1, 2
     mov r2, nouser
@@ -2763,36 +2850,47 @@ _start:
     sys
     mov r1, 1
     hlt
-have_target:
-    ; argv[0] 就是目标账户名（argv 块不含程序名），r5 已指向它
-target_ready:
+use_environment:
     mov r6, 0
-    stw [r6+tgt], r5
-    call acct_find
-    cmp r0, 0
-    je known
-    mov r0, 1
-    mov r1, 2
-    mov r2, nosuch
-    mov r3, 0
-    sys
-    mov r1, 1
-    hlt
-known:
+    mov r1, tgtbuf
+    stw [r6+target_name], r1
+check_current:
     mov r6, 0
     ldw r1, [r6+ruid]
     cmp r1, 0
     je ask_new
-    ldw r2, [r6+f_uid]
-    cmp r1, r2
-    je ask_new
     mov r0, 1
-    mov r1, 2
-    mov r2, deny
+    mov r1, 1
+    mov r2, current_prompt
     mov r3, 0
     sys
+    mov r0, 36
+    mov r1, 0
+    sys
+    mov r0, 2
+    mov r1, 0
+    mov r2, secret
+    mov r3, 256
+    sys
+    push r0
+    mov r0, 36
     mov r1, 1
-    hlt
+    sys
+    pop r0
+    cmp r0, 65535
+    je cancelled
+    mov r6, 0
+    ldw r3, [r6+target_name]
+    mov r0, 37
+    mov r1, 2
+    mov r2, secret
+    sys
+    cmp r0, 0
+    je current_verified
+    cmp r0, 1
+    jne auth_failed
+current_verified:
+    call clear_secret
 ask_new:
     mov r0, 1
     mov r1, 1
@@ -2804,8 +2902,8 @@ ask_new:
     sys
     mov r0, 2
     mov r1, 0
-    mov r2, p1
-    mov r3, 31
+    mov r2, secret
+    mov r3, 256
     sys
     push r0
     mov r0, 36
@@ -2814,6 +2912,20 @@ ask_new:
     pop r0
     cmp r0, 65535
     je cancelled
+    mov r0, 37
+    mov r1, 1
+    mov r2, secret
+    mov r3, hashbuf
+    sys
+    push r0
+    call clear_secret
+    pop r0
+    cmp r0, 60
+    je ask_confirm
+    cmp r0, 2
+    je weak_password
+    jmp crypto_failed
+ask_confirm:
     mov r0, 1
     mov r1, 1
     mov r2, np2
@@ -2824,8 +2936,8 @@ ask_new:
     sys
     mov r0, 2
     mov r1, 0
-    mov r2, p2
-    mov r3, 31
+    mov r2, secret
+    mov r3, 256
     sys
     push r0
     mov r0, 36
@@ -2834,19 +2946,17 @@ ask_new:
     pop r0
     cmp r0, 65535
     je cancelled
-    mov r1, p1
-    mov r2, p2
-cmp_loop:
-    ldb r3, [r1+0]
-    ldb r4, [r2+0]
-    cmp r3, r4
-    jne mismatch
-    cmp r3, 0
-    je match_ok
-    add r1, 1
-    add r2, 1
-    jmp cmp_loop
-mismatch:
+    mov r0, 37
+    mov r1, 4
+    mov r2, secret
+    mov r3, hashbuf
+    sys
+    push r0
+    call clear_secret
+    pop r0
+    cmp r0, 0
+    je update_password
+    call clear_hash
     mov r0, 1
     mov r1, 2
     mov r2, nomatch
@@ -2854,112 +2964,16 @@ mismatch:
     sys
     mov r1, 1
     hlt
-cancelled:
-    mov r0, 1
-    mov r1, 2
-    mov r2, cancel
-    mov r3, 0
+update_password:
+    mov r6, 0
+    ldw r2, [r6+target_name]
+    mov r3, hashbuf
+    mov r0, 37
+    mov r1, 3
     sys
-    mov r1, 1
-    hlt
-match_ok:
-    mov r1, p1
-    ldb r7, [r1+0]
-    cmp r7, 0
-    jne hash_it
-    mov r6, 0
-    mov r7, 1
-    stb [r6+dash], r7
-    jmp build
-hash_it:
-    mov r6, 0
-    mov r7, 0
-    stb [r6+dash], r7
-    call hash_pass
-build:
-    ; rebuild the table: lines before the target as-is, the target line with
-    ; the new hash field, then the rest
-    mov r1, acctbuf
-    mov r2, outbuf
-    mov r6, 0
-    ldw r3, [r6+f_line]
-rw_loop:
-    cmp r1, r3
-    je rw_target
-    ldb r7, [r1+0]
-    cmp r7, 0
-    je rw_done
-    call line_copy
-    jmp rw_loop
-rw_target:
-t_name:
-    ldb r7, [r1+0]
-    stb [r2+0], r7
-    add r1, 1
-    add r2, 1
-    cmp r7, 58
-    jne t_name
-t_uid:
-    ldb r7, [r1+0]
-    stb [r2+0], r7
-    add r1, 1
-    add r2, 1
-    cmp r7, 58
-    jne t_uid
-    mov r6, 0
-    ldb r7, [r6+dash]
-    cmp r7, 0
-    jne t_dash
-    ldw r4, [r6+hashval]
-    mov r5, r2
-    push r1         ; mem_itoa 破坏 r1（acctbuf 游标），必须保护
-    call mem_itoa
-    pop r1
-    mov r2, r5
-    jmp t_colon
-t_dash:
-    mov r7, 45
-    stb [r2+0], r7
-    add r2, 1
-t_colon:
-    mov r7, 58
-    stb [r2+0], r7
-    add r2, 1
-t_skip_hash:
-    ; 跳过旧哈希；把分隔冒号一并吃掉（t_colon 已经写过冒号了）
-    ldb r7, [r1+0]
-    cmp r7, 0
-    je rw_done
-    add r1, 1
-    cmp r7, 58
-    jne t_skip_hash
-    jmp t_tail
-t_tail:
-    ldb r7, [r1+0]
-    cmp r7, 0
-    je rw_done
-    stb [r2+0], r7
-    cmp r7, 10
-    je rw_after
-    add r1, 1
-    add r2, 1
-    jmp t_tail
-rw_after:
-    add r1, 1
-    add r2, 1
-rw_rest:
-    ldb r7, [r1+0]
-    cmp r7, 0
-    je rw_done
-    call line_copy
-    jmp rw_rest
-rw_done:
-    mov r7, 0
-    stb [r2+0], r7
-    mov r1, outbuf
-    call acct_write
     cmp r0, 0
     je pw_ok
+    call clear_hash
     mov r0, 1
     mov r1, 2
     mov r2, wfail
@@ -2967,7 +2981,55 @@ rw_done:
     sys
     mov r1, 1
     hlt
+auth_failed:
+    call clear_secret
+    mov r0, 1
+    mov r1, 2
+    mov r2, authmsg
+    mov r3, 0
+    sys
+    mov r0, 34
+    mov r1, 1
+    sys
+    mov r1, 1
+    hlt
+weak_password:
+    mov r0, 1
+    mov r1, 2
+    mov r2, weakmsg
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
+crypto_failed:
+    mov r0, 1
+    mov r1, 2
+    mov r2, cryptomsg
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
+cancelled:
+    call clear_secret
+    call clear_hash
+    mov r0, 1
+    mov r1, 2
+    mov r2, cancel
+    mov r3, 0
+    sys
+    mov r1, 1
+    hlt
+usage:
+    mov r0, 1
+    mov r1, 2
+    mov r2, use
+    mov r3, 0
+    sys
+    mov r1, 2
+    hlt
 pw_ok:
+    call clear_secret
+    call clear_hash
     mov r0, 1
     mov r1, 1
     mov r2, okmsg
@@ -2975,53 +3037,72 @@ pw_ok:
     sys
     mov r1, 0
     hlt
-${ARGN}
-${ACCT_LOAD}
-${ACCT_FIND}
-${HASH_PASS}
-${LINE_COPY}
-${ACCT_WRITE}
-${MEM_ITOA}
+clear_secret:
+    mov r1, secret
+    mov r6, 0
+clear_secret_loop:
+    cmp r6, 257
+    je clear_secret_done
+    mov r7, 0
+    stb [r1+0], r7
+    add r1, 1
+    add r6, 1
+    jmp clear_secret_loop
+clear_secret_done:
+    ret
+clear_hash:
+    mov r1, hashbuf
+    mov r6, 0
+clear_hash_loop:
+    cmp r6, 64
+    je clear_hash_done
+    mov r7, 0
+    stb [r1+0], r7
+    add r1, 1
+    add r6, 1
+    jmp clear_hash_loop
+clear_hash_done:
+    ret
 .data
-${ACCT_DATA}
 ruid:
     .word 0
-tgt:
+target_name:
     .word 0
-dash:
-    .byte 0
 tgtbuf:
     .space 32
-p1:
-    .space 32
-p2:
-    .space 32
-outbuf:
-    .space 640
+secret:
+    .space 257
+hashbuf:
+    .space 64
 userkey:
     .asciz "USER"
+current_prompt:
+    .asciz "Current password: "
 np1:
     .asciz "New password: "
 np2:
     .asciz "Retype new password: "
 nomatch:
     .asciz "passwd: passwords do not match\\n"
-nosuch:
-    .asciz "passwd: no such account\\n"
 nouser:
     .asciz "passwd: USER not set\\n"
-deny:
-    .asciz "passwd: you may only change your own password\\n"
+authmsg:
+    .asciz "passwd: authentication failed\\n"
+weakmsg:
+    .asciz "passwd: use at least 6 characters; maximum is 72 UTF-8 bytes\\n"
+cryptomsg:
+    .asciz "passwd: password service unavailable\\n"
 cancel:
     .asciz "passwd: cancelled\\n"
 wfail:
-    .asciz "passwd: cannot write /etc/passwd\\n"
+    .asciz "passwd: cannot update password\\n"
 okmsg:
     .asciz "password updated\\n"
+use:
+    .asciz "usage: passwd [name]\\n"
 `,
 
-  useradd: `; useradd name — create an account: next free uid, no password,
-; permissions lmbk, home directory /home/name. root only.
+  useradd: `; useradd name — create a locked account with permissions lmbk and /home/name. root only.
 .text
 _start:
     mov r4, r1
@@ -3188,6 +3269,10 @@ ap_copy:
     add r2, 1
     jmp ap_copy
 ap_written:
+    mov r6, r2
+    sub r6, outbuf
+    cmp r6, 636
+    jgt full
     mov r1, outbuf
     call acct_write
     cmp r0, 0
@@ -3273,13 +3358,13 @@ tgt:
 new_uid:
     .word 0
 outbuf:
-    .space 640
+    .space 704
 homebuf:
-    .space 64
+    .space 32
 homepre:
     .asciz "/home/"
 ap_tail:
-    .asciz ":-:lmbk\\n"
+    .asciz ":!:lmbk\\n"
 deny:
     .asciz "useradd: only root can create accounts\\n"
 use:
@@ -3289,7 +3374,7 @@ badname:
 dup:
     .asciz "useradd: account exists\\n"
 fullmsg:
-    .asciz "useradd: uid space exhausted\\n"
+    .asciz "useradd: account table is full\\n"
 wfail:
     .asciz "useradd: cannot write /etc/passwd\\n"
 okmsg:
@@ -3434,9 +3519,9 @@ ${ACCT_DATA}
 tgt:
     .word 0
 outbuf:
-    .space 640
+    .space 704
 homebuf:
-    .space 64
+    .space 32
 homepre:
     .asciz "/home/"
 deny:
@@ -3665,7 +3750,7 @@ ${ACCT_DATA}
 tgt:
     .word 0
 outbuf:
-    .space 640
+    .space 704
 pset:
     .space 8
 deny:

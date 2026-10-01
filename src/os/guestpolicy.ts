@@ -1672,6 +1672,10 @@ gp_setuid_from:
     mov r4, 0
     ldw r1, [r4+0x0056]
     call vfs_uid
+    cmp r0, 65535
+    je gp_setuid_done
+    mov r4, 0
+    stw [r4+0x005C], r0
 gp_setuid_done:
     ret
 

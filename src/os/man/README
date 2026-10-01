@@ -34,7 +34,7 @@ it. Whatever you pick, the disk is written back to IndexedDB as you work.
 
 ## First steps
 
-Log in as `root` (empty password by default), then:
+On the first root login, set a password when prompted. After logging in:
 
     ls -l /bin
     cat count.s
@@ -51,11 +51,10 @@ Log in as `root` (empty password by default), then:
 3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
    <defunct> until its parent reaps it.
 4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Accounts. The factory has one account: root, empty password.
-   Run 'useradd alice', then 'passwd alice' to set her password,
-   'exit', and log in as alice. 'users' prints the account table;
-   'chperm alice lk' changes her permission letters (drop 'l' to
-   lock the account). Only root may useradd, passwd other accounts,
+5. Accounts. Run 'useradd alice' to create a locked account, then
+   'passwd alice' to set her password. After 'exit', log in as alice.
+   'users' displays account names, UIDs and permissions. Dropping 'l'
+   locks console login. Only root may useradd, passwd other accounts,
    chperm or chown.
 6. Permissions. A non-root shell cannot kill root's processes:
    start 'sleep 60 &' as root, then try 'kill <pid>' as alice —
@@ -64,14 +63,21 @@ Log in as `root` (empty password by default), then:
 
 ## Accounts and permission letters
 
-The account table lives in /etc/passwd, one line per account:
+The account table lives in `/etc/passwd`, one line per account:
 
-    root:0:-:lmbka        name:uid:password-hash:perms
+    root:0:$2b$12$…:lmbka        name:uid:bcrypt hash:perms
 
-The hash is the password's djb2 value in decimal; '-' means no
-password. The factory ships exactly one account: root, empty password.
-useradd creates accounts (default perms 'lmbk'), userdel removes them,
-passwd sets passwords, users prints the table.
+New passwords use bcrypt with cost 12 and a fresh random salt per account.
+Passwords must contain at least 6 Unicode characters. The account file is
+mode 0600. `-` marks first-time initialization and `!` marks a locked
+account. The factory root account must set its password at first login;
+accounts created by `useradd` stay locked until root sets a password.
+`userdel` removes accounts, `passwd` changes passwords, and `users` only
+prints non-sensitive account data. Non-root password changes require the
+current password. Legacy numeric hashes can still authenticate for migration:
+console login requires an immediate password replacement, and `passwd` always
+writes a bcrypt hash. Disk images are not encrypted; anyone who obtains an image
+can attempt offline guesses, so use a unique passphrase.
 
 Each account carries a set of permission letters:
 

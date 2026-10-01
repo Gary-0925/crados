@@ -1,46 +1,44 @@
-// 账户表：根盘上的 /etc/passwd，一行一个账户，全部是磁盘字节。
-//
-//   name:uid:hash:perms
-//
-//   name   1..8 个字符，小写字母开头，允许字母数字 _ -
-//   uid    十进制，root 固定为 0
-//   hash   密码的 djb2-16 校验值（十进制）；"-" 表示空密码
-//   perms  权限字母的子集："-" 表示没有
-//            l  允许从控制台登录（去掉即锁定账户）
-//            m  允许 mount/umount
-//            b  允许 block_read/block_write 原始块读写
-//            k  允许向其他账户的进程发信号
-//            a  管理员：登录会话以有效 uid 0 运行
-//          uid 0 永远隐式拥有全部权限。
-//
-// 哈希只有 16 位，挡不住任何认真的攻击——这是教学系统，账户表的意义
-// 在于把"密码"和"权限"变成真实的盘上字段，而不是提供真正的安全。
-// 校验与写入都在 CRX 系统程序里（见 asmsrc.ts 的 hash_pass），宿主只认字段格式。
+import { isPasswordHash } from './password'
 
 export interface Account {
   name: string
   uid: number
-  hash: string // '-' = 空密码
-  perms: string // '-' = 无
+  hash: string
+  perms: string
 }
 
 export const ROOT_NAME = 'root'
 export const PERM_LETTERS = 'lmbka'
+export const LOCKED_PASSWORD = '!'
+export const INITIAL_PASSWORD = '-'
+
+const validName = /^[a-z][a-z0-9_-]{0,7}$/
+const validUid = /^(0|[1-9][0-9]{0,4})$/
 
 export const parsePasswd = (text: string): Account[] => {
   const out: Account[] = []
-  for (const line of text.split('\n')) {
-    const rec = line.trim()
-    if (!rec) continue
-    const [name, uid, hash, perms] = rec.split(':')
-    if (!name || uid === undefined) continue
-    const n = Number(uid)
-    if (!Number.isInteger(n) || n < 0 || n > 65535) continue
+  const names = new Set<string>()
+  const uids = new Set<number>()
+
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    const fields = line.split(':')
+    if (fields.length !== 4) continue
+    const [name, uidText, hash, permsText] = fields
+    if (!validName.test(name) || !validUid.test(uidText) || !isPasswordHash(hash)) continue
+    if (permsText !== '-' && (!/^[lmbka]+$/.test(permsText) || new Set(permsText).size !== permsText.length)) continue
+
+    const uid = Number(uidText)
+    if (uid > 65535 || (name === ROOT_NAME) !== (uid === 0) || names.has(name) || uids.has(uid)) continue
+
+    names.add(name)
+    uids.add(uid)
     out.push({
-      name: name.slice(0, 8),
-      uid: n,
-      hash: hash && hash !== '' ? hash : '-',
-      perms: perms && perms !== '' ? perms : '-',
+      name,
+      uid,
+      hash,
+      perms: permsText === '-' ? '-' : permsText,
     })
   }
   return out
@@ -49,7 +47,6 @@ export const parsePasswd = (text: string): Account[] => {
 export const serializePasswd = (list: Account[]): string =>
   list.map((a) => `${a.name}:${a.uid}:${a.hash}:${a.perms}`).join('\n') + '\n'
 
-// 出厂默认：只有 root，密码为空。
 export const factoryAccounts = (): Account[] => [
-  { name: ROOT_NAME, uid: 0, hash: '-', perms: PERM_LETTERS },
+  { name: ROOT_NAME, uid: 0, hash: INITIAL_PASSWORD, perms: PERM_LETTERS },
 ]

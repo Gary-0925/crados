@@ -1,7 +1,7 @@
 {
   "name": "crados",
   "private": true,
-  "version": "5.0",
+  "version": "5.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,12 +9,14 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "check": "npm run typecheck && npm run parts && npm run smoke && npm run persist && npm run ext2",
+    "check": "npm run typecheck && npm run parts && npm run password && npm run smoke && npm run persist && npm run ext2",
     "ext2": "node scripts/ext2-check.mjs",
+    "password": "node scripts/password-check.mjs",
     "persist": "node scripts/persist-check.mjs",
     "parts": "node scripts/parts-check.mjs"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "clsx": "2.1.1",
     "lucide-react": "^1.48.0",
     "react": "19.2.6",
@@ -27,10 +29,10 @@
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
-    "esbuild": "0.27.7",
+    "esbuild": "^0.28.2",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
-    "vite": "7.3.2",
+    "vite": "^7.3.6",
     "vite-plugin-singlefile": "2.3.0"
   }
 }

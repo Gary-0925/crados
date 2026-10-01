@@ -8,14 +8,15 @@
 // 与总线，操作系统出引导、进程、文件系统与权限。两边只通过 MachineSoftware 接口
 // 往来：机器每个时钟沿叫一次操作系统，块控制器放行用户态原始读写前问一次授权。
 
-import { factoryAccounts, parsePasswd, serializePasswd } from './accounts'
+import { factoryAccounts, INITIAL_PASSWORD, LOCKED_PASSWORD, parsePasswd, serializePasswd } from './accounts'
 import type { Account } from './accounts'
+import { decodePasswordBytes, hashPassword, isPasswordHash, verifyPassword } from './password'
 import {
   FS,
   lookupAbs,
   M_SETUID,
   MODE_DIR,
-  MODE_FILE,
+  MODE_SECRET,
   sameGeometry,
   systemGeometry,
   T_DIR,
@@ -110,6 +111,7 @@ export class Kernel implements MachineSoftware {
   private fgPid: number | null = null
 
   private readonly klog: { tick: number; msg: string }[] = []
+  private readonly passwordProofs = new Map<number, { uid: number; hash: string; expiresAt: number }>()
   /** 可移动设备当前的挂载点：键是设备名，值是挂载路径 */
   private readonly mounts = new Map<string, string>()
   /** 只有真正启动过的机器才配落盘：没启动成的机器上面可能是坏镜像 */
@@ -336,9 +338,8 @@ export class Kernel implements MachineSoftware {
       const ino = fs.create(bin, name, T_FILE)
       if (typeof ino !== 'number') continue
       fs.writeBytes(ino, r.bytes)
-      // login/passwd 需要以 root 的有效身份写 /etc/passwd、启动登录会话
-      const setuid = name === 'login' || name === 'passwd' ? M_SETUID : 0
-      fs.setFlags(ino, MODE_DIR | setuid) // 0755（可执行）
+      const setuid = ['login', 'passwd', 'users'].includes(name) ? M_SETUID : 0
+      fs.setFlags(ino, MODE_DIR | setuid)
       compiled++
     }
     return compiled
@@ -716,6 +717,7 @@ export class Kernel implements MachineSoftware {
   }
 
   private doExit(p: Process, code: number) {
+    this.passwordProofs.delete(p.pid)
     if (p.pid <= 1) {
       this.setPanic(`critical process ${p.pid} (${p.name}) attempted to exit with status ${code}`)
       return
@@ -929,19 +931,26 @@ export class Kernel implements MachineSoftware {
     return this.procs.get(pid)?.euid ?? null
   }
 
-  // 账户表只住在根盘。ext2 的盘出厂就带 /etc/passwd（由 rootimg 写进镜像），
-  // 这里只处理"导入的镜像里没有这张表"的情况。
   private ensureAccounts(name: string) {
     if (name !== 'sda') return
     const fs = this.fss.get(name)
-    if (!fs || !fs.valid() || fs.accountsReady()) return
+    if (!fs || !fs.valid()) return
+    const existing = lookupAbs(fs, '/etc/passwd')
+    if (existing && fs.accountsReady()) {
+      if (fs.iowner(existing) !== UID_ROOT || fs.iflags(existing) !== MODE_SECRET) {
+        fs.setOwner(existing, UID_ROOT)
+        fs.setFlags(existing, MODE_SECRET)
+        this.machine.disks.markDirty()
+      }
+      return
+    }
     for (const dir of ['home', 'root', 'etc', 'tmp']) {
       if (lookupAbs(fs, `/${dir}`)) continue
       const made = fs.create(ROOT_INO, dir, T_DIR)
       if (typeof made !== 'number') this.log(`accounts: cannot create /${dir}: ${made.err}`)
     }
     const accounts = factoryAccounts()
-    let ino = lookupAbs(fs, '/etc/passwd')
+    let ino = existing
     if (!ino) {
       const etc = lookupAbs(fs, '/etc')
       if (!etc) return
@@ -953,7 +962,8 @@ export class Kernel implements MachineSoftware {
       ino = made
     }
     fs.write(ino, serializePasswd(accounts))
-    fs.setFlags(ino, MODE_FILE) // 0644：哈希很弱，这是教学系统
+    fs.setOwner(ino, UID_ROOT)
+    fs.setFlags(ino, MODE_SECRET)
     this.machine.disks.markDirty()
     this.log(`accounts: ${accounts.length} account${accounts.length > 1 ? 's' : ''} in /etc/passwd (${accounts.map((a) => a.name).join(', ')})`)
   }
@@ -982,10 +992,97 @@ export class Kernel implements MachineSoftware {
       const acct = this.accountsOf().find((a) => a.uid === arg)
       if (!acct) return { err: 'ENOENT' }
       if (acct.uid !== UID_ROOT && !acct.perms.includes('l')) return { err: 'EACCES' }
+      if (acct.hash === INITIAL_PASSWORD || acct.hash === LOCKED_PASSWORD) return { err: 'EACCES' }
       return acct.perms.includes('a') ? 2 : 1
     }
     if (op === 3) return this.fillLoginEnv(arg)
     return { err: 'EINVAL' }
+  }
+
+  private hwPassword(p: Process, operation: number, passwordPointer: number, targetPointer: number): number {
+    if (p.euid !== UID_ROOT) return 0xffff
+    const bus = this.machine.busFor(p)
+    const readCString = (pointer: number, maxBytes: number): string | null => {
+      if (!Number.isInteger(pointer) || pointer < 0 || pointer > 0xffff) return null
+      const value: number[] = []
+      for (let i = 0; i <= maxBytes; i++) {
+        const address = pointer + i
+        if (address > 0xffff) return null
+        const byte = bus.readUser(address)
+        if (byte === 0) return decodePasswordBytes(Uint8Array.from(value))
+        if (i === maxBytes) return null
+        value.push(byte)
+      }
+      return null
+    }
+
+    try {
+      if (operation === 1) {
+        const password = readCString(passwordPointer, 256)
+        if (password === null) return 0xffff
+        const hash = hashPassword(password)
+        if (!hash) return 2
+        const encoded = UTF8_ENCODER.encode(hash)
+        if (!Number.isInteger(targetPointer) || targetPointer < 0 || targetPointer + encoded.length > 0xfffe) return 0xffff
+        for (let i = 0; i < encoded.length; i++) bus.writeUser(targetPointer + i, encoded[i])
+        bus.writeUser(targetPointer + encoded.length, 0)
+        return encoded.length
+      }
+
+      if (operation === 2) {
+        const password = readCString(passwordPointer, 256)
+        const name = readCString(targetPointer, 8)
+        if (password === null || !name) return 0xffff
+        const account = this.accountsOf().find((a) => a.name === name)
+        if (!account || account.hash === INITIAL_PASSWORD || account.hash === LOCKED_PASSWORD) return 0xffff
+        if (p.uid !== UID_ROOT && p.uid !== account.uid && p.name !== 'login') return 0xffff
+        const result = verifyPassword(password, account.hash)
+        if (result === 'invalid') return 0xffff
+        const now = Date.now()
+        for (const [pid, proof] of this.passwordProofs) if (proof.expiresAt <= now) this.passwordProofs.delete(pid)
+        if (p.name === 'passwd' && p.uid === account.uid) {
+          this.passwordProofs.set(p.pid, { uid: account.uid, hash: account.hash, expiresAt: now + 120_000 })
+        }
+        return result === 'match' ? 0 : 1
+      }
+
+      if (operation === 3) {
+        const name = readCString(passwordPointer, 8)
+        const hash = readCString(targetPointer, 128)
+        if (!name || !hash || !isPasswordHash(hash) || !hash.startsWith('$2b$12$')) return 0xffff
+        const fs = this.fss.get('sda')
+        const ino = fs ? lookupAbs(fs, '/etc/passwd') : 0
+        if (!fs || !ino || fs.itype(ino) !== T_FILE) return 0xffff
+        const text = fs.read(ino)
+        const rows = text.split('\n').filter((line) => line.length > 0)
+        const accounts = parsePasswd(text)
+        if (accounts.length !== rows.length) return 0xffff
+        const index = accounts.findIndex((a) => a.name === name)
+        if (index < 0) return 0xffff
+        const account = accounts[index]
+        if (p.uid !== UID_ROOT) {
+          const proof = this.passwordProofs.get(p.pid)
+          if (p.uid !== account.uid || !proof || proof.uid !== account.uid || proof.hash !== account.hash || proof.expiresAt <= Date.now()) return 0xffff
+        }
+        accounts[index] = { ...account, hash }
+        const result = fs.write(ino, serializePasswd(accounts))
+        if (isErr(result)) return 0xffff
+        this.machine.disks.markDirty()
+        this.passwordProofs.delete(p.pid)
+        return 0
+      }
+
+      if (operation === 4) {
+        const password = readCString(passwordPointer, 256)
+        const hash = readCString(targetPointer, 128)
+        if (password === null || !hash) return 0xffff
+        return verifyPassword(password, hash) === 'match' ? 0 : 0xffff
+      }
+
+      return 0xffff
+    } catch {
+      return 0xffff
+    }
   }
 
   private fillLoginEnv(at: number): number | Err {
@@ -1124,9 +1221,10 @@ export class Kernel implements MachineSoftware {
    *   43 hwacct(op, arg)            账户与权限（/etc/passwd 的解析在宿主）
    *   44 hwassemble(dev:ino → dev:ino)  汇编器（工具链）
    *   45 hwdisasm(dev:ino, buf)     反汇编器（工具链）
+   *   46 hwpassword(op, secretPtr, targetPtr) 受限密码操作
    * 号不对就是致命错误：与真正 CPU 上的非法系统调用一样，报给上层的是 Fault。
    */
-  private hypercall(p: Process, num: number, a1: number, a2: number): Syscall | null {
+  private hypercall(p: Process, num: number, a1: number, a2: number, a3: number): Syscall | null {
     switch (num) {
       case 3:
         return sys.exit(a1)
@@ -1152,6 +1250,8 @@ export class Kernel implements MachineSoftware {
       }
       case 45:
         return { call: 'hwdisasm', at: a1 }
+      case 46:
+        return { call: 'hwpassword', operation: a1, password: a2, target: a3 }
       default:
         return null
     }
@@ -1165,7 +1265,7 @@ export class Kernel implements MachineSoftware {
       this.doExit(p, trap.code)
       return
     }
-    const sc = this.hypercall(p, trap.num, trap.a1, trap.a2)
+    const sc = this.hypercall(p, trap.num, trap.a1, trap.a2, trap.a3)
     if (!sc) throw new Fault((p.cpu?.pc ?? 0) - 4, `unknown system call ${trap.num}`)
     let result: unknown = 0
 
@@ -1198,6 +1298,9 @@ export class Kernel implements MachineSoftware {
         break
       case 'hwdisasm':
         result = this.hwDisasm(p, sc.at)
+        break
+      case 'hwpassword':
+        result = this.hwPassword(p, sc.operation, sc.password, sc.target)
         break
     }
 

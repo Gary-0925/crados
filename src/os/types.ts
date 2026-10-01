@@ -34,6 +34,7 @@ export type Syscall =
   | { call: 'hwacct'; op: number; arg: number }
   | { call: 'hwassemble'; srcDev: number; srcIno: number; dstDev: number; dstIno: number }
   | { call: 'hwdisasm'; at: number }
+  | { call: 'hwpassword'; operation: number; password: number; target: number }
   | { call: 'mount'; dev: string; dir: string }
   | { call: 'umount'; target: string }
   | { call: 'sync' }
