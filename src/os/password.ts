@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs'
 
 export const PASSWORD_COST = 12
-export const PASSWORD_MIN_CODEPOINTS = 15
+export const PASSWORD_MIN_CODEPOINTS = 6
 export const PASSWORD_MAX_BYTES = 72
 
 const bcryptPattern = /^\$2[aby]\$(\d{2})\$[./A-Za-z0-9]{53}$/
