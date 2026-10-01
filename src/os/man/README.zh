@@ -32,7 +32,8 @@ Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
 
 ## 上手
 
-出厂只有一个账户：`root`，密码为空。登录后：
+出厂只有一个账户：`root`。首次以 root 登录时必须先设置密码；
+密码未设置的账户不能登录。登录后：
 
     ls -l /bin
     cat count.s
@@ -48,10 +49,9 @@ Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
 3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
    状态留存，直到父进程回收。
 4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 账户。出厂只有 root 一个账户，密码为空。运行 'useradd alice'，
-   再用 'passwd alice' 给她设密码，'exit' 后以 alice 登录。'users'
-   打印账户表；'chperm alice lk' 修改她的权限字母（去掉 'l' 即锁定
-   账户）。只有 root 可以 useradd、替别人 passwd、chperm、chown。
+5. 账户。运行 'useradd alice' 创建锁定账户，再用 'passwd alice' 设置密码，
+   'exit' 后以 alice 登录。'users' 只显示账户名、UID 与权限。去掉 'l' 会锁定
+   登录。只有 root 可以 useradd、替别人 passwd、chperm、chown。
 6. 权限。非 root 的 shell 杀不掉 root 的进程：以 root 运行
    'sleep 60 &'，再以 alice 执行 'kill <pid>'——在拿到 'k' 字母之前
    会返回 EPERM。
@@ -59,13 +59,18 @@ Linux 下的 e2fsck、debugfs、mount -o loop 都能原样读它。
 
 ## 账户与权限字母
 
-账户表存放在 /etc/passwd，每行一个账户：
+账户表存放在 `/etc/passwd`，每行一个账户：
 
-    root:0:-:lmbka        名字:uid:密码散列:权限
+    root:0:$2b$12$…:lmbka        名字:uid:bcrypt 散列:权限
 
-散列是密码的 djb2 值的十进制表示；'-' 表示没有密码。出厂状态只有
-一个账户：root，密码为空。useradd 创建账户（默认权限 'lmbk'），
-userdel 删除，passwd 设密码，users 打印账户表。
+新密码以 bcrypt cost 12 散列，并为每次更改生成独立的随机盐；
+密码至少 15 个 Unicode 字符，账户文件权限为 0600。`-` 表示首次
+初始化，`!` 表示锁定。出厂 root 首次登录时必须设密码；`useradd`
+创建的账户默认锁定，root 设好密码后才能登录。`userdel` 删除账户，
+`passwd` 修改密码，`users` 只输出非敏感账户信息。普通用户修改密码
+必须先验证当前密码。旧数值散列仍可用于迁移：控制台登录后会立即要求
+重设，新密码始终写为 bcrypt。磁盘镜像未加密；取得镜像的人可以离线
+尝试猜测，因此应使用未在其他地方复用的长密码。
 
 每个账户带一组权限字母：
 

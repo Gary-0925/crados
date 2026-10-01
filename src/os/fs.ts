@@ -49,6 +49,7 @@ export const M_SETUID = 0o4000
 
 // 常用模式直接写八进制，和 ls -l / chmod 的读法一致，避免位名组合出错
 export const MODE_FILE = 0o644
+export const MODE_SECRET = 0o600
 export const MODE_DIR = 0o755
 export const MODE_DEV = 0o666
 export const MODE_TMP = 0o1777
@@ -379,16 +380,17 @@ export function lookupAbs(fs: FS, path: string): number {
   return ino
 }
 
-/**
- * 系统盘权限策略。ext2 格式化时目录已经是 0755、文件 0644，这里只补那些
- * "出厂设置里没有、但语义上必须存在"的例外：/tmp 是 1777 的公共暂存区
- * （sticky 位让普通用户删不掉别人的文件）。
- */
+/** 系统盘目录、暂存区与账户数据库的权限策略。 */
 export function applySystemPolicy(fs: FS) {
   const tmp = lookupAbs(fs, '/tmp')
   if (tmp && fs.itype(tmp) === T_DIR) {
     fs.setOwner(tmp, UID_ROOT)
     fs.setFlags(tmp, MODE_TMP)
+  }
+  const passwd = lookupAbs(fs, '/etc/passwd')
+  if (passwd && fs.itype(passwd) === T_FILE) {
+    fs.setOwner(passwd, UID_ROOT)
+    fs.setFlags(passwd, MODE_SECRET)
   }
 }
 

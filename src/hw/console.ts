@@ -28,7 +28,6 @@ export const TTY_STATUS = 0xff10
 export const TTY_DATA = 0xff11
 export const TTY_MODE = 0xff12
 const CLEAR = '\x1b[2J'
-/** 键盘一行最多这么多个字符 */
 const LINE_CAP = 256
 
 const UTF8_ENCODER = new TextEncoder()
@@ -215,7 +214,7 @@ export class Console {
     // canonical tty 只接收可打印字符；Ctrl-C/D/L 走各自的入口。
     // 这样宿主浏览器产生的 DC1..DC4 等控制字节不会污染 argv 或文件。
     if (!ch || (ch.charCodeAt(0) < 0x20 && ch !== '\t')) return
-    if (this.lineBuf.length < LINE_CAP) this.lineBuf += ch
+    if (UTF8_ENCODER.encode(this.lineBuf + ch).length <= LINE_CAP) this.lineBuf += ch
     if (this.echoOn) this.write(ch, 'echo')
   }
 
@@ -228,12 +227,12 @@ export class Console {
 
   backspace() {
     if (!this.lineBuf) return
-    this.lineBuf = this.lineBuf.slice(0, -1)
+    this.lineBuf = Array.from(this.lineBuf).slice(0, -1).join('')
     if (this.echoOn) {
       const line = this.lines[this.lines.length - 1]
       const seg = line?.segs[line.segs.length - 1]
       if (seg) {
-        seg.t = seg.t.slice(0, -1)
+        seg.t = Array.from(seg.t).slice(0, -1).join('')
         if (!seg.t) line.segs.pop()
       }
     }

@@ -231,9 +231,51 @@ async function main() {
   check('新机器上电前系统盘位是空的', new Kernel().machine.disks.system === null)
   const fresh = new Kernel()
   check('创建空盘并装载系统', (await fresh.machine.powerOn({ kind: 'blank' })) === null && fresh.panic === null, fresh.panic ?? '')
+  const passwordScreen = () => fresh.machine.console.screen().map((line) => line.segs.map((segment) => segment.t).join('')).join('\n')
+  const passwordFingerprint = () => {
+    const lines = fresh.machine.console.screen()
+    return `${lines.length}|${lines.slice(-2).map((line) => line.segs.map((segment) => segment.t).join('')).join('\u0001')}`
+  }
+  const settlePassword = (quietTicks = 30, quietMs = 300, max = 40000) => {
+    let quiet = 0
+    let last = passwordFingerprint()
+    let lastChange = performance.now()
+    for (let i = 0; i < max; i++) {
+      fresh.step()
+      const next = passwordFingerprint()
+      if (next !== last) {
+        last = next
+        quiet = 0
+        lastChange = performance.now()
+      } else if (++quiet > quietTicks && performance.now() - lastChange > quietMs) return true
+    }
+    return false
+  }
+  const typePasswordLine = (text: string) => {
+    for (const character of text) fresh.typeChar(character)
+    fresh.pressEnter()
+  }
+  const rootPassword = 'persisted-root-passphrase-2026'
+  settlePassword()
+  typePasswordLine('root')
+  settlePassword()
+  check('新盘要求设置 root 密码', /Set an initial password for root/.test(passwordScreen()))
+  typePasswordLine(rootPassword)
+  settlePassword()
+  typePasswordLine(rootPassword)
+  settlePassword()
+  typePasswordLine('root')
+  settlePassword()
+  typePasswordLine(rootPassword)
+  settlePassword()
+  check('持久化测试账户已通过密码登录', /root@crados:\/root\$/.test(passwordScreen()))
+  const fs = fresh.filesystem('sda')!
+  const etcIno = fs.lookup(2, 'etc')
+  const passwdIno = etcIno ? fs.lookup(etcIno, 'passwd') : 0
+  const passwdText = passwdIno ? fs.read(passwdIno) : ''
+  check('密码更新写入 root-only bcrypt 账户文件', /^root:0:\$2b\$12\$[./A-Za-z0-9]{53}:lmbka$/m.test(passwdText) && fs.iflags(passwdIno) === 0o600)
 
   // 在系统盘上留一个只有这台机器有的痕迹
-  const fs = fresh.filesystem('sda')!
   const tmp = fresh.vfs.resolve('/tmp', '/')
   if ('err' in tmp) check('/tmp 可解析', false, tmp.err)
   else {
@@ -262,9 +304,16 @@ async function main() {
   const stored = new Kernel()
   check('从 IndexedDB 加载', (await stored.machine.powerOn({ kind: 'stored' })) === null && stored.panic === null, stored.panic ?? '')
   const marker = stored.vfs.resolve('/tmp/marker', '/')
+  const restoredFs = stored.filesystem('sda')!
   check(
     '恢复出来的盘带着上次写的文件',
-    !('err' in marker) && stored.filesystem('sda')!.read(marker.ino) === 'persisted across boots',
+    !('err' in marker) && restoredFs.read(marker.ino) === 'persisted across boots',
+  )
+  const restoredEtc = restoredFs.lookup(2, 'etc')
+  const restoredPasswd = restoredEtc ? restoredFs.lookup(restoredEtc, 'passwd') : 0
+  check(
+    '重启后仍保留 bcrypt 凭据与文件权限',
+    !!restoredPasswd && /^root:0:\$2b\$12\$[./A-Za-z0-9]{53}:lmbka$/m.test(restoredFs.read(restoredPasswd)) && restoredFs.iflags(restoredPasswd) === 0o600,
   )
   check('可移动盘被一并装回', stored.blockDevices().some((d) => d.name === 'sdb'))
   check(
@@ -282,7 +331,11 @@ async function main() {
     fromImage.panic ?? '',
   )
   const marker2 = fromImage.vfs.resolve('/tmp/marker', '/')
-  check('.img 里的文件也在', !('err' in marker2) && fromImage.filesystem('sda')!.read(marker2.ino) === 'persisted across boots')
+  const imageFs = fromImage.filesystem('sda')!
+  check('.img 里的文件也在', !('err' in marker2) && imageFs.read(marker2.ino) === 'persisted across boots')
+  const imageEtc = imageFs.lookup(2, 'etc')
+  const imagePasswd = imageEtc ? imageFs.lookup(imageEtc, 'passwd') : 0
+  check('.img 保留 bcrypt 凭据', !!imagePasswd && /^root:0:\$2b\$12\$[./A-Za-z0-9]{53}:lmbka$/m.test(imageFs.read(imagePasswd)) && imageFs.iflags(imagePasswd) === 0o600)
   await fromImage.destroy()
 
   check('分离设备会撤档', (await stored.detachDisk('sdb')) === 0)

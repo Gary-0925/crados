@@ -197,7 +197,7 @@ if (has(tools.debugfs)) {
   const ls = run(tools.debugfs, ['-R', 'ls -l /usr/man', rootPath]).out
   check('debugfs 看得见手册目录', /README/.test(ls) && /asm/.test(ls))
   const st = run(tools.debugfs, ['-R', 'stat /etc/passwd', rootPath]).out
-  check('debugfs 看到 /etc/passwd 的属主与权限', /Mode:  0644/.test(st) && /User:     0/.test(st), st.match(/Mode:.*/)?.[0] ?? '')
+  check('debugfs 看到 /etc/passwd 的 root-only 权限', /Mode:  0600/.test(st) && /User:     0/.test(st), st.match(/Mode:.*/)?.[0] ?? '')
   const dev = run(tools.debugfs, ['-R', 'stat /dev/tty', rootPath]).out
   check('debugfs 认出 /dev/tty 是字符设备', /Inode: \d+\s+Type: character special/.test(dev) || /character special/.test(dev), dev.match(/Type:.*/)?.[0] ?? '')
   const tmp = run(tools.debugfs, ['-R', 'stat /tmp', rootPath]).out
@@ -265,7 +265,16 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
   }
   const type = (text) => { for (const ch of text) guest.typeChar(ch); guest.pressEnter() }
   quiet(40)
+  const rootPassword = 'correct-horse-battery-staple'
   type('root')
+  quiet()
+  type(rootPassword)
+  quiet()
+  type(rootPassword)
+  quiet()
+  type('root')
+  quiet()
+  type(rootPassword)
   quiet()
   // 建文件、建目录、复制、删除、删目录、改权限：把 guest 侧的写入路径都走一遍，
   // 任何一条走歪都会在下面的 e2fsck 里现形
@@ -314,7 +323,7 @@ if (has(tools.e2fsck) || has(tools.debugfs)) {
     const passwd = run(tools.debugfs, ['-R', 'cat /etc/passwd', guestPath], true)
     check(
       'debugfs 看到 useradd 写出的账户行且没有补齐的空洞',
-      /bob:1:-:lmbk/.test(passwd.out) && !passwd.out.includes('\u0000') && passwd.out.split('\n').filter((l) => l.trim()).length === 2,
+      /bob:1:!:lmbk/.test(passwd.out) && !passwd.out.includes('\u0000') && passwd.out.split('\n').filter((l) => l.trim()).length === 2,
       JSON.stringify(passwd.out.replace(/\n/g, '|').slice(0, 60)),
     )
   }

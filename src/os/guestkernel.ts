@@ -154,6 +154,8 @@ syscall_entry:
     je sys_getuid
     cmp r0, 36          ; ttyecho(r1)：r1=0 关闭回显（密码输入），否则恢复
     je sys_ttyecho
+    cmp r0, 37
+    je sys_password
     cmp r0, 38          ; spawnas(path, uid)：以账户身份启动登录 shell
     je gp_spawnas
     cmp r0, 39          ; chown(path, uid)
@@ -2802,6 +2804,17 @@ sys_ttyecho:
     mov r4, 0xFF12
     stb [r4+0], r1
     mov r0, 0
+    iret
+
+sys_password:
+    call current_euid
+    cmp r0, ${UID_ROOT}
+    jne password_denied
+    mov r0, 46
+    svc
+    iret
+password_denied:
+    mov r0, 65535
     iret
 
 ; gethz: 从 KCB (0x0024) 读取时钟中断频率

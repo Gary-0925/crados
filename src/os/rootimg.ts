@@ -14,7 +14,7 @@ import {
 
 const LABEL = 'crados-root'
 
-// 出厂目录树。账户系统默认只有 root，密码为空；/home 留给 useradd。
+// 出厂目录树。root 账户首次登录时初始化密码；/home 留给 useradd。
 const DIRS = ['/bin', '/dev', '/etc', '/usr', '/usr/bin', '/usr/man', '/mnt', '/tmp', '/home', '/root']
 
 const FILES: [string, string][] = [
