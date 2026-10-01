@@ -1,4 +1,4 @@
-// 偏移 + 字节 + ASCII 三栏。highlight 标出该区域内被关注的那一字节。
+// 偏移 + 字节 + ASCII 三栏。
 
 export function HexDump({
   bytes,

@@ -47,7 +47,7 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Select plain entry
-        run: printf "export { default } from './app/Plain'\n" > src/App.tsx
+        run: printf "export { default } from './Plain'\n" > src/App.tsx
 
       - name: Fail if the control panel leaked into the bundle
         run: |
@@ -79,7 +79,7 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Select transparent entry
-        run: printf "export { default } from './app/Transparent'\n" > src/App.tsx
+        run: printf "export { default } from './Transparent'\n" > src/App.tsx
 
       - run: npm run build
 

@@ -13,7 +13,7 @@
 //   hw/ui（显示器、键盘、上电菜单） → os 的启动入口与只读接口
 //   os（操作系统）                  → hw 核心（装载在这台机器上）
 //   cp（面板）                      → hw + os，只读观测
-//   入口（src/app/Plain.tsx、src/app/Transparent.tsx）→ 装配以上部分
+//   入口（src/Plain.tsx、src/Transparent.tsx）→ 装配以上部分
 //
 // 任何一条不满足都退出非零码，CI 用 npm run check 拦住。
 
@@ -86,7 +86,7 @@ for (const { rel, imports } of files) {
 for (const { rel, imports } of files) {
   if (rel.startsWith('src/cp/')) continue
   const bad = imports.filter((t) => t.startsWith('src/cp/'))
-  const allowed = rel === 'src/app/Transparent.tsx'
+  const allowed = rel === 'src/Transparent.tsx'
   check(`${rel} 不引用 cp${allowed ? '（入口除外）' : ''}`, bad.length === 0 || allowed, bad.join(', '))
 }
 
@@ -105,8 +105,8 @@ check(
 )
 
 // ---------- 6. 纯净版入口不碰面板，透明版入口才装面板 ----------
-check('纯净版入口不引用面板', hits('src/app/Plain.tsx', /^src\/cp\//).length === 0)
-check('透明版入口装载面板', hits('src/app/Transparent.tsx', /^src\/cp\//).length > 0)
+check('纯净版入口不引用面板', hits('src/Plain.tsx', /^src\/cp\//).length === 0)
+check('透明版入口装载面板', hits('src/Transparent.tsx', /^src\/cp\//).length > 0)
 
 // ---------- 7. 三部分各有一个文件夹，且各有自己的入口语义 ----------
 for (const part of ['src/hw', 'src/os', 'src/cp']) {

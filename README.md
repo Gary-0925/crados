@@ -2,132 +2,7 @@
 
 Try plain version at <https://gary-0925.github.io/crados/>, or transparent version at <https://gary-0925.github.io/crados/transparent>.
 
-You could run `man` or `man README.zh` at <https://gary-0925.github.io/crados/transparent> to get more information，have fun!
-
-`man`:
-
-```text
-# crados
-
-The filesystem is bytes on a block device, the process table is bytes in RAM,
-and every program in /bin is CRX machine code fetched through a page table.
-
-## How a command runs
-
-    timer interrupt
-      -> scheduler picks a ready process (round robin, quantum 5)
-      -> CPU fetches an instruction through the page table
-      -> a sys instruction traps into the kernel
-
-execve reads the inode, follows its block pointers, copies the image into
-page frames, and only then starts the CPU. Watch it in dmesg.
-
-## Filesystem
-
-sda is the system disk, in the way C: is the system disk on Windows. It
-holds the root tree and every program that ships with the OS, and it is a
-real ext2 volume: export it from the Storage panel and e2fsck, debugfs or
-mount -o loop on Linux will read it as-is.
-
-    /bin        system programs, installed on sda at power-on
-    /usr/man    these manuals
-    /home/user  your files, and the example sources
-    /mnt        mount point for /dev/sdb
-    /tmp        scratch
-    /usr/bin    where your own programs go
-
-## First steps
-
-    ls -l /bin
-    cat count.s
-    as count.s -o count
-    ./count
-    ps
-
-## Experiments
-
-1. Scheduling. Run 'count 30 a &' then 'count 30 b'. The output
-   interleaves because the scheduler preempts each process.
-2. Blocking. Run 'sleep 8 &' then 'ps'. The sleeper is BLOCK, not
-   consuming CPU.
-3. Zombies. Run 'sleep 60 &', then 'kill <pid>', then 'ps'. It stays as
-   <defunct> until its parent reaps it.
-4. Out of memory. Run 'sleep 100 &' repeatedly until fork fails.
-5. Permissions. The login shell is uid 1. 'kill 1' returns
-   EPERM. Only euid 0 may signal init, and that still panics.
-6. Redirection. Run 'echo hi > /tmp/a' then 'cat /tmp/a'.
-
-## Manuals
-
-    man man        this catalog, and how the pages are stored
-    man asm        instruction set, assembler, syscalls
-    man storage    disks and the on-disk format
-    man inspect    memory, the process table, registers
-    man script     shell scripts and the #! mechanism
-
-Chinese versions: man README.zh, man asm.zh, and so on.
-```
-
-`man README.zh`:
-
-```text
-# crados
-
-文件系统是块设备上的字节，进程表是内存条里的字节，/bin 中的每个程序都是
-经页表取指执行的 CRX 机器码。
-
-## 一条命令是怎么跑起来的
-
-    时钟中断
-      -> 调度器挑一个就绪进程（轮转，时间片 5）
-      -> CPU 经页表取指
-      -> sys 指令陷入内核
-
-execve 会读取 inode、顺着块指针把映像逐块拷进页帧，然后才启动 CPU。
-这个过程在 dmesg 里能看到。
-
-## 文件系统
-
-sda 是系统盘，地位相当于 Windows 里的 C 盘：根目录树和所有随系统
-发行的程序都在这块盘上。
-
-    /bin        系统程序，每次上电安装到 sda
-    /usr/man    本手册
-    /home/user  你自己的文件和示例源码
-    /mnt        /dev/sdb 的挂载点
-    /tmp        临时目录
-    /usr/bin    存放你自己编译的程序
-
-## 上手
-
-    ls -l /bin
-    cat count.s
-    as count.s -o count
-    ./count
-    ps
-
-## 实验
-
-1. 调度。先后运行 'count 30 a &' 和 'count 30 b'，两者的输出会交错，
-   因为调度器在抢占它们。
-2. 阻塞。运行 'sleep 8 &' 再 'ps'，睡眠进程处于 BLOCK，不占用 CPU。
-3. 僵尸。运行 'sleep 60 &'，再 'kill <pid>'，再 'ps'，它会以 <defunct>
-   状态留存，直到父进程回收。
-4. 内存耗尽。反复运行 'sleep 100 &'，直到 fork 失败。
-5. 权限。登录 shell 是 uid 1。运行 'kill 1' 得到 EPERM。
-   只有 euid 0 可以信号 init，那样才会恐慌。
-6. 重定向。运行 'echo hi > /tmp/a' 再 'cat /tmp/a'。
-
-## 手册
-
-    man man        本目录，以及手册页是怎么存放的
-    man asm        指令集、汇编器、系统调用
-    man storage    磁盘与盘上格式
-    man inspect    内存、进程表、寄存器
-    man script     shell 脚本与 #! 机制
-
-英文版：man README、man asm，以此类推。
-```
+You could run `man` or `man man.zh` at <https://gary-0925.github.io/crados/transparent> to get more information，have fun!
 
 ## Booting
 
@@ -135,9 +10,9 @@ The machine's own firmware asks where the system disk comes from before any OS
 exists, because picking a boot medium is a hardware question — UEFI asks the same
 one. The three answers are the whole point of the choice:
 
-    from IndexedDB       the disk saved in this browser — files and edits intact
-    from a .img file     an exported image as the system disk (ext2, matching geometry)
-    new empty disk       format one and install the factory system
+- from IndexedDB : the disk saved in this browser — files and edits intact
+- from a .img file : an exported image as the system disk (ext2, matching geometry)
+- new empty disk : format one and install the factory system
 
 All three re-install `/bin` so the shipped programs always match the running
 firmware, and all three re-attach the removable disks stored in IndexedDB.
@@ -153,31 +28,35 @@ unmount, panic and shutdown). The Storage panel still exports any device as a
 The project is exactly three parts, one folder each, with nothing kept around for
 the sake of another part:
 
-    src/hw     虚拟硬件  the machine: CPU and ISA, RAM, disks (bytes, IndexedDB,
-                         .img import/export), boot media and power-on, console
-                         (screen, keyboard, UART registers), hardware clock and
-                         interrupts, bus, MMU, block controller.  hw/ui is its
-                         front panel and firmware: display, keyboard, power-on
-                         menu.
-    src/os     操作系统  crados itself: boot loader, process table, scheduler,
-                         system calls, VFS and ext2, accounts, /bin sources,
-                         manuals, and the CRX kernel that runs in supervisor mode.
-    src/cp     透明化面板 the transparent panel: the snapshot layer and the five
-                         panels.  The plain build leaves the whole folder out.
+- `src/hw` : the machine: CPU and ISA, RAM, disks (bytes, IndexedDB,
+             .img import/export), boot media and power-on, console
+             (screen, keyboard, UART registers), hardware clock and
+             interrupts, bus, MMU, block controller.  hw/ui is its
+             front panel and firmware: display, keyboard, power-on
+             menu.
 
-`src/app/Plain.tsx` assembles machine + OS; `src/app/Transparent.tsx` adds the
+- `src/os` : crados itself: boot loader, process table, scheduler,
+             system calls, VFS and ext2, accounts, /bin sources,
+             manuals, and the CRX kernel that runs in supervisor mode.
+
+- `src/cp` : the transparent panel: the snapshot layer and the five
+             panels.  The plain build leaves the whole folder out.
+
+`src/Plain.tsx` assembles machine + OS; `src/Transparent.tsx` adds the
 panel on top; `src/App.tsx` picks the one to build (that is the line the deploy
 workflow rewrites, so the path stays where CI expects it).  Who may import whom, and why the
 boundary sits where it does, is written down in `docs/architecture.md`.
 
 ## Development
 
-    npm ci          # install dependencies
-    npm run dev     # plain build on http://localhost:5173
-    npm run parts   # the three part boundaries, checked against the import graph
-    npm run check   # typecheck + parts + smoke + IndexedDB persistence + ext2 tests
+```bash
+npm ci          # install dependencies
+npm run dev     # plain build on http://localhost:5173
+npm run parts   # the three part boundaries, checked against the import graph
+npm run check   # typecheck + parts + smoke + IndexedDB persistence + ext2 tests
+```
 
 The transparent build is produced by CI, which rewrites `src/App.tsx` to point at
-`src/app/Transparent.tsx`. For local work on the control panel, change that line by hand.
+`src/Transparent.tsx`. For local work on the control panel, change that line by hand.
 The CI build also fails if the panel leaks into the plain bundle (it greps the
 built page for `crados/control-panel`, the panel's own tag).

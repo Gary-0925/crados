@@ -11,12 +11,6 @@ import type { PTE } from '@/os/process'
 import { isErr } from '@/os/types'
 import type { BlkInfo, PState, Syscall } from '@/os/types'
 
-/**
- * 面板的自我标识。它出现在构建产物里，就说明面板混进了纯净版：
- * CI 在打包后 grep 这个字符串把关（类名会被压缩混淆，字符串不会）。
- */
-export const PANEL_TAG = 'crados/control-panel'
-
 export interface SysEntry {
   tick: number
   pid: number

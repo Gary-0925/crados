@@ -10,7 +10,7 @@ import { PanicOverlay } from '@/hw/ui/PanicOverlay'
 import { Terminal } from '@/hw/ui/Terminal'
 import { BootMenu } from '@/hw/ui/BootMenu'
 import { useBoot } from '@/hw/ui/useBoot'
-import { ControlPanel, PANEL_TAG } from '@/cp/snapshot'
+import { ControlPanel } from '@/cp/snapshot'
 import type { Snapshot } from '@/cp/snapshot'
 import { ProcessesPanel } from '@/cp/ProcessesPanel'
 import { MemoryPanel } from '@/cp/MemoryPanel'
@@ -60,7 +60,6 @@ export default function Transparent() {
         </section>
 
         <aside
-          data-panel={PANEL_TAG}
           className="flex min-h-[44vh] flex-col border-t border-[#30363d] bg-[#010409] lg:min-h-0 lg:w-[452px] lg:border-l lg:border-t-0 xl:w-[520px]"
         >
           <div className="flex h-9 shrink-0 items-stretch gap-1 border-b border-[#30363d] px-1.5">
